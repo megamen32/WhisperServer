@@ -1,0 +1,31 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="18">
+            <item index="0" class="java.lang.String" itemvalue="trio-websocket" />
+            <item index="1" class="java.lang.String" itemvalue="kombu" />
+            <item index="2" class="java.lang.String" itemvalue="sniffio" />
+            <item index="3" class="java.lang.String" itemvalue="attrs" />
+            <item index="4" class="java.lang.String" itemvalue="exceptiongroup" />
+            <item index="5" class="java.lang.String" itemvalue="my-fake-useragent" />
+            <item index="6" class="java.lang.String" itemvalue="trio" />
+            <item index="7" class="java.lang.String" itemvalue="celery" />
+            <item index="8" class="java.lang.String" itemvalue="selenium" />
+            <item index="9" class="java.lang.String" itemvalue="certifi" />
+            <item index="10" class="java.lang.String" itemvalue="typing_extensions" />
+            <item index="11" class="java.lang.String" itemvalue="charset-normalizer" />
+            <item index="12" class="java.lang.String" itemvalue="fake-useragent" />
+            <item index="13" class="java.lang.String" itemvalue="vine" />
+            <item index="14" class="java.lang.String" itemvalue="billiard" />
+            <item index="15" class="java.lang.String" itemvalue="outcome" />
+            <item index="16" class="java.lang.String" itemvalue="websockets" />
+            <item index="17" class="java.lang.String" itemvalue="idna" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
