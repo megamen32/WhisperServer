@@ -24,7 +24,9 @@ MODEL_PRIORITY = {
     "base": 2,
     "small": 3,
     "medium": 4,
+    "large": 5,
     "large-v2": 5,
+    "large-v3": 5,
 }
 
 @asynccontextmanager
@@ -167,4 +169,4 @@ async def transcribe(file: UploadFile = File(...), model: str = Query("base")):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7653)

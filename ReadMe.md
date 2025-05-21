@@ -21,7 +21,7 @@ pip install -r requirements.txt
 **Or manually:**
 
 ```bash
-pip install fastapi uvicorn faster-whisper diskcache
+pip install fastapi uvicorn faster-whisper diskcache python-multipart
 ```
 
 If using GPU:
@@ -37,7 +37,7 @@ If using GPU:
 python main.py
 ```
 
-By default, the server runs at `http://localhost:8000`
+By default, the server runs at `http://localhost:7653`
 
 ---
 
@@ -55,7 +55,7 @@ Transcribe any audio file using a chosen model.
 #### Example using curl
 
 ```bash
-curl.exe -F "file=@C:/path/to/audio.mp3" "http://localhost:8000/transcribe?model=base"
+curl.exe -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base"
 ```
 
 #### Example Response

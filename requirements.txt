@@ -2,3 +2,4 @@ uvicorn~=0.34.2
 fastapi~=0.115.12
 diskcache~=5.6.3
 faster-whisper
+python-multipart
