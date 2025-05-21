@@ -1,8 +1,3 @@
-Вот минималистичный и понятный `README.md` на английском для твоего FastAPI + Faster Whisper сервиса:
-
----
-
-````markdown
 # WhisperServer
 
 A high-performance transcription server using [Faster Whisper](https://github.com/guillaumekln/faster-whisper), built with FastAPI, supporting:
