@@ -57,7 +57,7 @@ def transcribe_sync(file_path: str, model: str = "large-v3", language: Optional[
         return "[TRANSCRIPTION ERROR]"
 
 
-async def voice_to_text(message) -> str:
+async def voice_to_text(message) -> str:#For aiogram uses
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         file_path = tmp.name
 
