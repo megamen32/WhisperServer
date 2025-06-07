@@ -1,7 +1,7 @@
 import asyncio
 import multiprocessing as mp
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, UploadFile, File, Query, Request, HTTPException
 from fastapi.responses import JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -12,6 +12,9 @@ import hashlib
 from contextlib import asynccontextmanager
 from faster_whisper import WhisperModel
 from diskcache import Cache
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -29,10 +32,10 @@ MODEL_PRIORITY = {
     "large": 8,
 }
 
-# Кэш
+ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
+
 cache = Cache("whisper_cache")
 
-# Очереди
 request_queue = mp.Queue()
 response_queue = mp.Queue()
 pending_results = {}
@@ -181,8 +184,11 @@ async def transcribe(
     file: UploadFile = File(...),
     model: str = Query("base"),
     language: Optional[str] = Query(None),
-    beam_size: Optional[int] = Query(5)
+    beam_size: Optional[int] = Query(5),
+    api_key:str=Query(None),
 ):
+    if api_key not in ALLOWED_API_KEYS:
+        return JSONResponse({"error": "Invalid API key"}, status_code=403)
     if model not in MODEL_PRIORITY:
         return JSONResponse({"error": "Unsupported model"}, status_code=400)
 

@@ -1,0 +1,8 @@
+# Ignore Python envs and cache
+venv/
+__pycache__/
+*.pyc
+
+# Ignore secrets
+.env
+whisper_cache/
