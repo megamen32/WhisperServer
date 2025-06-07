@@ -6,3 +6,5 @@ __pycache__/
 # Ignore secrets
 .env
 whisper_cache/
+dist/
+*.egg-info/

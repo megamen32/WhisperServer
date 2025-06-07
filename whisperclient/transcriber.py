@@ -11,11 +11,7 @@ from typing import Optional
 import aiohttp
 import requests
 from faster_whisper import WhisperModel
-from dotenv import load_dotenv
-
-load_dotenv()
-
-_API_KEY = os.getenv("API_KEY", "bad-key")
+import whisperclient
 _MODEL: Optional[WhisperModel] = None
 
 
@@ -32,9 +28,10 @@ def _transcribe(path: str) -> str:
     return " ".join(s.text.strip() for s in segments)
 
 
-def transcribe_sync(file_path: str, model: str = "large-v3", language: Optional[str] = None) -> str:
+def transcribe_sync(file_path: str, model: str = "large-v3", language: Optional[str] = None,api_key=None) -> str:
     url = "https://whisper.bezrabotnyi.com/transcribe"
-    params = {"model": model, "api_key": _API_KEY}
+    key = api_key or whisperclient.api_key
+    params = {"model": model, "api_key": key}
     if language:
         params["language"] = language
 
@@ -74,9 +71,10 @@ async def voice_to_text(message) -> str:#For aiogram uses
     return text
 
 
-async def transcribe_with_fallback(file_path: str, model: str = "large-v3", language: Optional[str] = None) -> str:
+async def transcribe_with_fallback(file_path: str, model: str = "large-v3", language: Optional[str] = None,api_key=None) -> str:
     url = "https://whisper.bezrabotnyi.com/transcribe"
-    data = {"model": model, "api_key": _API_KEY}
+    key = api_key or whisperclient.api_key
+    data = {"model": model, "api_key": key}
     if language:
         data["language"] = language
 
