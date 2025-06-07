@@ -1,10 +1,10 @@
-# whisperclient
+# bezrabotnyiwhisper
 
 Python-клиент для сервиса голосовой расшифровки Whisper.
 
 ## Установка
 ```bash
-pip install whisperclient  # после публикации
+pip install bezrabotnyiwhisper  # после публикации
 ```
 
 ## Использование
