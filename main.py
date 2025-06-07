@@ -185,7 +185,7 @@ async def transcribe(
     model: str = Query("base"),
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
-    api_key:str=Query(None),
+    api_key:str=Query(...),
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
@@ -223,6 +223,10 @@ async def transcribe(
     except Exception as e:
         pending_results.pop(request_id, None)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/models")
+async def models():
+    return list(MODEL_PRIORITY.keys())
 
 if __name__ == "__main__":
     import uvicorn
