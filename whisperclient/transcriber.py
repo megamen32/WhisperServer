@@ -31,13 +31,15 @@ def _transcribe(path: str) -> str:
     return " ".join(s.text.strip() for s in segments)
 
 
-def _transcribe_stream(path: str) -> Generator[dict, None, None]:
+def _transcribe_stream(
+    path: str, include_words: bool = False
+) -> Generator[dict, None, None]:
     """Local streaming transcription yielding results in server format."""
     model = _get_model()
     segments, info = model.transcribe(
         path,
         beam_size=5,
-        word_timestamps=True,
+        word_timestamps=include_words,
         condition_on_previous_text=False,
     )
 
@@ -46,33 +48,39 @@ def _transcribe_stream(path: str) -> Generator[dict, None, None]:
     for seg in segments:
         seg_data = {"start": seg.start, "end": seg.end, "text": seg.text}
         all_segments.append(seg_data)
-        if seg.words:
+        if include_words and seg.words:
             words = [
                 {"start": w.start, "end": w.end, "word": w.word} for w in seg.words
             ]
             all_words.extend(words)
         else:
             words = []
-        yield {"segment": seg_data, "words": words}
+        item = {"segment": seg_data}
+        if include_words:
+            item["words"] = words
+        yield item
 
     result = {
         "text": " ".join(s["text"] for s in all_segments),
         "segments": all_segments,
-        "words": all_words,
         "language": info.language,
         "language_probability": info.language_probability,
     }
+    if include_words:
+        result["words"] = all_words
     yield {"result": result}
 
 
-async def _transcribe_stream_async(path: str) -> AsyncGenerator[dict, None]:
+async def _transcribe_stream_async(
+    path: str, include_words: bool = False
+) -> AsyncGenerator[dict, None]:
     """Asynchronous wrapper around :func:`_transcribe_stream`."""
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
     def worker() -> None:
         try:
-            for item in _transcribe_stream(path):
+            for item in _transcribe_stream(path, include_words=include_words):
                 loop.call_soon_threadsafe(queue.put_nowait, item)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)
@@ -164,7 +172,7 @@ def transcribe_stream_sync(
 
     logging.info("Пробуем локальную расшифровку...")
     try:
-        for item in _transcribe_stream(file_path):
+        for item in _transcribe_stream(file_path, include_words=False):
             yield item
     except Exception:
         logging.exception("Локальный whisper тоже не сработал")
@@ -278,7 +286,7 @@ async def transcribe_stream_with_fallback(
 
     logging.info("Пробуем локальную расшифровку...")
     try:
-        async for item in _transcribe_stream_async(file_path):
+        async for item in _transcribe_stream_async(file_path, include_words=False):
             yield item
     except Exception:
         logging.exception("Локальный whisper тоже не сработал")
