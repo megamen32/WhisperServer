@@ -2,7 +2,8 @@ import asyncio
 import multiprocessing as mp
 import tempfile
 from fastapi import FastAPI, UploadFile, File, Query, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import logging
@@ -39,6 +40,7 @@ cache = Cache("whisper_cache")
 request_queue = mp.Queue()
 response_queue = mp.Queue()
 pending_results = {}
+pending_streams = {}
 
 app = FastAPI()
 
@@ -79,6 +81,7 @@ def model_worker(request_queue, response_queue, stop_event):
                 lang = request.get("language")
                 cache_key = request.get("cache_key")
                 beam_size = request.get("beam_size",5)
+                stream = request.get("stream")
 
                 try:
                     if model_name not in model_cache:
@@ -100,7 +103,7 @@ def model_worker(request_queue, response_queue, stop_event):
                             beam_size=beam_size,
                             language=lang,
                             word_timestamps=True,
-                            condition_on_previous_text=False
+                            condition_on_previous_text=False,
                         )
                         all_segments = []
                         all_words = []
@@ -109,15 +112,24 @@ def model_worker(request_queue, response_queue, stop_event):
                             seg_data = {
                                 "start": seg.start,
                                 "end": seg.end,
-                                "text": seg.text
+                                "text": seg.text,
                             }
                             all_segments.append(seg_data)
                             if seg.words:
-                                all_words.extend([{
-                                    "start": w.start,
-                                    "end": w.end,
-                                    "word": w.word
-                                } for w in seg.words])
+                                words = [
+                                    {"start": w.start, "end": w.end, "word": w.word}
+                                    for w in seg.words
+                                ]
+                                all_words.extend(words)
+                            else:
+                                words = []
+
+                            if stream:
+                                response_queue.put({
+                                    "request_id": request_id,
+                                    "segment": seg_data,
+                                    "words": words,
+                                })
 
                         result = {
                             "text": " ".join([s["text"] for s in all_segments]),
@@ -132,7 +144,8 @@ def model_worker(request_queue, response_queue, stop_event):
 
                         response_queue.put({
                             "request_id": request_id,
-                            "result": result
+                            "result": result,
+                            "final": True,
                         })
 
                     finally:
@@ -160,6 +173,18 @@ async def response_listener(stop_event):
                     future.set_exception(Exception(result["error"]))
                 else:
                     future.set_result(result["result"])
+            elif request_id in pending_streams:
+                queue = pending_streams[request_id]
+                if "error" in result:
+                    await queue.put({"error": result["error"]})
+                    await queue.put(None)
+                    pending_streams.pop(request_id, None)
+                elif "segment" in result:
+                    await queue.put({"segment": result["segment"], "words": result.get("words", [])})
+                elif result.get("final"):
+                    await queue.put({"result": result["result"]})
+                    await queue.put(None)
+                    pending_streams.pop(request_id, None)
         except asyncio.CancelledError:
             break
 
@@ -185,6 +210,7 @@ async def transcribe(
     model: str = Query("base"),
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
+    stream: bool = Query(False),
     api_key:str=Query(...),
 ):
     if api_key not in ALLOWED_API_KEYS:
@@ -196,14 +222,23 @@ async def transcribe(
     audio_hash = hash_bytes(audio_bytes)
     cache_key = f"{model}:{language}:{audio_hash}"
 
-    if cache_key in cache:
+    if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
         return cache[cache_key]
+    if cache_key in cache and stream:
+        logger.info(f"[CACHE HIT] {cache_key}")
+        async def cached():
+            yield json.dumps({"result": cache[cache_key]}) + "\n"
+        return StreamingResponse(cached(), media_type="application/json")
 
     request_id = id(audio_bytes)
     loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    pending_results[request_id] = future
+    if stream:
+        queue = asyncio.Queue()
+        pending_streams[request_id] = queue
+    else:
+        future = loop.create_future()
+        pending_results[request_id] = future
 
     request_queue.put({
         "request_id": request_id,
@@ -211,18 +246,29 @@ async def transcribe(
         "model": model,
         "language": language,
         "cache_key": cache_key,
-        "beam_size": beam_size
+        "beam_size": beam_size,
+        "stream": stream,
     })
 
-    try:
-        result = await asyncio.wait_for(future, timeout=600)
-        return result
-    except asyncio.TimeoutError:
-        pending_results.pop(request_id, None)
-        return JSONResponse({"error": "Timeout"}, status_code=504)
-    except Exception as e:
-        pending_results.pop(request_id, None)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    if stream:
+        async def generator():
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield json.dumps(item) + "\n"
+
+        return StreamingResponse(generator(), media_type="application/json")
+    else:
+        try:
+            result = await asyncio.wait_for(future, timeout=600)
+            return result
+        except asyncio.TimeoutError:
+            pending_results.pop(request_id, None)
+            return JSONResponse({"error": "Timeout"}, status_code=504)
+        except Exception as e:
+            pending_results.pop(request_id, None)
+            return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/models")
 async def models():
