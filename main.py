@@ -103,7 +103,7 @@ def model_worker(request_queue, response_queue, stop_event):
                             temp_path,
                             beam_size=beam_size,
                             language=lang,
-                            word_timestamps=True,
+                            word_timestamps=request.get("words", False),
                             condition_on_previous_text=False,
                         )
                         all_segments = []
@@ -116,7 +116,7 @@ def model_worker(request_queue, response_queue, stop_event):
                                 "text": seg.text,
                             }
                             all_segments.append(seg_data)
-                            if seg.words:
+                            if request.get("words", False) and getattr(seg, "words", None):
                                 words = [
                                     {"start": w.start, "end": w.end, "word": w.word}
                                     for w in seg.words
@@ -126,19 +126,19 @@ def model_worker(request_queue, response_queue, stop_event):
                                 words = []
 
                             if stream:
-                                response_queue.put({
-                                    "request_id": request_id,
-                                    "segment": seg_data,
-                                    "words": words,
-                                })
+                                payload = {"request_id": request_id, "segment": seg_data}
+                                if request.get("words", False):
+                                    payload["words"] = words
+                                response_queue.put(payload)
 
                         result = {
                             "text": " ".join([s["text"] for s in all_segments]),
                             "segments": all_segments,
-                            "words": all_words,
                             "language": info.language,
-                            "language_probability": info.language_probability
+                            "language_probability": info.language_probability,
                         }
+                        if request.get("words", False):
+                            result["words"] = all_words
 
                         if cache_key:
                             cache[cache_key] = result
@@ -181,7 +181,10 @@ async def response_listener(stop_event):
                     await queue.put(None)
                     pending_streams.pop(request_id, None)
                 elif "segment" in result:
-                    await queue.put({"segment": result["segment"], "words": result.get("words", [])})
+                    payload = {"segment": result["segment"]}
+                    if "words" in result:
+                        payload["words"] = result["words"]
+                    await queue.put(payload)
                 elif result.get("final"):
                     await queue.put({"result": result["result"]})
                     await queue.put(None)
@@ -212,6 +215,7 @@ async def transcribe(
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
     stream: bool = Query(False),
+    words: bool = Query(False),
     api_key:str=Query(...),
 ):
     if api_key not in ALLOWED_API_KEYS:
@@ -221,7 +225,7 @@ async def transcribe(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = f"{model}:{language}:{audio_hash}"
+    cache_key = f"{model}:{language}:{words}:{audio_hash}"
 
     if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
@@ -249,6 +253,7 @@ async def transcribe(
         "cache_key": cache_key,
         "beam_size": beam_size,
         "stream": stream,
+        "words": words,
     })
 
     if stream:
