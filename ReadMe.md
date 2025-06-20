@@ -52,12 +52,15 @@ Transcribe any audio file using a chosen model.
 * `file`: audio file (`.mp3`, `.wav`, etc.)
 * `model`: model name (default: `base`)
 * `stream`: return results progressively when `true`
+* `words`: include word-level timestamps when `true`
 
 #### Example using curl
 
 ```bash
 # regular response
 curl.exe -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base"
+# with word timestamps
+curl.exe -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base&words=true"
 # streaming response
 curl.exe -N -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base&stream=true"
 ```
