@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from faster_whisper import WhisperModel
 from diskcache import Cache
 from dotenv import load_dotenv
+import torch
 
 load_dotenv()
 
@@ -276,5 +277,4 @@ async def models():
 
 if __name__ == "__main__":
     import uvicorn
-    import torch
     uvicorn.run(app, host="0.0.0.0", port=7653)
