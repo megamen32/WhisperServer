@@ -73,13 +73,21 @@ curl.exe -N -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?mo
 }
 ```
 
+### `GET /status`
+
+Returns current queue size and information about loaded models.
+
+```bash
+curl http://localhost:7653/status
+```
+
 ---
 
 ## 🧠 Caching
 
 The server uses `diskcache` to avoid redundant transcription for the same file. Cached results are keyed by the SHA256 hash of the audio + model name.
 
-Cached files are stored in `./whisper_cache`. You can manually clean it or set expiration rules.
+Cached files are stored in `./whisper_cache` with a 30 day TTL and a 10 GB size limit. Old entries are pruned automatically.
 
 ---
 
@@ -103,8 +111,8 @@ The server cleanly shuts down:
 
 ## 💡 TODO Ideas
 
-* Add `/status` endpoint to monitor queue size and model usage
-* Add TTL-based expiration to cache
+* ~~Add `/status` endpoint to monitor queue size and model usage~~ (done)
+* ~~Add TTL-based expiration to cache~~ (done)
 * ~~Support streaming or chunked transcription~~ (done)
 
 ---
