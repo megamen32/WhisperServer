@@ -51,11 +51,15 @@ Transcribe any audio file using a chosen model.
 
 * `file`: audio file (`.mp3`, `.wav`, etc.)
 * `model`: model name (default: `base`)
+* `stream`: return results progressively when `true`
 
 #### Example using curl
 
 ```bash
+# regular response
 curl.exe -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base"
+# streaming response
+curl.exe -N -F "file=@C:/path/to/audio.mp3" "http://localhost:7653/transcribe?model=base&stream=true"
 ```
 
 #### Example Response
@@ -98,7 +102,7 @@ The server cleanly shuts down:
 
 * Add `/status` endpoint to monitor queue size and model usage
 * Add TTL-based expiration to cache
-* Support streaming or chunked transcription
+* ~~Support streaming or chunked transcription~~ (done)
 
 ---
 
