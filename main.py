@@ -36,12 +36,15 @@ MODEL_PRIORITY = {
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 
-cache = Cache("whisper_cache")
+# Cache with 10GB limit and 1 month TTL for entries
+CACHE_TTL = 60 * 60 * 24 * 30
+cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
 
 request_queue = mp.Queue()
 response_queue = mp.Queue()
 pending_results = {}
 pending_streams = {}
+model_usage = None
 
 app = FastAPI()
 
@@ -57,7 +60,7 @@ app.router.lifespan_context = lifespan
 def hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def model_worker(request_queue, response_queue, stop_event):
+def model_worker(request_queue, response_queue, stop_event, usage_dict):
     model_cache = {}
 
     while not stop_event.is_set():
@@ -90,6 +93,7 @@ def model_worker(request_queue, response_queue, stop_event):
                         device = "cuda" if torch.cuda.is_available() else "cpu"
                         compute = "float16" if device == "cuda" else "int8"
                         model_cache[model_name] = WhisperModel(model_name, device=device, compute_type=compute)
+                    usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
 
                     model = model_cache[model_name]
 
@@ -141,7 +145,7 @@ def model_worker(request_queue, response_queue, stop_event):
                             result["words"] = all_words
 
                         if cache_key:
-                            cache[cache_key] = result
+                            cache.set(cache_key, result, expire=CACHE_TTL)
 
                         response_queue.put({
                             "request_id": request_id,
@@ -193,14 +197,18 @@ async def response_listener(stop_event):
             break
 
 async def startup_event():
+    global model_usage
     stop_event = mp.Event()
-    process = mp.Process(target=model_worker, args=(request_queue, response_queue, stop_event))
+    manager = mp.Manager()
+    model_usage = manager.dict()
+    process = mp.Process(target=model_worker, args=(request_queue, response_queue, stop_event, model_usage))
     process.start()
     executor = ThreadPoolExecutor()
     app.state.stop_event = stop_event
     app.state.model_process = process
     app.state.executor = executor
     app.state.response_listener_task = asyncio.create_task(response_listener(stop_event))
+    app.state.model_usage = model_usage
 
 def shutdown_event():
     logger.info("Остановка процесса...")
@@ -279,6 +287,13 @@ async def transcribe(
 @app.get("/models")
 async def models():
     return list(MODEL_PRIORITY.keys())
+
+
+@app.get("/status")
+async def status():
+    queue_size = request_queue.qsize()
+    usage = dict(app.state.model_usage) if hasattr(app.state, "model_usage") else {}
+    return {"queue_size": queue_size, "model_usage": usage}
 
 if __name__ == "__main__":
     import uvicorn
