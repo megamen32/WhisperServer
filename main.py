@@ -119,6 +119,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                                 "end": seg.end,
                                 "text": seg.text,
                             }
+                            logger.info(f'{model_name} processed segment: {seg_data}')
                             all_segments.append(seg_data)
                             if request.get("words", False) and getattr(seg, "words", None):
                                 words = [
@@ -171,6 +172,7 @@ async def response_listener(stop_event):
     while not stop_event.is_set():
         try:
             result = await asyncio.get_event_loop().run_in_executor(app.state.executor, response_queue.get)
+            logger.info(f'response_listener get from queue result {result}')
             request_id = result["request_id"]
             if request_id in pending_results:
                 future = pending_results.pop(request_id)
@@ -241,7 +243,8 @@ async def transcribe(
     if cache_key in cache and stream:
         logger.info(f"[CACHE HIT] {cache_key}")
         async def cached():
-            yield json.dumps({"result": cache[cache_key]}) + "\n"
+            for segment in cache[cache_key]['segments']:
+                yield json.dumps({"segment": segment}) + "\n"
         return StreamingResponse(cached(), media_type="application/json")
 
     request_id = id(audio_bytes)
@@ -271,8 +274,14 @@ async def transcribe(
                 if item is None:
                     break
                 yield json.dumps(item) + "\n"
-
-        return StreamingResponse(generator(), media_type="application/json")
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",   # для nginx
+            "X-Content-Type-Options": "nosniff",
+        }
+        return StreamingResponse(generator(), media_type="application/x-ndjson",
+    headers=headers)
     else:
         try:
             result = await asyncio.wait_for(future, timeout=600)
