@@ -8,3 +8,4 @@ __pycache__/
 whisper_cache/
 dist/
 *.egg-info/
+.pypirc
