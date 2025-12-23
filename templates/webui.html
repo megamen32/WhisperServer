@@ -163,6 +163,40 @@
             justify-content: space-between;
             font-size: 0.9rem;
             color: #9bbdff;
+            opacity: 0;
+            transition: opacity 0.15s ease;
+            pointer-events: none;
+            height: 0;
+            overflow: hidden;
+        }
+        .progress-meta.visible {
+            opacity: 1;
+            pointer-events: auto;
+            height: auto;
+        }
+        .upload-track {
+            margin-top: 18px;
+            width: 100%;
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.06);
+            overflow: hidden;
+            transition: opacity 0.2s ease, height 0.2s ease, margin 0.2s ease;
+        }
+        .upload-bar {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ffb86b, #ff7d8f);
+            transition: width 0.2s ease;
+        }
+        .upload-track.hidden {
+            opacity: 0;
+            pointer-events: none;
+            height: 0;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
         }
         .status-bar {
             margin-top: 12px;
@@ -195,6 +229,9 @@
         .segment-text {
             flex: 1;
         }
+        .transcript-container.segments-hidden .segment-text {
+            display: none;
+        }
         .timecode {
             font-size: 0.85rem;
             color: #7bedff;
@@ -204,10 +241,45 @@
         .transcript-container.show-times .timecode {
             display: inline-block;
         }
+        .final-output-wrapper {
+            position: relative;
+            margin-top: 24px;
+        }
         .final-output {
-            margin-top: 16px;
             font-weight: 600;
             color: #c5ffe4;
+            padding-top: 8px;
+        }
+        .copy-result-button {
+            position: absolute;
+            top: -26px;
+            left: 4px;
+            border: none;
+            border-radius: 999px;
+            background: #030303;
+            color: #ffffff;
+            font-size: 14px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            line-height: 1;
+            transition: background 0.2s ease, transform 0.2s ease;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+        }
+        .copy-result-button .copy-icon {
+            font-size: 18px;
+            line-height: 1;
+        }
+        .copy-result-button.hidden {
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(-2px);
+        }
+        .copy-result-button:hover {
+            background: #181818;
+            transform: translateY(-2px);
         }
         .error-output {
             margin-top: 10px;
@@ -224,6 +296,29 @@
             .progress-meta {
                 flex-direction: column;
                 gap: 6px;
+            }
+            .ui-card,
+            .drop-zone,
+            .controls,
+            .transcript-container,
+            .output {
+                text-align: center;
+            }
+            .controls {
+                align-items: center;
+            }
+            .control {
+                align-items: center;
+            }
+            .segment {
+                flex-direction: column;
+                align-items: center;
+            }
+            .segment-text {
+                text-align: center;
+            }
+            .transcript-container.show-times .segment {
+                flex-direction: column;
             }
         }
     </style>
@@ -245,11 +340,14 @@
                     <span>Модель (по умолчанию стандартная)</span>
                     <select id="model-select"></select>
                 </label>
-                <label class="control" hidden=true>
+                <label class="control" style="display: none;">
                     <span>API-ключ</span>
                     <input type="text" id="api-key-input" placeholder="Укажите ключ или используйте стандартный" />
                 </label>
                 <button type="button" id="toggle-times">Показать таймкоды</button>
+            </div>
+            <div class="upload-track hidden">
+                <div class="upload-bar" id="upload-bar"></div>
             </div>
             <div class="progress-track">
                 <div class="progress-bar" id="progress-bar"></div>
@@ -261,12 +359,23 @@
             <div class="status-bar" id="status-bar">Готово</div>
             <div class="output">
                 <div id="transcript" class="transcript-container"></div>
-                <div id="final-output" class="final-output"></div>
+                <div class="final-output-wrapper">
+                    <div id="final-output" class="final-output"></div>
+                    <button
+                        type="button"
+                        id="copy-result-button"
+                        class="copy-result-button hidden"
+                        title="Скопировать результат"
+                    >
+                        <span class="copy-icon" aria-hidden="true">📋</span>
+                        <span class="copy-label">Скопировать</span>
+                    </button>
+                </div>
                 <div id="error-output" class="error-output" aria-live="assertive"></div>
             </div>
         </div>
     <script>
-        const DEFAULT_MODEL = 'base';
+        const DEFAULT_MODEL = 'large-v3';
         const DEFAULT_API_KEY = __API_KEY__;
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
@@ -278,9 +387,18 @@
         const progressBar = document.getElementById('progress-bar');
         const speedLabel = document.getElementById('speed-label');
         const estimateLabel = document.getElementById('estimate-label');
+        const uploadBar = document.getElementById('upload-bar');
+        const uploadTrack = document.querySelector('.upload-track');
         const toggleTimes = document.getElementById('toggle-times');
         const micIcon = document.querySelector('.mic-icon');
         const micLabel = document.getElementById('mic-label');
+        const copyResultButton = document.getElementById('copy-result-button');
+        const progressMeta = document.querySelector('.progress-meta');
+
+        const UPLOAD_SPEED_PREFIX = 'Скорость загрузки:';
+        const UPLOAD_ESTIMATE_PREFIX = 'Осталось:';
+        const PROCESS_SPEED_PREFIX = 'Скорость:';
+        const PROCESS_ESTIMATE_PREFIX = 'Ожидание:';
 
         let isProcessing = false;
         let showTimecodes = false;
@@ -291,10 +409,16 @@
         let mediaRecorder = null;
         let mediaStream = null;
         let recordedChunks = [];
+        let activeXhr = null;
+        let currentFile = null;
+        let pendingReprocess = false;
+        let uploadStartTime = 0;
+        let currentUploadTotal = 0;
 
         const recordingSupported = typeof MediaRecorder !== 'undefined';
 
         document.getElementById('api-key-input').value = DEFAULT_API_KEY;
+        toggleTimes.hidden = true;
 
         function setStatus(message) {
             statusBar.textContent = message;
@@ -387,6 +511,67 @@
             estimateLabel.textContent = final ? 'Ожидание: завершено' : `Ожидание: ~${waitLeft.toFixed(1)} с`;
             const ratio = final ? 1 : Math.min(1, elapsed / (elapsed + Math.max(waitLeft, 1)));
             progressBar.style.width = `${Math.floor(ratio * 100)}%`;
+            progressMeta?.classList.add('visible');
+        }
+
+        function formatBytes(value = 0) {
+            if (!Number.isFinite(value) || value <= 0) {
+                return '0 B';
+            }
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let index = 0;
+            let size = value;
+            while (size >= 1024 && index < units.length - 1) {
+                size /= 1024;
+                index += 1;
+            }
+            return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+        }
+
+        function updateUploadProgress(loaded = 0, total = 0, done = false) {
+            const safeTotal = total > 0 ? total : Math.max(loaded, 1);
+            const ratio = Math.min(1, loaded / safeTotal);
+            uploadBar.style.width = `${Math.floor(ratio * 100)}%`;
+            const totalBytes = total > 0 ? total : currentUploadTotal;
+            const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartTime) / 1000);
+            const bytesPerSecond = Math.max(0, loaded / elapsedSeconds);
+            const speedText = bytesPerSecond > 0 ? `${formatBytes(bytesPerSecond)}/с` : '—';
+            speedLabel.textContent = `${UPLOAD_SPEED_PREFIX} ${speedText}`;
+            if (total > 0 && bytesPerSecond > 0 && !done) {
+                const eta = Math.max(0, (total - loaded) / bytesPerSecond);
+                const totalText = totalBytes ? formatBytes(totalBytes) : '—';
+                const loadedText = totalBytes ? formatBytes(Math.min(loaded, totalBytes)) : formatBytes(loaded);
+                estimateLabel.textContent = `${UPLOAD_ESTIMATE_PREFIX} ${eta.toFixed(1)} с · ${loadedText} / ${totalText}`;
+            } else if (done && total > 0) {
+                const totalText = totalBytes ? formatBytes(totalBytes) : '—';
+                estimateLabel.textContent = `${UPLOAD_ESTIMATE_PREFIX} 0.0 с · ${totalText} / ${totalText}`;
+            } else {
+                const totalText = totalBytes ? formatBytes(totalBytes) : '—';
+                const loadedText = formatBytes(loaded);
+                estimateLabel.textContent = `${UPLOAD_ESTIMATE_PREFIX} — · ${loadedText} / ${totalText}`;
+            }
+        }
+
+        function showUploadProgress(totalBytes = 0) {
+            uploadTrack.classList.remove('hidden');
+            uploadBar.style.width = '0%';
+            speedLabel.textContent = `${UPLOAD_SPEED_PREFIX} —`;
+            const totalText = totalBytes ? formatBytes(totalBytes) : '—';
+            estimateLabel.textContent = `${UPLOAD_ESTIMATE_PREFIX} — · 0 / ${totalText}`;
+            uploadStartTime = Date.now();
+            currentUploadTotal = totalBytes;
+            progressMeta?.classList.add('visible');
+        }
+
+        function hideUploadProgress(resetMeta = true) {
+            uploadBar.style.width = '0%';
+            uploadTrack.classList.add('hidden');
+            uploadStartTime = 0;
+            if (resetMeta) {
+                speedLabel.textContent = `${PROCESS_SPEED_PREFIX} —`;
+                estimateLabel.textContent = `${PROCESS_ESTIMATE_PREFIX} —`;
+            }
+            progressMeta?.classList.remove('visible');
         }
 
         async function refreshStatus() {
@@ -431,15 +616,31 @@
                 statusInterval = null;
             }
             dropZone.classList.remove('working');
+            if (activeXhr) {
+                activeXhr = null;
+            }
             if (finalMessage) {
                 setStatus(finalMessage);
             }
             isProcessing = false;
             if (success) {
                 updateProgress(true);
+                toggleTimes.hidden = false;
+                showTimecodes = false;
+                toggleTimes.textContent = 'Показать таймкоды';
+                transcriptContainer.classList.add('segments-hidden');
+                transcriptContainer.classList.remove('show-times');
             } else {
                 progressBar.style.width = '0%';
+                toggleTimes.hidden = true;
             }
+            if (pendingReprocess && currentFile) {
+                pendingReprocess = false;
+                setTimeout(() => transcribeFile(currentFile), 150);
+            } else {
+                pendingReprocess = false;
+            }
+            hideUploadProgress(false);
         }
 
         async function loadModels() {
@@ -470,16 +671,23 @@
                 }
                 return;
             }
+            currentFile = file;
             isProcessing = true;
             segmentsProcessed = 0;
             startTime = Date.now();
             estimatedWait = 0;
             transcriptContainer.innerHTML = '';
             finalOutput.textContent = '';
+            hideCopyButton();
             errorOutput.textContent = '';
             progressBar.style.width = '0%';
+            showUploadProgress(file.size);
             dropZone.classList.add('working');
             setStatus('Загрузка файла на сервер...');
+            transcriptContainer.classList.remove('segments-hidden');
+            transcriptContainer.classList.remove('show-times');
+            showTimecodes = false;
+            toggleTimes.hidden = true;
             const apiKeyValue = document.getElementById('api-key-input').value.trim() || DEFAULT_API_KEY;
             const form = new FormData();
             form.append('file', file);
@@ -487,66 +695,115 @@
             requestUrl.searchParams.set('stream', 'true');
             requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
             requestUrl.searchParams.set('api_key', apiKeyValue);
-            refreshStatus();
-            statusInterval = setInterval(refreshStatus, 1800);
-            try {
-                const response = await fetch(requestUrl, {
-                    method: 'POST',
-                    body: form,
-                });
-                if (!response.ok) {
-                    const message = await response.text();
-                    throw new Error(message || `Ошибка: ${response.status}`);
+
+            let buffer = '';
+            let responseOffset = 0;
+            let hasFailed = false;
+
+            function fail(message) {
+                if (hasFailed) {
+                    return;
                 }
-                const reader = response.body?.getReader();
-                if (!reader) {
-                    throw new Error('Сервер не вернул поток');
-                }
-                const decoder = new TextDecoder('utf-8');
-                let buffer = '';
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        break;
-                    }
-                    buffer += decoder.decode(value, { stream: true });
-                    let newlineIndex;
-                    while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-                        const line = buffer.slice(0, newlineIndex).trim();
-                        buffer = buffer.slice(newlineIndex + 1);
-                        if (!line) {
-                            continue;
-                        }
-                        const payload = JSON.parse(line);
-                        if (payload.error) {
-                            throw new Error(payload.error);
-                        }
-                        if (payload.segment) {
-                            appendSegment(payload.segment);
-                        }
-                        if (payload.result && payload.result.text) {
-                            finalOutput.textContent = payload.result.text;
-                        }
-                    }
-                }
-                const tail = buffer.trim();
-                if (tail) {
-                    const payload = JSON.parse(tail);
-                    if (payload.error) {
-                        throw new Error(payload.error);
-                    }
-                    if (payload.segment) {
-                        appendSegment(payload.segment);
-                    }
-                    if (payload.result && payload.result.text) {
-                        finalOutput.textContent = payload.result.text;
-                    }
-                }
-                cleanupProcessing({ finalMessage: 'Готово', success: true });
-            } catch (error) {
-                errorOutput.textContent = error.message;
+                hasFailed = true;
+                errorOutput.textContent = message;
                 cleanupProcessing({ finalMessage: 'Ошибка транскрипции', success: false });
+                if (activeXhr && activeXhr.readyState !== 4) {
+                    activeXhr.abort();
+                }
             }
+
+            function handlePayload(payload) {
+                if (!payload) {
+                    return;
+                }
+                if (payload.error) {
+                    fail(payload.error);
+                    return;
+                }
+                if (payload.segment) {
+                    appendSegment(payload.segment);
+                }
+                if (payload.result && payload.result.text) {
+                    finalOutput.textContent = payload.result.text;
+                    showCopyButton();
+                }
+            }
+
+            function drainResponseText(text, flush = false) {
+                if (hasFailed) {
+                    return;
+                }
+                const chunk = text.slice(responseOffset);
+                responseOffset = text.length;
+                if (chunk) {
+                    buffer += chunk;
+                }
+                let newlineIndex;
+                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                    const line = buffer.slice(0, newlineIndex).trim();
+                    buffer = buffer.slice(newlineIndex + 1);
+                    if (!line) {
+                        continue;
+                    }
+                    try {
+                        const payload = JSON.parse(line);
+                        handlePayload(payload);
+                    } catch (error) {
+                        fail('Ошибка разбора ответа сервера');
+                        return;
+                    }
+                }
+                if (flush) {
+                    const tail = buffer.trim();
+                    if (tail) {
+                        try {
+                            const payload = JSON.parse(tail);
+                            handlePayload(payload);
+                        } catch (error) {
+                            fail('Ошибка разбора ответа сервера');
+                        }
+                    }
+                    buffer = '';
+                }
+            }
+
+            const xhr = new XMLHttpRequest();
+            activeXhr = xhr;
+            xhr.open('POST', requestUrl.toString(), true);
+            xhr.responseType = 'text';
+            xhr.upload.addEventListener('progress', (event) => {
+                if (event.lengthComputable) {
+                    updateUploadProgress(event.loaded, event.total);
+                } else {
+                    updateUploadProgress(event.loaded, file.size);
+                }
+            });
+            xhr.upload.addEventListener('load', () => {
+                updateUploadProgress(file.size, file.size, true);
+                hideUploadProgress(true);
+                setStatus('Файл загружен. Обработка на сервере...');
+                refreshStatus();
+                statusInterval = setInterval(refreshStatus, 1800);
+            });
+            xhr.addEventListener('progress', () => {
+                drainResponseText(xhr.responseText);
+            });
+            xhr.addEventListener('error', () => {
+                fail('Ошибка сети при загрузке');
+            });
+            xhr.addEventListener('load', () => {
+                if (hasFailed) {
+                    return;
+                }
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    fail(xhr.responseText || `Ошибка: ${xhr.status}`);
+                    return;
+                }
+                drainResponseText(xhr.responseText, true);
+                cleanupProcessing({ finalMessage: 'Готово', success: true });
+            });
+            updateUploadProgress(0, file.size);
+            xhr.send(form);
         }
 
         dropZone.addEventListener('click', () => fileInput.click());
@@ -581,7 +838,50 @@
         toggleTimes.addEventListener('click', () => {
             showTimecodes = !showTimecodes;
             transcriptContainer.classList.toggle('show-times', showTimecodes);
+            transcriptContainer.classList.toggle('segments-hidden', !showTimecodes);
             toggleTimes.textContent = showTimecodes ? 'Скрыть таймкоды' : 'Показать таймкоды';
+        });
+
+        copyResultButton.addEventListener('click', async () => {
+            const text = finalOutput.textContent.trim();
+            if (!text) {
+                setStatus('Нет результата для копирования');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(text);
+                setStatus('Результат скопирован');
+            } catch (error) {
+                const fallback = document.createElement('textarea');
+                fallback.value = text;
+                document.body.appendChild(fallback);
+                fallback.select();
+                document.execCommand('copy');
+                document.body.removeChild(fallback);
+                setStatus('Скопировано (резервно)');
+            }
+        });
+
+        function showCopyButton() {
+            copyResultButton.classList.remove('hidden');
+        }
+
+        function hideCopyButton() {
+            if (!copyResultButton.classList.contains('hidden')) {
+                copyResultButton.classList.add('hidden');
+            }
+        }
+
+        modelSelect.addEventListener('change', () => {
+            if (!currentFile) {
+                return;
+            }
+            if (isProcessing) {
+                pendingReprocess = true;
+                setStatus('Подождите завершения текущей расшифровки — новая модель будет применена автоматически');
+            } else {
+                transcribeFile(currentFile);
+            }
         });
 
         loadModels();
