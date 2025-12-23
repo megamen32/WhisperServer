@@ -286,7 +286,7 @@ async def transcribe(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-льно     cache_key = f"{model}:{language}:{words}:{audio_hash}"
+    cache_key = f"{model}:{language}:{words}:{audio_hash}"
 
     if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
