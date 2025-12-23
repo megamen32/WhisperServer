@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>Whisper сервер</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            color-scheme: dark;
+        }
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(165deg, #050505, #0a1431 50%, #071728);
+            color: #f4f6fb;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .page {
+            width: 100%;
+            padding: 32px 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .ui-card {
+            width: min(780px, 100%);
+            background: rgba(6, 8, 19, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 36px;
+            padding: 36px;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+            backdrop-filter: blur(12px);
+        }
+            .mic-icon {
+                margin: 0 auto 24px;
+                width: 140px;
+                height: 140px;
+                border-radius: 50%;
+                border: 4px solid rgba(255, 255, 255, 0.4);
+                background: radial-gradient(circle at 30% 15%, rgba(125, 210, 255, 0.35), transparent 60%),
+                    radial-gradient(circle at 70% 35%, rgba(120, 96, 255, 0.4), transparent 55%),
+                    rgba(20, 28, 48, 0.9);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 64px;
+                color: #8ae1ff;
+                box-shadow: 0 12px 25px rgba(0, 0, 0, 0.45);
+                cursor: pointer;
+                transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+            }
+            .mic-icon:hover {
+                transform: translateY(-2px);
+            }
+            .mic-icon.recording {
+                border-color: #ff9f9f;
+                box-shadow: 0 0 30px rgba(255, 110, 110, 0.6), 0 12px 25px rgba(0, 0, 0, 0.4);
+            }
+            .mic-label {
+                text-align: center;
+                color: rgba(255, 255, 255, 0.7);
+                font-size: 0.95rem;
+                margin-top: -12px;
+                margin-bottom: 20px;
+            }
+            .drop-zone {
+            border: 2px dashed rgba(252, 252, 252, 0.35);
+            border-radius: 20px;
+            padding: 32px;
+            text-align: center;
+            font-size: 1rem;
+            line-height: 1.5;
+            cursor: pointer;
+            transition: border-color 0.2s ease, background 0.2s ease;
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .drop-zone.active {
+            border-color: #72d6ff;
+            background: rgba(114, 214, 255, 0.05);
+        }
+        .drop-zone.working {
+            border-color: #36d6b8;
+        }
+        .drop-zone .button-link {
+            color: #84d2ff;
+            text-decoration: underline;
+            cursor: pointer;
+        }
+        #file-input {
+            display: none;
+        }
+        .controls {
+            margin-top: 22px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            align-items: flex-end;
+        }
+        .control {
+            flex: 1;
+            min-width: 200px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .control span {
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        select,
+        input[type='text'] {
+            width: 100%;
+            padding: 10px 14px;
+            border-radius: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            background: rgba(255, 255, 255, 0.04);
+            color: #f4f6fb;
+            font-size: 1rem;
+            outline: none;
+        }
+        select:focus,
+        input[type='text']:focus {
+            border-color: #89e5ff;
+            background: rgba(255, 255, 255, 0.08);
+        }
+        #toggle-times {
+            border: none;
+            background: linear-gradient(135deg, #46b5ff, #6b58ff);
+            color: white;
+            padding: 11px 22px;
+            border-radius: 999px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 10px 20px rgba(34, 92, 255, 0.35);
+            transition: transform 0.2s ease;
+        }
+        #toggle-times:active {
+            transform: translateY(2px);
+        }
+        .progress-track {
+            margin-top: 24px;
+            width: 100%;
+            height: 14px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.07);
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #7df2ff, #5ba7ff);
+            transition: width 0.4s ease;
+        }
+        .progress-meta {
+            margin-top: 10px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.9rem;
+            color: #9bbdff;
+        }
+        .status-bar {
+            margin-top: 12px;
+            text-align: center;
+            font-size: 0.95rem;
+            color: #b2d2ff;
+        }
+        .output {
+            margin-top: 24px;
+            max-height: 320px;
+            overflow-y: auto;
+            border-radius: 24px;
+            padding: 18px;
+            background: rgba(7, 10, 25, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .transcript-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .segment {
+            display: flex;
+            gap: 12px;
+            align-items: baseline;
+            font-size: 1rem;
+            line-height: 1.4;
+            word-break: break-word;
+        }
+        .segment-text {
+            flex: 1;
+        }
+        .timecode {
+            font-size: 0.85rem;
+            color: #7bedff;
+            min-width: 90px;
+            display: none;
+        }
+        .transcript-container.show-times .timecode {
+            display: inline-block;
+        }
+        .final-output {
+            margin-top: 16px;
+            font-weight: 600;
+            color: #c5ffe4;
+        }
+        .error-output {
+            margin-top: 10px;
+            color: #ff9ea1;
+            min-height: 18px;
+        }
+        @media (max-width: 640px) {
+            .ui-card {
+                padding: 28px 20px;
+            }
+            .controls {
+                flex-direction: column;
+            }
+            .progress-meta {
+                flex-direction: column;
+                gap: 6px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="ui-card">
+            <div class="mic-icon" aria-hidden="true">🎙️</div>
+            <div class="mic-label" id="mic-label">Нажмите, чтобы записать</div>
+            <div class="drop-zone" id="drop-zone">
+                <p>
+                    <strong>Перетащите файл сюда</strong><br>
+                    или <span class="button-link" id="select-file-button">нажмите, чтобы выбрать файл</span>
+                </p>
+                <input type="file" id="file-input" accept="audio/*" />
+            </div>
+            <div class="controls">
+                <label class="control">
+                    <span>Модель (по умолчанию стандартная)</span>
+                    <select id="model-select"></select>
+                </label>
+                <label class="control" hidden=true>
+                    <span>API-ключ</span>
+                    <input type="text" id="api-key-input" placeholder="Укажите ключ или используйте стандартный" />
+                </label>
+                <button type="button" id="toggle-times">Показать таймкоды</button>
+            </div>
+            <div class="progress-track">
+                <div class="progress-bar" id="progress-bar"></div>
+            </div>
+            <div class="progress-meta">
+                <span id="speed-label">Скорость: —</span>
+                <span id="estimate-label">Ожидание: —</span>
+            </div>
+            <div class="status-bar" id="status-bar">Готово</div>
+            <div class="output">
+                <div id="transcript" class="transcript-container"></div>
+                <div id="final-output" class="final-output"></div>
+                <div id="error-output" class="error-output" aria-live="assertive"></div>
+            </div>
+        </div>
+    <script>
+        const DEFAULT_MODEL = 'base';
+        const DEFAULT_API_KEY = __API_KEY__;
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const modelSelect = document.getElementById('model-select');
+        const transcriptContainer = document.getElementById('transcript');
+        const finalOutput = document.getElementById('final-output');
+        const errorOutput = document.getElementById('error-output');
+        const statusBar = document.getElementById('status-bar');
+        const progressBar = document.getElementById('progress-bar');
+        const speedLabel = document.getElementById('speed-label');
+        const estimateLabel = document.getElementById('estimate-label');
+        const toggleTimes = document.getElementById('toggle-times');
+        const micIcon = document.querySelector('.mic-icon');
+        const micLabel = document.getElementById('mic-label');
+
+        let isProcessing = false;
+        let showTimecodes = false;
+        let startTime = 0;
+        let segmentsProcessed = 0;
+        let statusInterval = null;
+        let estimatedWait = 0;
+        let mediaRecorder = null;
+        let mediaStream = null;
+        let recordedChunks = [];
+
+        const recordingSupported = typeof MediaRecorder !== 'undefined';
+
+        document.getElementById('api-key-input').value = DEFAULT_API_KEY;
+
+        function setStatus(message) {
+            statusBar.textContent = message;
+        }
+
+        function updateRecordingUI(active) {
+            micIcon.classList.toggle('recording', active);
+            micLabel.textContent = active ? 'Идет запись… нажмите, чтобы остановить' : 'Нажмите, чтобы записать';
+        }
+
+        function cleanupRecordingStream() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach((track) => track.stop());
+                mediaStream = null;
+            }
+            mediaRecorder = null;
+        }
+
+        async function startRecording() {
+            if (isProcessing) {
+                errorOutput.textContent = 'Подождите завершения текущей расшифровки';
+                return;
+            }
+            if (!recordingSupported) {
+                errorOutput.textContent = 'Ваш браузер не поддерживает запись с микрофона';
+                return;
+            }
+            try {
+                recordedChunks = [];
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : 'audio/webm';
+                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: preferredMime });
+                mediaRecorder.addEventListener('dataavailable', (event) => {
+                    if (event.data && event.data.size > 0) {
+                        recordedChunks.push(event.data);
+                    }
+                });
+                mediaRecorder.addEventListener('stop', () => {
+                    updateRecordingUI(false);
+                    cleanupRecordingStream();
+                    if (!recordedChunks.length) {
+                        setStatus('Запись отменена');
+                        return;
+                    }
+                    const blob = new Blob(recordedChunks, { type: preferredMime });
+                    const file = new File([blob], `recording-${Date.now()}.webm`, { type: blob.type });
+                    transcribeFile(file);
+                });
+                mediaRecorder.addEventListener('error', (event) => {
+                    errorOutput.textContent = event.error?.message || 'Ошибка записи';
+                    updateRecordingUI(false);
+                    cleanupRecordingStream();
+                });
+                mediaRecorder.start();
+                setStatus('Идет запись...');
+                updateRecordingUI(true);
+            } catch (error) {
+                errorOutput.textContent = error.message;
+                updateRecordingUI(false);
+                cleanupRecordingStream();
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            } else {
+                updateRecordingUI(false);
+                cleanupRecordingStream();
+            }
+        }
+
+        function formatTime(value = 0) {
+            const minutes = Math.floor(value / 60);
+            const seconds = (value % 60).toFixed(2).padStart(5, '0');
+            return `${minutes}:${seconds}`;
+        }
+
+        function updateProgress(final = false) {
+            if (!startTime) {
+                progressBar.style.width = final ? '100%' : '0%';
+                return;
+            }
+            const elapsed = Math.max(0.1, (Date.now() - startTime) / 1000);
+            const speed = segmentsProcessed / elapsed;
+            speedLabel.textContent = `Скорость: ${speed.toFixed(2)} сег/с`;
+            const waitLeft = final ? 0 : Math.max(0, estimatedWait - elapsed);
+            estimateLabel.textContent = final ? 'Ожидание: завершено' : `Ожидание: ~${waitLeft.toFixed(1)} с`;
+            const ratio = final ? 1 : Math.min(1, elapsed / (elapsed + Math.max(waitLeft, 1)));
+            progressBar.style.width = `${Math.floor(ratio * 100)}%`;
+        }
+
+        async function refreshStatus() {
+            try {
+                const response = await fetch('/status');
+                if (!response.ok) {
+                    throw new Error('Не удалось получить статус');
+                }
+                const payload = await response.json();
+                const queueSize = Number(payload.queue_size || 0);
+                estimatedWait = queueSize * 3 + 1;
+                setStatus(queueSize ? `В очереди: ${queueSize}` : 'Обработка запроса...');
+                updateProgress();
+            } catch (error) {
+                setStatus('Не удалось обновить статус очереди');
+            }
+        }
+
+        function appendSegment(segment) {
+            if (!segment) {
+                return;
+            }
+            segmentsProcessed += 1;
+            const wrapper = document.createElement('div');
+            wrapper.className = 'segment';
+            const timestamp = document.createElement('span');
+            timestamp.className = 'timecode';
+            timestamp.textContent = `${formatTime(segment.start)} → ${formatTime(segment.end)}`;
+            const text = document.createElement('div');
+            text.className = 'segment-text';
+            text.textContent = segment.text;
+            wrapper.appendChild(timestamp);
+            wrapper.appendChild(text);
+            transcriptContainer.appendChild(wrapper);
+            transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
+            updateProgress();
+        }
+
+        function cleanupProcessing({ finalMessage, success = true } = {}) {
+            if (statusInterval) {
+                clearInterval(statusInterval);
+                statusInterval = null;
+            }
+            dropZone.classList.remove('working');
+            if (finalMessage) {
+                setStatus(finalMessage);
+            }
+            isProcessing = false;
+            if (success) {
+                updateProgress(true);
+            } else {
+                progressBar.style.width = '0%';
+            }
+        }
+
+        async function loadModels() {
+            try {
+                const response = await fetch('/models');
+                if (!response.ok) {
+                    throw new Error('Не удалось получить список моделей');
+                }
+                const models = await response.json();
+                if (Array.isArray(models) && models.length) {
+                    modelSelect.innerHTML = models
+                        .map((model) => `<option value="${model}">${model}</option>`)
+                        .join('');
+                    if (!models.includes(DEFAULT_MODEL)) {
+                        modelSelect.prepend(new Option(DEFAULT_MODEL, DEFAULT_MODEL));
+                    }
+                    modelSelect.value = DEFAULT_MODEL;
+                }
+            } catch (error) {
+                setStatus('Ошибка загрузки моделей');
+            }
+        }
+
+        async function transcribeFile(file) {
+            if (!file || isProcessing) {
+                if (isProcessing) {
+                    errorOutput.textContent = 'Подождите завершения текущей расшифровки';
+                }
+                return;
+            }
+            isProcessing = true;
+            segmentsProcessed = 0;
+            startTime = Date.now();
+            estimatedWait = 0;
+            transcriptContainer.innerHTML = '';
+            finalOutput.textContent = '';
+            errorOutput.textContent = '';
+            progressBar.style.width = '0%';
+            dropZone.classList.add('working');
+            setStatus('Загрузка файла на сервер...');
+            const apiKeyValue = document.getElementById('api-key-input').value.trim() || DEFAULT_API_KEY;
+            const form = new FormData();
+            form.append('file', file);
+            const requestUrl = new URL('/transcribe', window.location.origin);
+            requestUrl.searchParams.set('stream', 'true');
+            requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
+            requestUrl.searchParams.set('api_key', apiKeyValue);
+            refreshStatus();
+            statusInterval = setInterval(refreshStatus, 1800);
+            try {
+                const response = await fetch(requestUrl, {
+                    method: 'POST',
+                    body: form,
+                });
+                if (!response.ok) {
+                    const message = await response.text();
+                    throw new Error(message || `Ошибка: ${response.status}`);
+                }
+                const reader = response.body?.getReader();
+                if (!reader) {
+                    throw new Error('Сервер не вернул поток');
+                }
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += decoder.decode(value, { stream: true });
+                    let newlineIndex;
+                    while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                        const line = buffer.slice(0, newlineIndex).trim();
+                        buffer = buffer.slice(newlineIndex + 1);
+                        if (!line) {
+                            continue;
+                        }
+                        const payload = JSON.parse(line);
+                        if (payload.error) {
+                            throw new Error(payload.error);
+                        }
+                        if (payload.segment) {
+                            appendSegment(payload.segment);
+                        }
+                        if (payload.result && payload.result.text) {
+                            finalOutput.textContent = payload.result.text;
+                        }
+                    }
+                }
+                const tail = buffer.trim();
+                if (tail) {
+                    const payload = JSON.parse(tail);
+                    if (payload.error) {
+                        throw new Error(payload.error);
+                    }
+                    if (payload.segment) {
+                        appendSegment(payload.segment);
+                    }
+                    if (payload.result && payload.result.text) {
+                        finalOutput.textContent = payload.result.text;
+                    }
+                }
+                cleanupProcessing({ finalMessage: 'Готово', success: true });
+            } catch (error) {
+                errorOutput.textContent = error.message;
+                cleanupProcessing({ finalMessage: 'Ошибка транскрипции', success: false });
+            }
+        }
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragenter', (event) => {
+            event.preventDefault();
+            dropZone.classList.add('active');
+        });
+        dropZone.addEventListener('dragover', (event) => {
+            event.preventDefault();
+            dropZone.classList.add('active');
+        });
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('active');
+        });
+        dropZone.addEventListener('drop', (event) => {
+            event.preventDefault();
+            dropZone.classList.remove('active');
+            const selectedFile = event.dataTransfer.files?.[0];
+            transcribeFile(selectedFile);
+        });
+        fileInput.addEventListener('change', () => {
+            const selectedFile = fileInput.files?.[0];
+            transcribeFile(selectedFile);
+        });
+        micIcon.addEventListener('click', () => {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        });
+        toggleTimes.addEventListener('click', () => {
+            showTimecodes = !showTimecodes;
+            transcriptContainer.classList.toggle('show-times', showTimecodes);
+            toggleTimes.textContent = showTimecodes ? 'Скрыть таймкоды' : 'Показать таймкоды';
+        });
+
+        loadModels();
+    </script>
+</body>
+</html>
