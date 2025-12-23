@@ -1,8 +1,9 @@
 import asyncio
 import multiprocessing as mp
 import tempfile
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -45,6 +46,8 @@ response_queue = mp.Queue()
 pending_results = {}
 pending_streams = {}
 model_usage = None
+
+TEMPLATE_PATH = Path(__file__).parent / "templates" / "webui.html"
 
 app = FastAPI()
 
@@ -303,6 +306,14 @@ async def status():
     queue_size = request_queue.qsize()
     usage = dict(app.state.model_usage) if hasattr(app.state, "model_usage") else {}
     return {"queue_size": queue_size, "model_usage": usage}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def webui():
+    api_key_value = json.dumps(os.getenv("API_KEY", "bad-key"))
+    template = TEMPLATE_PATH.read_text()
+    html_content = template.replace("__API_KEY__", api_key_value)
+    return HTMLResponse(html_content)
 
 if __name__ == "__main__":
     import uvicorn
