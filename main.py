@@ -41,8 +41,8 @@ ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 CACHE_TTL = 60 * 60 * 24 * 30
 cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
 
-request_queue = mp.Queue()
-response_queue = mp.Queue()
+request_queue = None
+response_queue = None
 pending_results = {}
 pending_streams = {}
 model_usage = None
@@ -54,9 +54,10 @@ app = FastAPI()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await startup_event()
-    yield
-    shutdown_event()
-    app.state.response_listener_task.cancel()
+    try:
+        yield
+    finally:
+        await shutdown_event()
 
 app.router.lifespan_context = lifespan
 
@@ -171,10 +172,13 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
             logger.exception("Фатальная ошибка в loop:")
             time.sleep(1)
 
-async def response_listener(stop_event):
-    while not stop_event.is_set():
+async def response_listener(stop_event, response_queue):
+    loop = asyncio.get_running_loop()
+    while True:
         try:
-            result = await asyncio.get_event_loop().run_in_executor(app.state.executor, response_queue.get)
+            result = await loop.run_in_executor(app.state.executor, response_queue.get)
+            if result is None or result.get("__shutdown__"):
+                break
             logger.info(f'response_listener get from queue result {result}')
             request_id = result["request_id"]
             if request_id in pending_results:
@@ -203,23 +207,67 @@ async def response_listener(stop_event):
 
 async def startup_event():
     global model_usage
-    stop_event = mp.Event()
-    manager = mp.Manager()
+    ctx = mp.get_context()
+    stop_event = ctx.Event()
+    manager = ctx.Manager()
     model_usage = manager.dict()
-    process = mp.Process(target=model_worker, args=(request_queue, response_queue, stop_event, model_usage))
+    request_queue = ctx.Queue()
+    response_queue = ctx.Queue()
+    process = ctx.Process(
+        target=model_worker,
+        args=(request_queue, response_queue, stop_event, model_usage),
+    )
     process.start()
     executor = ThreadPoolExecutor()
     app.state.stop_event = stop_event
     app.state.model_process = process
     app.state.executor = executor
-    app.state.response_listener_task = asyncio.create_task(response_listener(stop_event))
+    app.state.request_queue = request_queue
+    app.state.response_queue = response_queue
+    app.state.manager = manager
+    app.state.response_listener_task = asyncio.create_task(
+        response_listener(stop_event, response_queue)
+    )
     app.state.model_usage = model_usage
 
-def shutdown_event():
+async def shutdown_event():
     logger.info("Остановка процесса...")
     app.state.stop_event.set()
-    app.state.model_process.join()
-    logger.info("Модель завершена.")
+    try:
+        app.state.response_queue.put({"__shutdown__": True})
+    except Exception:
+        pass
+
+    if hasattr(app.state, "response_listener_task"):
+        app.state.response_listener_task.cancel()
+        try:
+            await app.state.response_listener_task
+        except asyncio.CancelledError:
+            pass
+
+    process = app.state.model_process
+    process.join(timeout=10)
+    if process.is_alive():
+        logger.warning("Модель не завершилась вовремя, отправляем terminate.")
+        process.terminate()
+        process.join(timeout=5)
+    else:
+        logger.info("Модель завершена.")
+
+    app.state.executor.shutdown(wait=False)
+
+    for q in (app.state.request_queue, app.state.response_queue):
+        try:
+            q.close()
+            q.join_thread()
+        except Exception:
+            pass
+
+    if hasattr(app.state, "manager"):
+        try:
+            app.state.manager.shutdown()
+        except Exception:
+            pass
 
 @app.post("/transcribe")
 async def transcribe(
@@ -238,17 +286,25 @@ async def transcribe(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = f"{model}:{language}:{words}:{audio_hash}"
+льно     cache_key = f"{model}:{language}:{words}:{audio_hash}"
 
     if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
         return cache[cache_key]
     if cache_key in cache and stream:
         logger.info(f"[CACHE HIT] {cache_key}")
+        cached_result = cache[cache_key]
         async def cached():
-            for segment in cache[cache_key]['segments']:
+            for segment in cached_result.get("segments", []):
                 yield json.dumps({"segment": segment}) + "\n"
-        return StreamingResponse(cached(), media_type="application/json")
+            yield json.dumps({"result": cached_result}) + "\n"
+        headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",   # для nginx
+            "X-Content-Type-Options": "nosniff",
+        }
+        return StreamingResponse(cached(), media_type="application/x-ndjson", headers=headers)
 
     request_id = id(audio_bytes)
     loop = asyncio.get_event_loop()
@@ -259,7 +315,7 @@ async def transcribe(
         future = loop.create_future()
         pending_results[request_id] = future
 
-    request_queue.put({
+    app.state.request_queue.put({
         "request_id": request_id,
         "audio_bytes": audio_bytes,
         "model": model,
@@ -283,8 +339,7 @@ async def transcribe(
             "X-Accel-Buffering": "no",   # для nginx
             "X-Content-Type-Options": "nosniff",
         }
-        return StreamingResponse(generator(), media_type="application/x-ndjson",
-    headers=headers)
+        return StreamingResponse(generator(), media_type="application/x-ndjson", headers=headers)
     else:
         try:
             result = await asyncio.wait_for(future, timeout=600)
@@ -303,7 +358,7 @@ async def models():
 
 @app.get("/status")
 async def status():
-    queue_size = request_queue.qsize()
+    queue_size = app.state.request_queue.qsize()
     usage = dict(app.state.model_usage) if hasattr(app.state, "model_usage") else {}
     return {"queue_size": queue_size, "model_usage": usage}
 
