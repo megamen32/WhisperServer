@@ -18,6 +18,10 @@ import whisperclient
 _MODEL: Optional[WhisperModel] = None
 
 
+def _get_server_url() -> str:
+    return whisperclient.server_url
+
+
 def _get_model() -> WhisperModel:
     global _MODEL
     if _MODEL is None:
@@ -102,7 +106,7 @@ def transcribe_sync(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    url = "https://whisper.bezrabotnyi.com/transcribe"
+    url = _get_server_url()
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
     params = {"model": model_name, "api_key": key}
@@ -143,7 +147,7 @@ def transcribe_stream_sync(
     Yields dictionaries received from the server in real time. Falls back to a
     one-shot local transcription if the request fails.
     """
-    url = "https://whisper.bezrabotnyi.com/transcribe"
+    url = _get_server_url()
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
     params = {"model": model_name, "api_key": key, "stream": "true"}
@@ -202,7 +206,7 @@ async def transcribe_with_fallback(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    url = "https://whisper.bezrabotnyi.com/transcribe"
+    url = _get_server_url()
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
     data = {"model": model_name, "api_key": key}
@@ -250,7 +254,7 @@ async def transcribe_stream_with_fallback(
     model: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
     """Asynchronously stream transcription results with local fallback."""
-    url = "https://whisper.bezrabotnyi.com/transcribe"
+    url = _get_server_url()
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
     params = {"model": model_name, "api_key": key, "stream": "true"}

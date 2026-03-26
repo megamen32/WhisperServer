@@ -12,3 +12,4 @@ import os
 api_key = os.getenv("API_KEY", "bad-key")
 # Модель по умолчанию используется при обращении к серверу
 model = os.getenv("MODEL", "large-v3")
+server_url = os.getenv("WHISPER_URL", "https://whisper.bezrabotnyi.com/transcribe")

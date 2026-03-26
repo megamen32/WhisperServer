@@ -5,3 +5,6 @@ faster-whisper
 python-multipart
 python-dotenv
 torch
+aiohttp
+requests
+aiogram>=3,<4

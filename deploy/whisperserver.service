@@ -1,0 +1,16 @@
+[Unit]
+Description=WhisperServer FastAPI with Telegram bot subprocess
+After=network.target
+
+[Service]
+Type=simple
+User=roomhacker
+Group=roomhacker
+WorkingDirectory=/home/roomhacker/PycharmProjects/WhisperServer
+EnvironmentFile=/home/roomhacker/PycharmProjects/WhisperServer/.env
+ExecStart=/home/roomhacker/PycharmProjects/WhisperServer/venv/bin/python /home/roomhacker/PycharmProjects/WhisperServer/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
