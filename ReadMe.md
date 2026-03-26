@@ -39,6 +39,26 @@ python main.py
 
 By default, the server runs at `http://localhost:7653`
 
+### Telegram bot subprocess
+
+If `TG_BOT_TOKEN` is set in the environment, the server will also start `telegram_bot.py`
+as a separate subprocess and keep it alive. By default that bot uses the local server URL
+`http://127.0.0.1:7653/transcribe`.
+
+Useful variables:
+
+```bash
+TG_BOT_TOKEN=...
+TG_BOT_ENABLED=1
+TG_BOT_MODEL=base
+TG_BOT_LANG=ru
+TG_BOT_MAX_SIZE_MB=40
+TG_BOT_CONCURRENCY=4
+TG_BOT_SERVER_URL=http://127.0.0.1:7653/transcribe
+```
+
+An example `systemd` unit is included at `deploy/whisperserver.service`.
+
 ---
 
 ## 📡 API Usage
@@ -120,5 +140,4 @@ The server cleanly shuts down:
 ## License
 
 MIT — use it, modify it, profit from it. No warranty.
-
 

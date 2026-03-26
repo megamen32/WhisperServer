@@ -1,5 +1,9 @@
 import asyncio
+import importlib.util
 import multiprocessing as mp
+import signal
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Request, HTTPException
@@ -48,6 +52,7 @@ pending_streams = {}
 model_usage = None
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "webui.html"
+BOT_SCRIPT_PATH = Path(__file__).parent / "telegram_bot.py"
 
 app = FastAPI()
 
@@ -63,6 +68,86 @@ app.router.lifespan_context = lifespan
 
 def hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _bot_enabled() -> bool:
+    flag = os.getenv("TG_BOT_ENABLED")
+    if flag is not None:
+        return _env_flag("TG_BOT_ENABLED")
+    return bool(os.getenv("TG_BOT_TOKEN"))
+
+
+def start_bot_subprocess():
+    if not _bot_enabled():
+        logger.info("Telegram bot subprocess disabled.")
+        return None
+    if not os.getenv("TG_BOT_TOKEN"):
+        logger.warning("TG_BOT_ENABLED is set, but TG_BOT_TOKEN is empty. Bot will not start.")
+        return None
+    if importlib.util.find_spec("aiogram") is None:
+        logger.error("aiogram is not installed. Telegram bot subprocess will not start.")
+        return None
+    if not BOT_SCRIPT_PATH.exists():
+        logger.error("telegram_bot.py not found. Telegram bot subprocess will not start.")
+        return None
+
+    env = os.environ.copy()
+    env.setdefault("TG_BOT_API_KEY", os.getenv("API_KEY", "bad-key"))
+    env.setdefault("TG_BOT_MODEL", os.getenv("MODEL", "base"))
+    env.setdefault("TG_BOT_SERVER_URL", "http://127.0.0.1:7653/transcribe")
+    env.setdefault("WHISPER_URL", env["TG_BOT_SERVER_URL"])
+
+    process = subprocess.Popen(
+        [sys.executable, str(BOT_SCRIPT_PATH)],
+        cwd=str(Path(__file__).parent),
+        env=env,
+    )
+    logger.info("Telegram bot subprocess started with pid=%s", process.pid)
+    return process
+
+
+async def stop_bot_subprocess():
+    process = getattr(app.state, "bot_process", None)
+    if process is None or process.poll() is not None:
+        return
+
+    logger.info("Stopping Telegram bot subprocess...")
+    loop = asyncio.get_running_loop()
+    process.send_signal(signal.SIGINT)
+    try:
+        await loop.run_in_executor(None, process.wait, 10)
+        logger.info("Telegram bot subprocess stopped.")
+        return
+    except subprocess.TimeoutExpired:
+        logger.warning("Telegram bot subprocess did not stop in time, sending terminate.")
+
+    process.terminate()
+    try:
+        await loop.run_in_executor(None, process.wait, 5)
+        logger.info("Telegram bot subprocess terminated.")
+    except subprocess.TimeoutExpired:
+        logger.warning("Telegram bot subprocess is still alive, sending kill.")
+        process.kill()
+        await loop.run_in_executor(None, process.wait)
+
+
+async def monitor_bot_subprocess():
+    while not app.state.lifecycle_stop.is_set():
+        process = getattr(app.state, "bot_process", None)
+        if process is not None and process.poll() is not None:
+            logger.warning(
+                "Telegram bot subprocess exited with code %s. Restarting.",
+                process.returncode,
+            )
+            app.state.bot_process = start_bot_subprocess()
+        await asyncio.sleep(5)
 
 def model_worker(request_queue, response_queue, stop_event, usage_dict):
     model_cache = {}
@@ -229,9 +314,21 @@ async def startup_event():
         response_listener(stop_event, response_queue)
     )
     app.state.model_usage = model_usage
+    app.state.lifecycle_stop = asyncio.Event()
+    app.state.bot_process = start_bot_subprocess()
+    app.state.bot_monitor_task = asyncio.create_task(monitor_bot_subprocess())
 
 async def shutdown_event():
     logger.info("Остановка процесса...")
+    if hasattr(app.state, "lifecycle_stop"):
+        app.state.lifecycle_stop.set()
+    if hasattr(app.state, "bot_monitor_task"):
+        app.state.bot_monitor_task.cancel()
+        try:
+            await app.state.bot_monitor_task
+        except asyncio.CancelledError:
+            pass
+    await stop_bot_subprocess()
     app.state.stop_event.set()
     try:
         app.state.response_queue.put({"__shutdown__": True})
@@ -360,7 +457,14 @@ async def models():
 async def status():
     queue_size = app.state.request_queue.qsize()
     usage = dict(app.state.model_usage) if hasattr(app.state, "model_usage") else {}
-    return {"queue_size": queue_size, "model_usage": usage}
+    bot_process = getattr(app.state, "bot_process", None)
+    bot_status = {
+        "enabled": _bot_enabled(),
+        "running": bool(bot_process and bot_process.poll() is None),
+        "pid": bot_process.pid if bot_process else None,
+        "returncode": bot_process.poll() if bot_process else None,
+    }
+    return {"queue_size": queue_size, "model_usage": usage, "telegram_bot": bot_status}
 
 
 @app.get("/", response_class=HTMLResponse)
