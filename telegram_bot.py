@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, Message
@@ -46,6 +47,7 @@ class BotSettings:
     def __init__(self) -> None:
         self.token = os.getenv("TG_BOT_TOKEN", "")
         self.api_key = os.getenv("TG_BOT_API_KEY", os.getenv("API_KEY", "bad-key"))
+        self.http_proxy = os.getenv("TG_BOT_HTTP_PROXY", "http://192.168.2.1:3128")
         self.server_url = os.getenv(
             "TG_BOT_SERVER_URL",
             os.getenv("WHISPER_URL", "http://127.0.0.1:7653/transcribe"),
@@ -64,7 +66,8 @@ whisperclient.api_key = settings.api_key
 whisperclient.model = settings.model
 whisperclient.server_url = settings.server_url
 
-bot = Bot(token=settings.token)
+bot_session = AiohttpSession(proxy=settings.http_proxy)
+bot = Bot(token=settings.token, session=bot_session)
 dp = Dispatcher()
 sem = asyncio.Semaphore(settings.concurrency)
 chat_langs: dict[int, Optional[str]] = {}
@@ -288,7 +291,11 @@ async def handle_media(message: Message) -> None:
 
 
 async def run_bot() -> None:
-    log.info("Telegram bot started. Server URL: %s", settings.server_url)
+    log.info(
+        "Telegram bot started. Server URL: %s. Proxy: %s",
+        settings.server_url,
+        settings.http_proxy,
+    )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -297,7 +304,11 @@ async def run_bot() -> None:
             loop.add_signal_handler(sig, stop_event.set)
 
     polling_task = asyncio.create_task(
-        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            skip_updates=False,
+        )
     )
     stop_task = asyncio.create_task(stop_event.wait())
 
