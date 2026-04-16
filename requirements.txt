@@ -6,5 +6,6 @@ python-multipart
 python-dotenv
 torch
 aiohttp
+aiohttp-socks
 requests
 aiogram>=3,<4
