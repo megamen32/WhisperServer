@@ -1,103 +1,96 @@
-"""Utility functions for speech-to-text using Faster Whisper."""
+"""
+Utility functions for speech-to-text.
+Local transcription is delegated to whisper_cli.py via subprocess
+to avoid loading heavy dependencies (torch, ctranslate2) at import time.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import json
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 from typing import AsyncGenerator, Generator, Optional
-import threading
 
+# No heavy imports here — only standard library + lightweight deps
 import aiohttp
 import requests
-from faster_whisper import WhisperModel
-import whisperclient
-
-_MODEL: Optional[WhisperModel] = None
 
 
-def _get_server_url() -> str:
-    return whisperclient.server_url
+def _get_cli_path() -> str:
+    """Return absolute path to whisper_cli.py."""
+    # Option 1: same directory as this module
+    cli_path = Path(__file__).parent / "whisper_cli.py"
+    if cli_path.exists():
+        return str(cli_path.resolve())
+    # Option 2: installed as console script
+    return "whisper_cli"
 
 
-def _get_model() -> WhisperModel:
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = WhisperModel("base", device="cpu")
-    return _MODEL
+def _has_cuda() -> bool:
+    """Check if NVIDIA GPU is available without importing torch."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
-def _transcribe(path: str) -> str:
-    model = _get_model()
-    segments, _ = model.transcribe(path, beam_size=5)
-    return " ".join(s.text.strip() for s in segments)
+def _run_cli_sync(
+    file_path: str,
+    model: str,
+    device: Optional[str],
+    include_words: bool,
+    stream: bool,
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    """Execute whisper_cli.py synchronously."""
+    cmd = [
+        sys.executable,
+        _get_cli_path(),
+        file_path,
+        "--model", model,
+    ]
+    if device:
+        cmd.extend(["--device", device])
+    if include_words:
+        cmd.append("--words")
+    if stream:
+        cmd.append("--stream")
 
-
-def _transcribe_stream(
-    path: str, include_words: bool = False
-) -> Generator[dict, None, None]:
-    """Local streaming transcription yielding results in server format."""
-    model = _get_model()
-    segments, info = model.transcribe(
-        path,
-        beam_size=5,
-        word_timestamps=include_words,
-        condition_on_previous_text=False,
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
     )
 
-    all_segments = []
-    all_words = []
-    for seg in segments:
-        seg_data = {"start": seg.start, "end": seg.end, "text": seg.text}
-        all_segments.append(seg_data)
-        if include_words and seg.words:
-            words = [
-                {"start": w.start, "end": w.end, "word": w.word} for w in seg.words
-            ]
-            all_words.extend(words)
-        else:
-            words = []
-        item = {"segment": seg_data}
-        if include_words:
-            item["words"] = words
-        yield item
 
-    result = {
-        "text": " ".join(s["text"] for s in all_segments),
-        "segments": all_segments,
-        "language": info.language,
-        "language_probability": info.language_probability,
-    }
-    if include_words:
-        result["words"] = all_words
-    yield {"result": result}
-
-
-async def _transcribe_stream_async(
-    path: str, include_words: bool = False
-) -> AsyncGenerator[dict, None]:
-    """Asynchronous wrapper around :func:`_transcribe_stream`."""
-    loop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-
-    def worker() -> None:
+def _parse_cli_output(output: str) -> Optional[dict]:
+    """Parse JSON from CLI stdout. Handle multi-line NDJSON for streaming."""
+    lines = output.strip().split("\n")
+    last_result = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            for item in _transcribe_stream(path, include_words=include_words):
-                loop.call_soon_threadsafe(queue.put_nowait, item)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-    while True:
-        item = await queue.get()
-        if item is None:
-            break
-        yield item
-    thread.join()
+            data = json.loads(line)
+            if data.get("type") == "result":
+                last_result = data
+        except json.JSONDecodeError:
+            continue
+    return last_result
 
 
 def transcribe_sync(
@@ -106,34 +99,60 @@ def transcribe_sync(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    url = _get_server_url()
+    """
+    Transcribe audio file.
+    Tries remote server first, falls back to local CLI subprocess.
+    """
+    # Lazy import to avoid circular deps / early load
+    import whisperclient
+
+    url = whisperclient.server_url
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
-    params = {"model": model_name, "api_key": key}
-    if language:
-        params["language"] = language
 
+    # === Remote attempt ===
     try:
         with open(file_path, "rb") as f:
             files = {
                 "file": (os.path.basename(file_path), f, "application/octet-stream")
             }
+            params = {"model": model_name, "api_key": key}
+            if language:
+                params["language"] = language
             response = requests.post(url, files=files, params=params, timeout=600)
             if response.ok:
                 return response.json()["text"]
             else:
                 logging.warning(
-                    f"[Whisper сервер ответил {response.status_code}] {response.text}"
+                    f"[Whisper remote {response.status_code}] {response.text[:200]}"
                 )
     except Exception:
-        logging.warning("Ошибка при обращении к удалённому whisper", exc_info=True)
+        logging.warning("Remote whisper request failed", exc_info=True)
 
-    logging.info("Пробуем локальную расшифровку...")
+    # === Local CLI fallback ===
+    logging.info("Falling back to local CLI transcription")
     try:
-        return _transcribe(file_path)
+        device = "cuda" if _has_cuda() else "cpu"
+        proc = _run_cli_sync(
+            file_path=file_path,
+            model=model_name or "base",
+            device=device,
+            include_words=False,
+            stream=False,
+            timeout=600,
+        )
+        if proc.returncode == 0:
+            result = _parse_cli_output(proc.stdout)
+            if result and "text" in result:
+                return result["text"]
+        else:
+            logging.error(f"CLI failed: {proc.stderr[:300]}")
+    except subprocess.TimeoutExpired:
+        logging.error("Local CLI transcription timed out")
     except Exception:
-        logging.exception("Локальный whisper тоже не сработал")
-        return "[TRANSCRIPTION ERROR]"
+        logging.exception("Local CLI transcription crashed")
+
+    return "[TRANSCRIPTION ERROR]"
 
 
 def transcribe_stream_sync(
@@ -142,23 +161,25 @@ def transcribe_stream_sync(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> Generator[dict, None, None]:
-    """Stream transcription results from the remote server.
-
-    Yields dictionaries received from the server in real time. Falls back to a
-    one-shot local transcription if the request fails.
     """
-    url = _get_server_url()
+    Stream transcription results.
+    Remote streaming first, then local CLI streaming fallback.
+    """
+    import whisperclient
+
+    url = whisperclient.server_url
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
-    params = {"model": model_name, "api_key": key, "stream": "true"}
-    if language:
-        params["language"] = language
 
+    # === Remote streaming attempt ===
     try:
         with open(file_path, "rb") as f:
             files = {
                 "file": (os.path.basename(file_path), f, "application/octet-stream")
             }
+            params = {"model": model_name, "api_key": key, "stream": "true"}
+            if language:
+                params["language"] = language
             with requests.post(
                 url, files=files, params=params, timeout=600, stream=True
             ) as resp:
@@ -169,35 +190,33 @@ def transcribe_stream_sync(
                     return
                 else:
                     logging.warning(
-                        f"[Whisper сервер ответил {resp.status_code}] {resp.text}"
+                        f"[Whisper remote {resp.status_code}] {resp.text[:200]}"
                     )
     except Exception:
-        logging.warning("Ошибка при обращении к удалённому whisper", exc_info=True)
+        logging.warning("Remote streaming failed", exc_info=True)
 
-    logging.info("Пробуем локальную расшифровку...")
+    # === Local CLI streaming fallback ===
+    logging.info("Falling back to local CLI streaming")
     try:
-        for item in _transcribe_stream(file_path, include_words=False):
-            yield item
+        device = "cuda" if _has_cuda() else "cpu"
+        proc = _run_cli_sync(
+            file_path=file_path,
+            model=model_name or "base",
+            device=device,
+            include_words=False,
+            stream=True,
+            timeout=600,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.strip().split("\n"):
+                if line.strip():
+                    yield json.loads(line)
+        else:
+            logging.error(f"CLI streaming failed: {proc.stderr[:300]}")
+            yield {"result": {"text": "[TRANSCRIPTION ERROR]"}}
     except Exception:
-        logging.exception("Локальный whisper тоже не сработал")
+        logging.exception("Local CLI streaming crashed")
         yield {"result": {"text": "[TRANSCRIPTION ERROR]"}}
-
-
-async def voice_to_text(message) -> str:  # For aiogram uses
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        file_path = tmp.name
-
-    await message.download_media(file_path)
-
-    try:
-        text = await transcribe_with_fallback(file_path)
-    finally:
-        try:
-            os.remove(file_path)
-        except OSError:
-            logging.warning("Не удалось удалить временный файл", exc_info=True)
-
-    return text
 
 
 async def transcribe_with_fallback(
@@ -206,13 +225,14 @@ async def transcribe_with_fallback(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    url = _get_server_url()
+    """Async transcription with remote fallback + local CLI."""
+    import whisperclient
+
+    url = whisperclient.server_url
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
-    data = {"model": model_name, "api_key": key}
-    if language:
-        data["language"] = language
 
+    # === Remote async attempt ===
     try:
         async with aiohttp.ClientSession() as session:
             with open(file_path, "rb") as f:
@@ -223,9 +243,11 @@ async def transcribe_with_fallback(
                     filename=os.path.basename(file_path),
                     content_type="application/octet-stream",
                 )
-
+                params = {"model": model_name, "api_key": key}
+                if language:
+                    params["language"] = language
                 async with session.post(
-                    url, data=form, params=data, timeout=600
+                    url, data=form, params=params, timeout=600
                 ) as resp:
                     if resp.status == 200:
                         result = await resp.json()
@@ -233,18 +255,34 @@ async def transcribe_with_fallback(
                     else:
                         error_text = await resp.text()
                         logging.warning(
-                            f"[Whisper сервер ответил {resp.status}] {error_text}"
+                            f"[Whisper remote {resp.status}] {error_text[:200]}"
                         )
     except Exception:
-        logging.warning("Ошибка при обращении к удалённому whisper", exc_info=True)
+        logging.warning("Remote async whisper failed", exc_info=True)
 
-    logging.info("Пробуем локальную расшифровку...")
+    # === Local CLI fallback (run in executor) ===
+    logging.info("Falling back to local CLI (async)")
     loop = asyncio.get_event_loop()
     try:
-        return await loop.run_in_executor(None, _transcribe, file_path)
+        device = "cuda" if _has_cuda() else "cpu"
+        proc = await loop.run_in_executor(
+            None,
+            _run_cli_sync,
+            file_path,
+            model_name or "base",
+            device,
+            False,  # include_words
+            False,  # stream
+            600,    # timeout
+        )
+        if proc.returncode == 0:
+            result = _parse_cli_output(proc.stdout)
+            if result and "text" in result:
+                return result["text"]
     except Exception:
-        logging.exception("Локальный whisper тоже не сработал")
-        return "[TRANSCRIPTION ERROR]"
+        logging.exception("Local CLI async fallback failed")
+
+    return "[TRANSCRIPTION ERROR]"
 
 
 async def transcribe_stream_with_fallback(
@@ -253,14 +291,14 @@ async def transcribe_stream_with_fallback(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
-    """Asynchronously stream transcription results with local fallback."""
-    url = _get_server_url()
+    """Async streaming with remote fallback + local CLI streaming."""
+    import whisperclient
+
+    url = whisperclient.server_url
     key = api_key or whisperclient.api_key
     model_name = model or whisperclient.model
-    params = {"model": model_name, "api_key": key, "stream": "true"}
-    if language:
-        params["language"] = language
 
+    # === Remote async streaming ===
     try:
         async with aiohttp.ClientSession() as session:
             with open(file_path, "rb") as f:
@@ -271,6 +309,9 @@ async def transcribe_stream_with_fallback(
                     filename=os.path.basename(file_path),
                     content_type="application/octet-stream",
                 )
+                params = {"model": model_name, "api_key": key, "stream": "true"}
+                if language:
+                    params["language"] = language
                 async with session.post(
                     url, data=form, params=params, timeout=600
                 ) as resp:
@@ -283,20 +324,66 @@ async def transcribe_stream_with_fallback(
                     else:
                         error_text = await resp.text()
                         logging.warning(
-                            f"[Whisper сервер ответил {resp.status}] {error_text}"
+                            f"[Whisper remote {resp.status}] {error_text[:200]}"
                         )
     except Exception:
-        logging.warning("Ошибка при обращении к удалённому whisper", exc_info=True)
+        logging.warning("Remote async streaming failed", exc_info=True)
 
-    logging.info("Пробуем локальную расшифровку...")
+    # === Local CLI streaming fallback ===
+    logging.info("Falling back to local CLI streaming (async)")
     try:
-        async for item in _transcribe_stream_async(file_path, include_words=False):
-            yield item
+        device = "cuda" if _has_cuda() else "cpu"
+        cmd = [
+            sys.executable,
+            _get_cli_path(),
+            file_path,
+            "--model", model_name or "base",
+            "--device", device,
+            "--stream",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8").strip()
+                if line:
+                    yield json.loads(line)
+            await proc.wait()
+        finally:
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read()
+                logging.error(f"CLI streaming failed: {stderr.decode()[:300]}")
     except Exception:
-        logging.exception("Локальный whisper тоже не сработал")
+        logging.exception("Local CLI async streaming crashed")
         yield {"result": {"text": "[TRANSCRIPTION ERROR]"}}
 
 
+async def voice_to_text(message) -> str:
+    """
+    Helper for aiogram: download voice message and transcribe.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        file_path = tmp.name
+
+    try:
+        await message.download_media(file_path)
+        text = await transcribe_with_fallback(file_path)
+        return text
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            logging.warning("Failed to remove temp file", exc_info=True)
+
+
 if __name__ == "__main__":
-    t = transcribe_sync("/tmp/test.ogg")
-    print(t)
+    # Quick self-test
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python transcriber.py <audio_file>")
+        sys.exit(1)
+    result = transcribe_sync(sys.argv[1])
+    print(result)
