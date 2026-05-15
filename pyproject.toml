@@ -1,3 +1,21 @@
+[project]
+name = "whisper-server"
+version = "0.1.0"
+description = "OpenAI-compatible Whisper API server"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "asyncio: marks tests as async",
+    "integration: marks tests as integration tests",
+]
+
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
