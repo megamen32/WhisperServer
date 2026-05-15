@@ -1,12 +1,18 @@
 # Ignore Python envs and cache
 venv/
+.venv/
+.pytest_cache/
 __pycache__/
 *.pyc
 
+
 # Ignore secrets
 .env
+
 whisper_cache/
 dist/
 *.egg-info/
 .pypirc
 build-env/
+
+openapi.yaml
