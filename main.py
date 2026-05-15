@@ -5,8 +5,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import shutil
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Query, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,11 @@ MODEL_PRIORITY = {
 }
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
+
+# Map OpenAI model names to faster-whisper models
+OPENAI_MODEL_MAP = {
+    "whisper-1": os.getenv("OPENAI_DEFAULT_MODEL", "large-v3"),
+}
 
 # Cache with 10GB limit and 1 month TTL for entries
 CACHE_TTL = 60 * 60 * 24 * 30
@@ -173,7 +179,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 request_id = request["request_id"]
                 lang = request.get("language")
                 cache_key = request.get("cache_key")
-                beam_size = request.get("beam_size",5)
+                beam_size = request.get("beam_size", 5)
+                temperature = request.get("temperature", 0.0)
                 stream = request.get("stream")
 
                 try:
@@ -196,6 +203,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             temp_path,
                             beam_size=beam_size,
                             language=lang,
+                            temperature=temperature,
                             word_timestamps=request.get("words", False),
                             condition_on_previous_text=False,
                         )
@@ -372,9 +380,10 @@ async def transcribe(
     model: str = Query("base"),
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
+    temperature: float = Query(0.0),
     stream: bool = Query(False),
     words: bool = Query(False),
-    api_key:str=Query(...),
+    api_key: str = Query(...),
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
@@ -419,6 +428,7 @@ async def transcribe(
         "language": language,
         "cache_key": cache_key,
         "beam_size": beam_size,
+        "temperature": temperature,
         "stream": stream,
         "words": words,
     })
@@ -447,6 +457,69 @@ async def transcribe(
         except Exception as e:
             pending_results.pop(request_id, None)
             return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/v1/audio/transcriptions")
+async def openai_transcribe(
+    file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
+    language: Optional[str] = Form(None),
+    temperature: float = Form(0.0),
+):
+    """OpenAI-compatible transcription endpoint"""
+    # Map OpenAI model name to actual model
+    actual_model = OPENAI_MODEL_MAP.get(model, model)
+
+    if actual_model not in MODEL_PRIORITY:
+        return JSONResponse({"error": f"Unsupported model: {actual_model}"}, status_code=400)
+
+    # Check file format
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in [".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".webm"]:
+        return JSONResponse({"error": "Unsupported audio format"}, status_code=400)
+
+    # Read audio file
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return JSONResponse({"error": "Empty audio file"}, status_code=400)
+
+    # Create cache key for this request
+    audio_hash = hash_bytes(audio_bytes)
+    cache_key = f"openai:{actual_model}:{language}:{audio_hash}"
+
+    # Check cache
+    if cache_key in cache:
+        logger.info(f"[CACHE HIT] {cache_key}")
+        cached_result = cache[cache_key]
+        return JSONResponse({"text": cached_result.get("text", "")})
+
+    # Queue the request
+    request_id = id(audio_bytes)
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    pending_results[request_id] = future
+
+    app.state.request_queue.put({
+        "request_id": request_id,
+        "audio_bytes": audio_bytes,
+        "model": actual_model,
+        "language": language,
+        "cache_key": cache_key,
+        "beam_size": 5,
+        "temperature": temperature,
+        "stream": False,
+        "words": False,
+    })
+
+    try:
+        result = await asyncio.wait_for(future, timeout=600)
+        return JSONResponse({"text": result.get("text", "")})
+    except asyncio.TimeoutError:
+        pending_results.pop(request_id, None)
+        return JSONResponse({"error": "Transcription timeout"}, status_code=504)
+    except Exception as e:
+        pending_results.pop(request_id, None)
+        logger.exception("OpenAI transcribe error:")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/models")
 async def models():
