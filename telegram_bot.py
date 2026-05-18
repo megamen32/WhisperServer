@@ -7,7 +7,9 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import AsyncGenerator, Optional
+from urllib.parse import urlparse
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
@@ -36,11 +38,38 @@ SUPPORTED_DOC_EXTENSIONS = {
 }
 
 
+MODEL_PRIORITY = {
+    "tiny": 1, "base": 2, "small": 3, "medium": 4,
+    "distil-large-v3": 5, "large-v3": 6, "large-v2": 7, "large": 8,
+}
+_MIN_FAST_PRIORITY = MODEL_PRIORITY["medium"]
+
+
 def normalize_lang(lang: Optional[str]) -> Optional[str]:
     if not lang:
         return None
     short = lang.split("_")[0].split("-")[0].lower()
     return short if short in ALLOWED_LANGS else None
+
+
+async def _get_fast_model() -> Optional[str]:
+    parsed = urlparse(settings.server_url)
+    status_url = f"{parsed.scheme}://{parsed.netloc}/status"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(status_url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    usage = data.get("model_usage", {})
+                    loaded = [
+                        m for m, count in usage.items()
+                        if count > 0 and MODEL_PRIORITY.get(m, 0) >= _MIN_FAST_PRIORITY
+                    ]
+                    if loaded:
+                        return max(loaded, key=lambda m: MODEL_PRIORITY.get(m, 0))
+    except Exception:
+        pass
+    return None
 
 
 class BotSettings:
@@ -169,9 +198,12 @@ async def transcribe_stream(file_path: Path, lang: Optional[str]) -> AsyncGenera
     assembled: list[str] = []
     last_text = ""
 
+    model = await _get_fast_model() or whisperclient.model
+
     async for chunk in whisperclient.transcribe_stream_with_fallback(
         str(file_path),
         language=lang,
+        model=model,
     ):
         if "result" in chunk:
             text = (chunk["result"].get("text") or "").strip()
