@@ -472,7 +472,8 @@ async def transcribe(
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
-    if model not in MODEL_PRIORITY:
+    actual_model = OPENAI_MODEL_MAP.get(model, model)
+    if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
         return JSONResponse({"error": "Unsupported model"}, status_code=400)
 
     audio_bytes = await file.read()
@@ -509,7 +510,7 @@ async def transcribe(
     app.state.request_queue.put({
         "request_id": request_id,
         "audio_bytes": audio_bytes,
-        "model": model,
+        "model": actual_model,
         "language": language,
         "cache_key": cache_key,
         "beam_size": beam_size,
