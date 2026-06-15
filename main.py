@@ -42,10 +42,82 @@ MODEL_PRIORITY = {
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 
-# Map OpenAI model names to faster-whisper models
+# Map OpenAI model names to faster-whisper models.
+# whisper-1 is resolved inside the model worker: it reuses an already loaded
+# model when its priority is >= OPENAI_WHISPER_MIN_MODEL.
+OPENAI_WHISPER_ALIAS = "whisper-1"
+OPENAI_WHISPER_INTERNAL_MODEL = "__openai_whisper_1__"
+OPENAI_WHISPER_MIN_MODEL = os.getenv("OPENAI_WHISPER_MIN_MODEL", "medium")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "large-v3")
 OPENAI_MODEL_MAP = {
-    "whisper-1": os.getenv("OPENAI_DEFAULT_MODEL", "large-v3"),
+    OPENAI_WHISPER_ALIAS: OPENAI_WHISPER_INTERNAL_MODEL,
 }
+
+
+def _model_priority(model_id):
+    return MODEL_PRIORITY.get(model_id, 999)
+
+
+def _min_openai_whisper_priority():
+    if OPENAI_WHISPER_MIN_MODEL not in MODEL_PRIORITY:
+        logger.warning(
+            "Unknown OPENAI_WHISPER_MIN_MODEL=%s; falling back to medium",
+            OPENAI_WHISPER_MIN_MODEL,
+        )
+    return MODEL_PRIORITY.get(OPENAI_WHISPER_MIN_MODEL, MODEL_PRIORITY["medium"])
+
+
+def _select_openai_whisper_model(model_cache):
+    """Choose a concrete faster-whisper model for the OpenAI whisper-1 alias."""
+    min_priority = _min_openai_whisper_priority()
+    loaded_candidates = [
+        model_id
+        for model_id in model_cache.keys()
+        if MODEL_PRIORITY.get(model_id, -1) >= min_priority
+    ]
+    if loaded_candidates:
+        return sorted(loaded_candidates, key=_model_priority, reverse=True)[0]
+
+    if _model_priority(OPENAI_DEFAULT_MODEL) >= min_priority:
+        return OPENAI_DEFAULT_MODEL
+
+    # Default is smaller than the configured minimum: load the minimum model.
+    return OPENAI_WHISPER_MIN_MODEL if OPENAI_WHISPER_MIN_MODEL in MODEL_PRIORITY else "medium"
+
+
+def _get_openai_model_ids():
+    """Return OpenAI-compatible model ids: alias first, then concrete local models."""
+    ids = ["whisper-1"]
+    for model_id in MODEL_PRIORITY.keys():
+        if model_id not in ids:
+            ids.append(model_id)
+    return ids
+
+
+def _require_openai_api_key(request: Request):
+    """Validate OpenAI-compatible Authorization: Bearer <API_KEY> or X-API-Key."""
+    expected = os.getenv("API_KEY", "").strip()
+    if not expected:
+        return
+
+    auth_header = request.headers.get("authorization", "").strip()
+    supplied = ""
+    if auth_header.lower().startswith("bearer "):
+        supplied = auth_header[7:].strip()
+    if not supplied:
+        supplied = request.headers.get("x-api-key", "").strip()
+
+    if supplied != expected:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "Invalid API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
 
 # Cache with 10GB limit and 1 month TTL for entries
 CACHE_TTL = 60 * 60 * 24 * 30
@@ -184,12 +256,25 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 stream = request.get("stream")
 
                 try:
+                    requested_model_name = model_name
+                    if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
+                        model_name = _select_openai_whisper_model(model_cache)
+                        logger.info(
+                            "Resolved %s to %s (min=%s, loaded=%s)",
+                            OPENAI_WHISPER_ALIAS,
+                            model_name,
+                            OPENAI_WHISPER_MIN_MODEL,
+                            sorted(model_cache.keys(), key=_model_priority),
+                        )
+
                     if model_name not in model_cache:
                         logger.info(f"Loading model: {model_name}")
                         device = "cuda" if torch.cuda.is_available() else "cpu"
                         compute = "float16" if device == "cuda" else "int8"
                         model_cache[model_name] = WhisperModel(model_name, device=device, compute_type=compute)
                     usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
+                    if requested_model_name != model_name:
+                        usage_dict[requested_model_name] = usage_dict.get(requested_model_name, 0) + 1
 
                     model = model_cache[model_name]
 
@@ -460,16 +545,19 @@ async def transcribe(
 
 @app.post("/v1/audio/transcriptions")
 async def openai_transcribe(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     language: Optional[str] = Form(None),
     temperature: float = Form(0.0),
 ):
     """OpenAI-compatible transcription endpoint"""
+    _require_openai_api_key(request)
+
     # Map OpenAI model name to actual model
     actual_model = OPENAI_MODEL_MAP.get(model, model)
 
-    if actual_model not in MODEL_PRIORITY:
+    if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
         return JSONResponse({"error": f"Unsupported model: {actual_model}"}, status_code=400)
 
     # Check file format
@@ -484,7 +572,8 @@ async def openai_transcribe(
 
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = f"openai:{actual_model}:{language}:{audio_hash}"
+    cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
+    cache_key = f"openai:{cache_key_model}:{language}:{audio_hash}"
 
     # Check cache
     if cache_key in cache:
@@ -520,6 +609,25 @@ async def openai_transcribe(
         pending_results.pop(request_id, None)
         logger.exception("OpenAI transcribe error:")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/v1/models")
+async def openai_models(request: Request):
+    """OpenAI-compatible models list."""
+    _require_openai_api_key(request)
+    created = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "local-whisperserver",
+            }
+            for model_id in _get_openai_model_ids()
+        ],
+    }
+
 
 @app.get("/models")
 async def models():
