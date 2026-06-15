@@ -42,7 +42,12 @@ MODEL_PRIORITY = {
     "tiny": 1, "base": 2, "small": 3, "medium": 4,
     "distil-large-v3": 5, "large-v3": 6, "large-v2": 7, "large": 8,
 }
-_MIN_FAST_PRIORITY = MODEL_PRIORITY["medium"]
+OPENAI_WHISPER_ALIAS = "whisper-1"
+OPENAI_WHISPER_MIN_MODEL = os.getenv("OPENAI_WHISPER_MIN_MODEL", "medium")
+
+
+def _min_openai_whisper_priority() -> int:
+    return MODEL_PRIORITY.get(OPENAI_WHISPER_MIN_MODEL, MODEL_PRIORITY["medium"])
 
 
 def normalize_lang(lang: Optional[str]) -> Optional[str]:
@@ -63,7 +68,7 @@ async def _get_fast_model() -> Optional[str]:
                     usage = data.get("model_usage", {})
                     loaded = [
                         m for m, count in usage.items()
-                        if count > 0 and MODEL_PRIORITY.get(m, 0) >= _MIN_FAST_PRIORITY
+                        if count > 0 and MODEL_PRIORITY.get(m, 0) >= _min_openai_whisper_priority()
                     ]
                     if loaded:
                         return max(loaded, key=lambda m: MODEL_PRIORITY.get(m, 0))
@@ -81,7 +86,7 @@ class BotSettings:
             "TG_BOT_SERVER_URL",
             os.getenv("WHISPER_URL", "http://127.0.0.1:7653/transcribe"),
         )
-        self.model = os.getenv("TG_BOT_MODEL", os.getenv("MODEL", "base"))
+        self.model = os.getenv("TG_BOT_MODEL", os.getenv("MODEL", OPENAI_WHISPER_ALIAS))
         self.default_lang = normalize_lang(os.getenv("TG_BOT_LANG"))
         self.concurrency = max(1, int(os.getenv("TG_BOT_CONCURRENCY", "4")))
         self.max_size_mb = max(1, int(os.getenv("TG_BOT_MAX_SIZE_MB", "40")))
@@ -198,7 +203,10 @@ async def transcribe_stream(file_path: Path, lang: Optional[str]) -> AsyncGenera
     assembled: list[str] = []
     last_text = ""
 
-    model = await _get_fast_model() or whisperclient.model
+    # Use the same dynamic model-selection path as OpenAI-compatible whisper-1.
+    # The server resolves whisper-1 to an already loaded model >= OPENAI_WHISPER_MIN_MODEL,
+    # or falls back to OPENAI_DEFAULT_MODEL / OPENAI_WHISPER_MIN_MODEL.
+    model = whisperclient.model
 
     async for chunk in whisperclient.transcribe_stream_with_fallback(
         str(file_path),
