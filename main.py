@@ -85,6 +85,29 @@ def _select_openai_whisper_model(model_cache):
     return OPENAI_WHISPER_MIN_MODEL if OPENAI_WHISPER_MIN_MODEL in MODEL_PRIORITY else "medium"
 
 
+
+def _is_truthy(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _openai_sse(event):
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _openai_delta_event(text, segment_id=None):
+    event = {"type": "transcript.text.delta", "delta": text or ""}
+    if segment_id is not None:
+        event["segment_id"] = str(segment_id)
+    return event
+
+
+def _openai_done_event(text):
+    return {"type": "transcript.text.done", "text": text or ""}
+
 def _get_openai_model_ids():
     """Return OpenAI-compatible model ids: alias first, then concrete local models."""
     ids = ["whisper-1"]
@@ -551,6 +574,8 @@ async def openai_transcribe(
     model: str = Form("whisper-1"),
     language: Optional[str] = Form(None),
     temperature: float = Form(0.0),
+    response_format: str = Form("json"),
+    stream: bool = Form(False),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
@@ -580,13 +605,34 @@ async def openai_transcribe(
     if cache_key in cache:
         logger.info(f"[CACHE HIT] {cache_key}")
         cached_result = cache[cache_key]
-        return JSONResponse({"text": cached_result.get("text", "")})
+        cached_text = cached_result.get("text", "")
+        if stream:
+            async def cached_stream_generator():
+                if cached_text:
+                    yield _openai_sse(_openai_delta_event(cached_text))
+                yield _openai_sse(_openai_done_event(cached_text))
+
+            return StreamingResponse(
+                cached_stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        return JSONResponse({"text": cached_text})
 
     # Queue the request
     request_id = id(audio_bytes)
     loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    pending_results[request_id] = future
+    if stream:
+        queue = asyncio.Queue()
+        pending_streams[request_id] = queue
+    else:
+        future = loop.create_future()
+        pending_results[request_id] = future
 
     app.state.request_queue.put({
         "request_id": request_id,
@@ -596,9 +642,39 @@ async def openai_transcribe(
         "cache_key": cache_key,
         "beam_size": 5,
         "temperature": temperature,
-        "stream": False,
+        "stream": stream,
         "words": False,
     })
+
+    if stream:
+        async def openai_stream_generator():
+            final_text = ""
+            try:
+                while True:
+                    item = await asyncio.wait_for(queue.get(), timeout=600)
+                    if item is None:
+                        break
+                    if "segment" in item:
+                        segment = item["segment"]
+                        text = segment.get("text", "")
+                        final_text += text
+                        yield _openai_sse(_openai_delta_event(text, segment.get("id")))
+                    elif "result" in item:
+                        result = item["result"]
+                        yield _openai_sse(_openai_done_event(result.get("text", final_text)))
+            finally:
+                pending_streams.pop(request_id, None)
+
+        return StreamingResponse(
+            openai_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     try:
         result = await asyncio.wait_for(future, timeout=600)
