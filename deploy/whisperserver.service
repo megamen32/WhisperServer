@@ -8,7 +8,8 @@ User=roomhacker
 Group=roomhacker
 WorkingDirectory=/home/roomhacker/PycharmProjects/WhisperServer
 EnvironmentFile=/home/roomhacker/PycharmProjects/WhisperServer/.env
-ExecStart=/home/roomhacker/PycharmProjects/WhisperServer/venv/bin/python /home/roomhacker/PycharmProjects/WhisperServer/main.py
+Environment=LD_LIBRARY_PATH=/home/roomhacker/PycharmProjects/WhisperServer/.venv/lib/python3.10/site-packages/nvidia/cublas/lib:/home/roomhacker/PycharmProjects/WhisperServer/.venv/lib/python3.10/site-packages/nvidia/cudnn/lib:/home/roomhacker/PycharmProjects/WhisperServer/.venv/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:/home/roomhacker/PycharmProjects/WhisperServer/.venv/lib/python3.10/site-packages/nvidia/cu13/lib
+ExecStart=/home/roomhacker/PycharmProjects/WhisperServer/.venv/bin/python /home/roomhacker/PycharmProjects/WhisperServer/main.py
 Restart=always
 RestartSec=5
 
