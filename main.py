@@ -6,9 +6,10 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import secrets
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -73,6 +74,59 @@ def _broker_cpu_capable(model_id: str) -> bool:
     return model_id in BROKER_CPU_CAPABLE
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
+WEBUI_SESSION_COOKIE = "whisper_web_session"
+WEBUI_CSRF_HEADER = "x-whisper-csrf"
+WEBUI_SESSION_TTL_SECONDS = int(os.getenv("WEBUI_SESSION_TTL_SECONDS", "7200"))
+_webui_sessions = {}
+
+
+def _new_webui_token():
+    return secrets.token_urlsafe(32)
+
+
+def _prune_webui_sessions(now=None):
+    now = now or time.time()
+    stale = [sid for sid, data in _webui_sessions.items() if data.get("expires", 0) < now]
+    for sid in stale:
+        _webui_sessions.pop(sid, None)
+
+
+def _create_webui_session():
+    now = time.time()
+    sid = secrets.token_urlsafe(32)
+    token = _new_webui_token()
+    _webui_sessions[sid] = {"token": token, "expires": now + WEBUI_SESSION_TTL_SECONDS}
+    return sid, token
+
+
+def _rotate_webui_token(sid):
+    token = _new_webui_token()
+    _webui_sessions[sid] = {"token": token, "expires": time.time() + WEBUI_SESSION_TTL_SECONDS}
+    return token
+
+
+def _same_origin_request(request: Request):
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", "")).split(",", 1)[0].strip()
+    expected = f"{scheme}://{host}"
+    return origin.rstrip("/") == expected.rstrip("/")
+
+
+def _consume_webui_token(request: Request):
+    _prune_webui_sessions()
+    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    supplied = request.headers.get(WEBUI_CSRF_HEADER, "")
+    session = _webui_sessions.get(sid)
+    if not sid or not supplied or not session or supplied != session.get("token"):
+        raise HTTPException(status_code=403, detail="Invalid or expired web UI token")
+    if not _same_origin_request(request):
+        _webui_sessions.pop(sid, None)
+        raise HTTPException(status_code=403, detail="Invalid request origin")
+    return _rotate_webui_token(sid)
+
 
 # Map OpenAI model names to faster-whisper models.
 # whisper-1 is resolved inside the model worker: it reuses an already loaded
@@ -641,6 +695,7 @@ async def transcribe(
 
 @app.post("/web/transcribe")
 async def web_transcribe(
+    request: Request,
     file: UploadFile = File(...),
     model: str = Query("base"),
     language: Optional[str] = Query(None),
@@ -649,8 +704,13 @@ async def web_transcribe(
     stream: bool = Query(False),
     words: bool = Query(False),
 ):
-    """First-party Web UI proxy: keeps API_KEY server-side and out of browser JS/URLs."""
-    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
+    """First-party Web UI tunnel: API_KEY stays server-side; CSRF token is one-use."""
+    next_token = _consume_webui_token(request)
+    response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
+    if not hasattr(response, "headers"):
+        response = JSONResponse(response)
+    response.headers["X-Whisper-Next-CSRF"] = next_token
+    return response
 
 @app.post("/v1/audio/transcriptions")
 async def openai_transcribe(
@@ -811,8 +871,21 @@ async def status():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def webui():
-    return HTMLResponse(TEMPLATE_PATH.read_text())
+async def webui(request: Request):
+    _prune_webui_sessions()
+    sid, token = _create_webui_session()
+    html = TEMPLATE_PATH.read_text().replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
+    response = HTMLResponse(html)
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
+    response.set_cookie(
+        WEBUI_SESSION_COOKIE,
+        sid,
+        max_age=WEBUI_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=(scheme == "https"),
+        samesite="strict",
+    )
+    return response
 
 if __name__ == "__main__":
     import uvicorn

@@ -375,6 +375,7 @@
         </div>
     <script>
         const DEFAULT_MODEL = 'large-v3';
+        let webuiCsrfToken = __WEBUI_CSRF_TOKEN__;
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
         const modelSelect = document.getElementById('model-select');
@@ -766,6 +767,7 @@
             activeXhr = xhr;
             xhr.open('POST', requestUrl.toString(), true);
             xhr.responseType = 'text';
+            xhr.setRequestHeader('X-Whisper-CSRF', webuiCsrfToken);
             xhr.upload.addEventListener('progress', (event) => {
                 if (event.lengthComputable) {
                     updateUploadProgress(event.loaded, event.total);
@@ -793,6 +795,10 @@
                 if (xhr.status < 200 || xhr.status >= 300) {
                     fail(xhr.responseText || `Ошибка: ${xhr.status}`);
                     return;
+                }
+                const nextToken = xhr.getResponseHeader('X-Whisper-Next-CSRF');
+                if (nextToken) {
+                    webuiCsrfToken = nextToken;
                 }
                 drainResponseText(xhr.responseText, true);
                 cleanupProcessing({ finalMessage: 'Готово', success: true });
