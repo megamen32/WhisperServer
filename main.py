@@ -18,6 +18,10 @@ import os
 import hashlib
 from contextlib import asynccontextmanager
 from faster_whisper import WhisperModel
+try:
+    from cudabroker_client import ManagedModel
+except Exception:
+    ManagedModel = None  # type: ignore
 from diskcache import Cache
 from dotenv import load_dotenv
 import torch
@@ -39,6 +43,34 @@ MODEL_PRIORITY = {
     "large-v2": 7,
     "large": 8,
 }
+
+BROKER_CLIENT_ID = os.getenv("CUDABROKER_CLIENT_ID", "whisper")
+BROKER_TTL_SECONDS = float(os.getenv("CUDABROKER_WHISPER_TTL_SECONDS", "900"))
+BROKER_VRAM_MB = {
+    "tiny": 800,
+    "base": 1000,
+    "small": 1600,
+    "medium": 3200,
+    "distil-large-v3": 4200,
+    "large-v3": 5200,
+    "large-v2": 5200,
+    "large": 5200,
+}
+BROKER_CPU_CAPABLE = {"tiny", "base", "small"}
+
+
+def _broker_vram_mb(model_id: str) -> int:
+    override = os.getenv(f"CUDABROKER_VRAM_MB_{model_id.replace('-', '_').upper()}")
+    if override:
+        return int(float(override))
+    return int(BROKER_VRAM_MB.get(model_id, 5200))
+
+
+def _broker_cpu_capable(model_id: str) -> bool:
+    override = os.getenv(f"CUDABROKER_CPU_CAPABLE_{model_id.replace('-', '_').upper()}")
+    if override is not None:
+        return _is_truthy(override)
+    return model_id in BROKER_CPU_CAPABLE
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 
@@ -291,15 +323,38 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         )
 
                     if model_name not in model_cache:
-                        logger.info(f"Loading model: {model_name}")
-                        device = "cuda" if torch.cuda.is_available() else "cpu"
-                        compute = "float16" if device == "cuda" else "int8"
-                        model_cache[model_name] = WhisperModel(model_name, device=device, compute_type=compute)
+                        logger.info(f"Preparing broker-managed model: {model_name}")
+                        if ManagedModel is not None:
+                            model_cache[model_name] = ManagedModel(
+                                model_id=f"whisper-{model_name}",
+                                loader=lambda mn=model_name: WhisperModel(
+                                    mn,
+                                    device="cuda" if torch.cuda.is_available() else "cpu",
+                                    compute_type="float16" if torch.cuda.is_available() else "int8",
+                                ),
+                                vram_mb=_broker_vram_mb(model_name),
+                                gpu_priority=MODEL_PRIORITY.get(model_name, 0),
+                                cpu_capable=_broker_cpu_capable(model_name),
+                                ttl_seconds=BROKER_TTL_SECONDS,
+                                cpu_fallback=(
+                                    lambda mn=model_name: WhisperModel(mn, device="cpu", compute_type="int8")
+                                ) if _broker_cpu_capable(model_name) else None,
+                                client_id=BROKER_CLIENT_ID,
+                            )
+                        else:
+                            logger.warning("cudabroker_client not available, loading WhisperModel without broker")
+                            device = "cuda" if torch.cuda.is_available() else "cpu"
+                            compute = "float16" if device == "cuda" else "int8"
+                            model_cache[model_name] = WhisperModel(model_name, device=device, compute_type=compute)
                     usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
                     if requested_model_name != model_name:
                         usage_dict[requested_model_name] = usage_dict.get(requested_model_name, 0) + 1
 
-                    model = model_cache[model_name]
+                    model_entry = model_cache[model_name]
+                    if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                        model = model_entry.acquire()
+                    else:
+                        model = model_entry
 
                     with tempfile.NamedTemporaryFile(delete=False) as temp:
                         temp.write(audio_bytes)
@@ -307,6 +362,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         temp_path = temp.name
 
                     try:
+                        if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                            model_entry.touch(active=True)
                         segments, info = model.transcribe(
                             temp_path,
                             beam_size=beam_size,
@@ -319,6 +376,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         all_words = []
 
                         for seg in segments:
+                            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                                model_entry.touch(active=True)
                             seg_data = {
                                 "start": seg.start,
                                 "end": seg.end,
