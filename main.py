@@ -541,19 +541,15 @@ async def shutdown_event():
         except Exception:
             pass
 
-@app.post("/transcribe")
-async def transcribe(
-    file: UploadFile = File(...),
-    model: str = Query("base"),
-    language: Optional[str] = Query(None),
-    beam_size: Optional[int] = Query(5),
-    temperature: float = Query(0.0),
-    stream: bool = Query(False),
-    words: bool = Query(False),
-    api_key: str = Query(...),
+async def _transcribe_impl(
+    file: UploadFile,
+    model: str,
+    language: Optional[str],
+    beam_size: Optional[int],
+    temperature: float,
+    stream: bool,
+    words: bool,
 ):
-    if api_key not in ALLOWED_API_KEYS:
-        return JSONResponse({"error": "Invalid API key"}, status_code=403)
     actual_model = OPENAI_MODEL_MAP.get(model, model)
     if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
         return JSONResponse({"error": "Unsupported model"}, status_code=400)
@@ -625,6 +621,36 @@ async def transcribe(
         except Exception as e:
             pending_results.pop(request_id, None)
             return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/transcribe")
+async def transcribe(
+    file: UploadFile = File(...),
+    model: str = Query("base"),
+    language: Optional[str] = Query(None),
+    beam_size: Optional[int] = Query(5),
+    temperature: float = Query(0.0),
+    stream: bool = Query(False),
+    words: bool = Query(False),
+    api_key: str = Query(...),
+):
+    if api_key not in ALLOWED_API_KEYS:
+        return JSONResponse({"error": "Invalid API key"}, status_code=403)
+    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
+
+
+@app.post("/web/transcribe")
+async def web_transcribe(
+    file: UploadFile = File(...),
+    model: str = Query("base"),
+    language: Optional[str] = Query(None),
+    beam_size: Optional[int] = Query(5),
+    temperature: float = Query(0.0),
+    stream: bool = Query(False),
+    words: bool = Query(False),
+):
+    """First-party Web UI proxy: keeps API_KEY server-side and out of browser JS/URLs."""
+    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
 
 @app.post("/v1/audio/transcriptions")
 async def openai_transcribe(
@@ -786,10 +812,7 @@ async def status():
 
 @app.get("/", response_class=HTMLResponse)
 async def webui():
-    api_key_value = json.dumps(os.getenv("API_KEY", "bad-key"))
-    template = TEMPLATE_PATH.read_text()
-    html_content = template.replace("__API_KEY__", api_key_value)
-    return HTMLResponse(html_content)
+    return HTMLResponse(TEMPLATE_PATH.read_text())
 
 if __name__ == "__main__":
     import uvicorn
