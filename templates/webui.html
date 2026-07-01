@@ -342,7 +342,6 @@
                 </label>
                 <label class="control" style="display: none;">
                     <span>API-ключ</span>
-                    <input type="text" id="api-key-input" placeholder="Укажите ключ или используйте стандартный" />
                 </label>
                 <button type="button" id="toggle-times">Показать таймкоды</button>
             </div>
@@ -376,7 +375,6 @@
         </div>
     <script>
         const DEFAULT_MODEL = 'large-v3';
-        const DEFAULT_API_KEY = __API_KEY__;
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
         const modelSelect = document.getElementById('model-select');
@@ -417,7 +415,6 @@
 
         const recordingSupported = typeof MediaRecorder !== 'undefined';
 
-        document.getElementById('api-key-input').value = DEFAULT_API_KEY;
         toggleTimes.hidden = true;
 
         function setStatus(message) {
@@ -688,13 +685,11 @@
             transcriptContainer.classList.remove('show-times');
             showTimecodes = false;
             toggleTimes.hidden = true;
-            const apiKeyValue = document.getElementById('api-key-input').value.trim() || DEFAULT_API_KEY;
             const form = new FormData();
             form.append('file', file);
-            const requestUrl = new URL('/transcribe', window.location.origin);
+            const requestUrl = new URL('/web/transcribe', window.location.origin);
             requestUrl.searchParams.set('stream', 'true');
             requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
-            requestUrl.searchParams.set('api_key', apiKeyValue);
 
             let buffer = '';
             let responseOffset = 0;
