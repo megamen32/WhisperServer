@@ -12,9 +12,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from main import app
 
 
+TEST_API_KEY = "WHISPER_TEST_API_KEY"
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {TEST_API_KEY}"}
+
+
 @pytest.fixture
 def client(monkeypatch):
     """Create a test client with mocked startup/shutdown."""
+    monkeypatch.setenv("API_KEY", TEST_API_KEY)
     # Mock the startup to avoid worker process
     async def mock_startup():
         app.state.request_queue = MagicMock()
@@ -65,13 +73,14 @@ class TestOpenAIEndpointValidation:
 
     def test_endpoint_exists(self, client):
         """Test that /v1/audio/transcriptions endpoint exists."""
-        response = client.post("/v1/audio/transcriptions")
+        response = client.post("/v1/audio/transcriptions", headers=auth_headers())
         assert response.status_code in [422, 400]  # Missing required fields
 
     def test_missing_file_returns_422(self, client):
         """Test that missing file parameter returns 422 (validation error)."""
         response = client.post(
             "/v1/audio/transcriptions",
+            headers=auth_headers(),
             data={"model": "whisper-1"}
         )
         assert response.status_code == 422
@@ -81,6 +90,7 @@ class TestOpenAIEndpointValidation:
         empty_file = io.BytesIO(b"")
         response = client.post(
             "/v1/audio/transcriptions",
+            headers=auth_headers(),
             files={"file": ("test.wav", empty_file, "audio/wav")},
             data={"model": "whisper-1"}
         )
@@ -92,6 +102,7 @@ class TestOpenAIEndpointValidation:
         unsupported = io.BytesIO(b"not audio data")
         response = client.post(
             "/v1/audio/transcriptions",
+            headers=auth_headers(),
             files={"file": ("test.txt", unsupported, "text/plain")},
             data={"model": "whisper-1"}
         )
@@ -162,6 +173,7 @@ class TestOpenAIEndpointValidation:
         """Test that invalid model name is rejected."""
         response = client.post(
             "/v1/audio/transcriptions",
+            headers=auth_headers(),
             files={"file": ("test.wav", sample_audio, "audio/wav")},
             data={"model": "invalid-model-xyz"}
         )
@@ -227,7 +239,8 @@ class TestOpenAISpecCompliance:
         """Test that error responses have 'error' field."""
         response = client.post(
             "/v1/audio/transcriptions",
-            files={"file": ("", io.BytesIO(b""), "text/plain")},
+            headers=auth_headers(),
+            files={"file": ("test.txt", io.BytesIO(b"not audio data"), "text/plain")},
             data={"model": "whisper-1"}
         )
         # Error response should have error field
