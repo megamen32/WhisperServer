@@ -663,7 +663,7 @@ async def _transcribe_impl(
         return cache[cache_key]
     if cache_key in cache and stream:
         logger.info(f"[CACHE HIT] {cache_key}")
-        cached_result = cache[cache_key]
+        cached_result = globals()["cache"][cache_key]
         async def cached():
             for segment in cached_result.get("segments", []):
                 yield json.dumps({"segment": segment}) + "\n"
@@ -771,6 +771,7 @@ async def openai_transcribe(
     response_format: str = Form("json"),
     stream: bool = Form(False),
     vad_filter: bool = Form(True),
+    cache: bool = Form(True),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
@@ -794,10 +795,10 @@ async def openai_transcribe(
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
-    cache_key = transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
+    cache_key = transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter) if cache else None
 
     # Check cache
-    if cache_key in cache:
+    if cache_key and cache_key in globals()["cache"]:
         logger.info(f"[CACHE HIT] {cache_key}")
         cached_result = cache[cache_key]
         cached_text = cached_result.get("text", "")
