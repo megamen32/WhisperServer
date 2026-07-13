@@ -152,6 +152,27 @@ OPENAI_MODEL_MAP = {
 }
 
 
+def build_vad_transcribe_options(enabled: bool) -> dict:
+    """Return faster-whisper kwargs for request-scoped VAD control."""
+    if not enabled:
+        return {"vad_filter": False, "vad_parameters": None}
+    return {
+        "vad_filter": True,
+        "vad_parameters": {
+            "threshold": WHISPER_VAD_THRESHOLD,
+            "min_speech_duration_ms": WHISPER_VAD_MIN_SPEECH_MS,
+            "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS,
+            "speech_pad_ms": WHISPER_VAD_SPEECH_PAD_MS,
+        },
+    }
+
+
+def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: str, *, vad_filter: bool, words: bool | None = None) -> str:
+    """Build a cache key that never mixes VAD-enabled and raw decoding."""
+    words_part = "" if words is None else f":{words}"
+    return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}"
+
+
 def _model_priority(model_id):
     return MODEL_PRIORITY.get(model_id, 999)
 
@@ -438,13 +459,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             temperature=temperature,
                             word_timestamps=request.get("words", False),
                             condition_on_previous_text=False,
-                            vad_filter=vad_filter,
-                            vad_parameters={
-                                "threshold": WHISPER_VAD_THRESHOLD,
-                                "min_speech_duration_ms": WHISPER_VAD_MIN_SPEECH_MS,
-                                "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS,
-                                "speech_pad_ms": WHISPER_VAD_SPEECH_PAD_MS,
-                            } if vad_filter else None,
+                            **build_vad_transcribe_options(vad_filter),
                             no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
                             log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
                             compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
@@ -641,7 +656,7 @@ async def _transcribe_impl(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = f"vad-v1:{int(vad_filter)}:{model}:{language}:{words}:{audio_hash}"
+    cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words)
 
     if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
@@ -779,7 +794,7 @@ async def openai_transcribe(
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
-    cache_key = f"openai:vad-v1:{int(vad_filter)}:{cache_key_model}:{language}:{audio_hash}"
+    cache_key = transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
 
     # Check cache
     if cache_key in cache:
