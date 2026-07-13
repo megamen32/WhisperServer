@@ -135,6 +135,18 @@ OPENAI_WHISPER_ALIAS = "whisper-1"
 OPENAI_WHISPER_INTERNAL_MODEL = "__openai_whisper_1__"
 OPENAI_WHISPER_MIN_MODEL = os.getenv("OPENAI_WHISPER_MIN_MODEL", "medium")
 OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "large-v3")
+
+# Speech filtering defaults. Silero VAD runs before decoding, so silence and
+# short noise bursts never reach Whisper. The decoder thresholds provide a
+# second guard against low-confidence hallucinations.
+WHISPER_VAD_ENABLED = os.getenv("WHISPER_VAD_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+WHISPER_VAD_THRESHOLD = float(os.getenv("WHISPER_VAD_THRESHOLD", "0.50"))
+WHISPER_VAD_MIN_SPEECH_MS = int(os.getenv("WHISPER_VAD_MIN_SPEECH_MS", "250"))
+WHISPER_VAD_MIN_SILENCE_MS = int(os.getenv("WHISPER_VAD_MIN_SILENCE_MS", "700"))
+WHISPER_VAD_SPEECH_PAD_MS = int(os.getenv("WHISPER_VAD_SPEECH_PAD_MS", "200"))
+WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.60"))
+WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-1.0"))
+WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
 OPENAI_MODEL_MAP = {
     OPENAI_WHISPER_ALIAS: OPENAI_WHISPER_INTERNAL_MODEL,
 }
@@ -363,6 +375,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 beam_size = request.get("beam_size", 5)
                 temperature = request.get("temperature", 0.0)
                 stream = request.get("stream")
+                vad_filter = request.get("vad_filter", WHISPER_VAD_ENABLED)
 
                 try:
                     requested_model_name = model_name
@@ -425,6 +438,16 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             temperature=temperature,
                             word_timestamps=request.get("words", False),
                             condition_on_previous_text=False,
+                            vad_filter=vad_filter,
+                            vad_parameters={
+                                "threshold": WHISPER_VAD_THRESHOLD,
+                                "min_speech_duration_ms": WHISPER_VAD_MIN_SPEECH_MS,
+                                "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS,
+                                "speech_pad_ms": WHISPER_VAD_SPEECH_PAD_MS,
+                            } if vad_filter else None,
+                            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
                         )
                         all_segments = []
                         all_words = []
@@ -432,10 +455,17 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         for seg in segments:
                             if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                                 model_entry.touch(active=True)
+                            seg_text = (seg.text or "").strip()
+                            if not seg_text:
+                                logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
+                                continue
                             seg_data = {
                                 "start": seg.start,
                                 "end": seg.end,
-                                "text": seg.text,
+                                "text": seg_text,
+                                "avg_logprob": getattr(seg, "avg_logprob", None),
+                                "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                                "compression_ratio": getattr(seg, "compression_ratio", None),
                             }
                             logger.info(f'{model_name} processed segment: {seg_data}')
                             all_segments.append(seg_data)
@@ -603,6 +633,7 @@ async def _transcribe_impl(
     temperature: float,
     stream: bool,
     words: bool,
+    vad_filter: bool,
 ):
     actual_model = OPENAI_MODEL_MAP.get(model, model)
     if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
@@ -610,7 +641,7 @@ async def _transcribe_impl(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = f"{model}:{language}:{words}:{audio_hash}"
+    cache_key = f"vad-v1:{int(vad_filter)}:{model}:{language}:{words}:{audio_hash}"
 
     if cache_key in cache and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
@@ -649,6 +680,7 @@ async def _transcribe_impl(
         "temperature": temperature,
         "stream": stream,
         "words": words,
+        "vad_filter": vad_filter,
     })
 
     if stream:
@@ -686,11 +718,12 @@ async def transcribe(
     temperature: float = Query(0.0),
     stream: bool = Query(False),
     words: bool = Query(False),
+    vad_filter: bool = Query(True),
     api_key: str = Query(...),
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
-    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
+    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter)
 
 
 @app.post("/web/transcribe")
@@ -703,10 +736,11 @@ async def web_transcribe(
     temperature: float = Query(0.0),
     stream: bool = Query(False),
     words: bool = Query(False),
+    vad_filter: bool = Query(True),
 ):
     """First-party Web UI tunnel: API_KEY stays server-side; CSRF token is one-use."""
     next_token = _consume_webui_token(request)
-    response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words)
+    response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter)
     if not hasattr(response, "headers"):
         response = JSONResponse(response)
     response.headers["X-Whisper-Next-CSRF"] = next_token
@@ -721,6 +755,7 @@ async def openai_transcribe(
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
     stream: bool = Form(False),
+    vad_filter: bool = Form(True),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
@@ -744,7 +779,7 @@ async def openai_transcribe(
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
-    cache_key = f"openai:{cache_key_model}:{language}:{audio_hash}"
+    cache_key = f"openai:vad-v1:{int(vad_filter)}:{cache_key_model}:{language}:{audio_hash}"
 
     # Check cache
     if cache_key in cache:
@@ -789,6 +824,7 @@ async def openai_transcribe(
         "temperature": temperature,
         "stream": stream,
         "words": False,
+        "vad_filter": vad_filter,
     })
 
     if stream:
