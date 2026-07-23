@@ -9,7 +9,7 @@
 - **OpenAI-compatible API**: `POST /v1/audio/transcriptions`, `GET /v1/models`.
 - **Обычный API**: `POST /transcribe` для прямого использования без OpenAI SDK.
 - **Streaming**: Server-Sent Events для OpenAI endpoint и NDJSON для локального endpoint.
-- **Автовыбор модели**: `whisper-1` разворачивается в локальную faster-whisper модель, по умолчанию `large-v3`.
+- **OpenAI alias**: `whisper-1` переиспользует сильнейшую загруженную модель, а при пустом worker загружает `parakeet-v3`.
 - **Очередь и приоритеты**: более лёгкие модели получают более высокий приоритет, тяжёлые не блокируют весь сервер.
 - **Lazy loading + TTL**: модели грузятся по требованию и могут выгружаться после простоя через CUDA broker.
 - **Кеширование**: повторная отправка того же файла возвращает результат из `diskcache`.
@@ -17,6 +17,8 @@
 - **Telegram bot**: можно отправить голосовое, аудио или видео и получить текст.
 - **Python client**: библиотека `whisperclient` сначала пробует удалённый сервер, при ошибке может упасть в локальный faster-whisper CLI.
 - **CUDA broker integration**: сервер может договариваться с другими GPU-проектами о VRAM и приоритетах.
+- **Модельная телеметрия**: каждая обработка может записываться в JSONL с RTF, queue/load/inference latency и VRAM.
+- **VAD**: Whisper использует встроенный Silero VAD faster-whisper, а Parakeet v3 — общий Silero VAD frontend с сохранением таймкодов.
 
 ## Быстрый старт
 
@@ -25,7 +27,7 @@ git clone https://github.com/megamen32/WhisperServer.git
 cd WhisperServer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env
 python main.py
 ```
@@ -85,16 +87,23 @@ curl -N http://127.0.0.1:7653/v1/audio/transcriptions \
 
 ## Модели
 
-Поддерживаются `tiny`, `base`, `small`, `medium`, `distil-large-v3`, `large-v3`, `large-v2`, `large` и OpenAI alias `whisper-1`.
+Поддерживаются `tiny`, `base`, `small`, `medium`, `distil-large-v3`, `large-v3`, `large-v2`, `large`, `parakeet-v3` и OpenAI alias `whisper-1`. Parakeet v3 загружается как `nvidia/parakeet-tdt-0.6b-v3` через NeMo и распознаёт 25 европейских языков.
 
-По умолчанию `whisper-1` выбирает `OPENAI_DEFAULT_MODEL=large-v3`, но если уже загружена подходящая модель не ниже `OPENAI_WHISPER_MIN_MODEL`, сервер переиспользует её.
+`whisper-1` — умный alias: если в worker уже загружена модель, используется
+сильнейшая загруженная модель; если ничего нет, по умолчанию загружается
+`parakeet-v3`.
+
+Для Whisper-запросов worker может обслужить слабую модель уже загруженной
+совместимой более сильной моделью. Реальное решение возвращается в полях
+`requested_model`, `served_model`, `model_substituted` и
+`substitution_reason`.
 
 ## Конфигурация
 
 ```bash
 API_KEY=dev-local-key
-MODEL=base
-OPENAI_DEFAULT_MODEL=large-v3
+MODEL=parakeet-v3
+OPENAI_DEFAULT_MODEL=parakeet-v3
 TG_BOT_ENABLED=false
 ```
 
@@ -107,7 +116,7 @@ import whisperclient
 from whisperclient import transcribe_sync, transcribe_stream_sync
 
 whisperclient.api_key = "dev-local-key"
-whisperclient.model = "large-v3"
+whisperclient.model = "parakeet-v3"
 whisperclient.whisper_url = "http://127.0.0.1:7653/transcribe"
 
 print(transcribe_sync("voice.ogg"))
@@ -146,7 +155,7 @@ sudo systemctl status whisperserver --no-pager
 ## Разработка
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e ".[dev]"
 pytest -q
 python -m py_compile main.py telegram_bot.py whisperclient/*.py tests/*.py
 ```

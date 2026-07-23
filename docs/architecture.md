@@ -10,7 +10,7 @@ FastAPI main.py
         |
         +--> diskcache: кеш результатов
         +--> multiprocessing queue: очередь запросов
-        +--> model worker: faster-whisper model cache
+        +--> model worker: native model backend cache
         +--> CUDA broker: опциональная координация GPU/VRAM
 ```
 
@@ -20,7 +20,7 @@ FastAPI main.py
 2. Аудио хешируется; если результат есть в `whisper_cache`, сервер возвращает кеш.
 3. Если кеша нет, запрос кладётся в multiprocessing queue.
 4. Worker выбирает/загружает модель.
-5. faster-whisper возвращает сегменты и финальный текст.
+5. Backend возвращает сегменты и финальный текст.
 6. Результат сохраняется в кеш и отдаётся клиенту.
 
 ## Streaming
@@ -30,7 +30,19 @@ FastAPI main.py
 
 ## Model selection
 
-`whisper-1` — alias, который выбирает конкретную faster-whisper модель: уже загруженную подходящую, `OPENAI_DEFAULT_MODEL` или минимум `OPENAI_WHISPER_MIN_MODEL`.
+`whisper-1` — умный alias: worker переиспользует сильнейшую уже загруженную
+модель, а если cache пуст, загружает `OPENAI_DEFAULT_MODEL` (по умолчанию
+`parakeet-v3`). Whisper-модели работают через faster-whisper, а `parakeet-v3`
+— через NeMo.
+
+Если в worker уже загружена более сильная совместимая Whisper-модель, запрос
+более слабой модели обслуживается ей. Таблица подмен намеренно не включает
+Parakeet: у него другой backend и набор гарантий по языкам/декодированию.
+Ответ содержит `requested_model`, `served_model`, `model_substituted` и
+`substitution_reason`.
+
+Каждая job также записывается в `WHISPER_METRICS_JSONL`: очередь, холодная
+загрузка, inference time, audio duration, RTF, peak VRAM и результат.
 
 ## CUDA broker
 

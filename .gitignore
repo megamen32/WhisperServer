@@ -16,3 +16,4 @@ dist/
 build-env/
 
 openapi.yaml
+whisper_metrics.jsonl

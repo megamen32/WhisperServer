@@ -7,9 +7,6 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import AsyncGenerator, Optional
-from urllib.parse import urlparse
-
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
@@ -38,16 +35,7 @@ SUPPORTED_DOC_EXTENSIONS = {
 }
 
 
-MODEL_PRIORITY = {
-    "tiny": 1, "base": 2, "small": 3, "medium": 4,
-    "distil-large-v3": 5, "large-v3": 6, "large-v2": 7, "large": 8,
-}
 OPENAI_WHISPER_ALIAS = "whisper-1"
-OPENAI_WHISPER_MIN_MODEL = os.getenv("OPENAI_WHISPER_MIN_MODEL", "medium")
-
-
-def _min_openai_whisper_priority() -> int:
-    return MODEL_PRIORITY.get(OPENAI_WHISPER_MIN_MODEL, MODEL_PRIORITY["medium"])
 
 
 def normalize_lang(lang: Optional[str]) -> Optional[str]:
@@ -55,26 +43,6 @@ def normalize_lang(lang: Optional[str]) -> Optional[str]:
         return None
     short = lang.split("_")[0].split("-")[0].lower()
     return short if short in ALLOWED_LANGS else None
-
-
-async def _get_fast_model() -> Optional[str]:
-    parsed = urlparse(settings.server_url)
-    status_url = f"{parsed.scheme}://{parsed.netloc}/status"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(status_url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    usage = data.get("model_usage", {})
-                    loaded = [
-                        m for m, count in usage.items()
-                        if count > 0 and MODEL_PRIORITY.get(m, 0) >= _min_openai_whisper_priority()
-                    ]
-                    if loaded:
-                        return max(loaded, key=lambda m: MODEL_PRIORITY.get(m, 0))
-    except Exception:
-        pass
-    return None
 
 
 class BotSettings:
@@ -203,9 +171,7 @@ async def transcribe_stream(file_path: Path, lang: Optional[str]) -> AsyncGenera
     assembled: list[str] = []
     last_text = ""
 
-    # Use the same dynamic model-selection path as OpenAI-compatible whisper-1.
-    # The server resolves whisper-1 to an already loaded model >= OPENAI_WHISPER_MIN_MODEL,
-    # or falls back to OPENAI_DEFAULT_MODEL / OPENAI_WHISPER_MIN_MODEL.
+    # whisper-1 is intentionally mapped to Parakeet v3 by the server.
     model = whisperclient.model
 
     async for chunk in whisperclient.transcribe_stream_with_fallback(

@@ -8,7 +8,7 @@ import os
 
 # Light config variables — safe to load immediately
 api_key = os.getenv("API_KEY", "bad-key")
-model = os.getenv("MODEL", "large-v3")
+model = os.getenv("MODEL", "parakeet-v3")
 server_url = os.getenv(
     "WHISPER_URL",
     "https://whisper.bezrabotnyi.com/transcribe"

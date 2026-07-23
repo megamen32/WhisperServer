@@ -91,7 +91,7 @@ def test_openai_v1_streaming_cache_hit_uses_sse(monkeypatch):
     cache.clear()
     audio = _wav_bytes().getvalue()
     audio_hash = main.hash_bytes(audio)
-    cache_key = f"openai:whisper-1:None:{audio_hash}"
+    cache_key = main.transcription_cache_key("openai", "whisper-1", None, audio_hash, vad_filter=True)
     cache[cache_key] = {"text": "cached hello"}
 
     client = TestClient(app)
@@ -108,3 +108,29 @@ def test_openai_v1_streaming_cache_hit_uses_sse(monkeypatch):
         {"type": "transcript.text.delta", "delta": "cached hello"},
         {"type": "transcript.text.done", "text": "cached hello"},
     ]
+
+
+def test_openai_v1_transcriptions_cache_hit_returns_json(monkeypatch):
+    """Exercise the normal OpenAI POST cache-hit path without a worker call."""
+    monkeypatch.setenv("API_KEY", "WHISPER_TEST_API_KEY")
+    cache.clear()
+    audio = _wav_bytes().getvalue()
+    cache_key = main.transcription_cache_key(
+        "openai",
+        "whisper-1",
+        None,
+        main.hash_bytes(audio),
+        vad_filter=True,
+    )
+    cache[cache_key] = {"text": "cached hello"}
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/audio/transcriptions",
+        headers={"Authorization": "Bearer WHISPER_TEST_API_KEY"},
+        files={"file": ("voice.wav", io.BytesIO(audio), "audio/wav")},
+        data={"model": "whisper-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "cached hello"}

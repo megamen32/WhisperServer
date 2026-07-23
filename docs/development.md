@@ -5,7 +5,7 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -e ".[dev]"
 cp .env.example .env
 ```
 
@@ -22,6 +22,17 @@ pytest -q
 pytest tests/test_openai_endpoint_simple.py -q
 pytest tests/test_openai_v1_streaming.py -q
 ```
+
+Black-box тесты требуют запущенный сервер, доступную модель и `espeak`/`espeak-ng` для TTS:
+
+```bash
+BLACKBOX_TESTS=1 \
+BLACKBOX_BASE_URL=http://127.0.0.1:7653 \
+BLACKBOX_API_KEY=dev-local-key \
+pytest -m integration tests/test_blackbox_audio.py -q
+```
+
+Можно выбрать другую модель через `BLACKBOX_MODEL`. Без `BLACKBOX_TESTS=1` этот набор пропускается.
 
 ## Syntax check
 

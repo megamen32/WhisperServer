@@ -7,9 +7,14 @@
 | Переменная | Значение по умолчанию | Описание |
 |---|---|---|
 | `API_KEY` | пусто / disabled | ключ для OpenAI-compatible endpoint и внутренних клиентов |
-| `MODEL` | `base` | модель по умолчанию для `/transcribe` |
-| `OPENAI_DEFAULT_MODEL` | `large-v3` | модель для alias `whisper-1`, если ничего подходящего не загружено |
-| `OPENAI_WHISPER_MIN_MODEL` | `medium` | минимальный уровень модели для переиспользования под `whisper-1` |
+| `MODEL` | `parakeet-v3` | модель по умолчанию для `/transcribe` |
+| `OPENAI_DEFAULT_MODEL` | `parakeet-v3` | fallback-модель для умного alias `whisper-1`, если ничего не загружено |
+| `WHISPER_METRICS_JSONL` | `whisper_metrics.jsonl` | путь к JSONL-телеметрии каждой транскрибации; пустое значение отключает запись |
+| `WHISPER_VAD_ENABLED` | `1` | включить VAD по умолчанию |
+| `WHISPER_VAD_THRESHOLD` | `0.50` | порог Silero VAD |
+| `WHISPER_VAD_MIN_SPEECH_MS` | `250` | минимальная длительность речи |
+| `WHISPER_VAD_MIN_SILENCE_MS` | `700` | пауза, после которой закрывается speech chunk |
+| `WHISPER_VAD_SPEECH_PAD_MS` | `200` | padding вокруг speech chunk |
 | `WEBUI_SESSION_TTL_SECONDS` | `7200` | срок жизни web UI session/csrf token |
 
 ## Telegram bot

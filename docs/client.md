@@ -9,7 +9,7 @@ import whisperclient
 from whisperclient import transcribe_sync
 
 whisperclient.api_key = "dev-local-key"
-whisperclient.model = "large-v3"
+whisperclient.model = "parakeet-v3"
 whisperclient.whisper_url = "http://127.0.0.1:7653/transcribe"
 
 text = transcribe_sync("voice.ogg")
@@ -38,6 +38,6 @@ for event in transcribe_stream_sync("voice.ogg"):
 
 ```bash
 python whisperclient/whisper_cli.py audio.mp3 --model base --device cpu
-python whisperclient/whisper_cli.py audio.mp3 --model large-v3 --device cuda --stream
+python whisperclient/whisper_cli.py audio.mp3 --model parakeet-v3 --device cuda --stream
 python whisperclient/whisper_cli.py audio.mp3 --model base --words
 ```

@@ -20,15 +20,21 @@ OpenAI-compatible endpoint.
 | Поле | Обязательно | Описание |
 |---|---:|---|
 | `file` | да | audio/video файл: mp3, wav, m4a, ogg, flac, mp4, webm и другие форматы, которые понимает ffmpeg/faster-whisper |
-| `model` | да | `whisper-1` или локальная модель: `base`, `small`, `medium`, `large-v3` и т.д. |
+| `model` | да | `whisper-1` или локальная модель: `parakeet-v3`, `base`, `small`, `medium`, `large-v3` и т.д. |
 | `language` | нет | ISO language code, например `ru`, `en`, `de` |
 | `temperature` | нет | принимается для совместимости с OpenAI API |
 | `stream` | нет | `true` включает SSE streaming |
 
-Обычный ответ:
+Обычный ответ включает текст и фактическую модель обслуживания:
 
 ```json
-{"text": "Распознанный текст", "language": "ru", "language_probability": 0.98}
+{
+  "text": "Распознанный текст",
+  "requested_model": "base",
+  "served_model": "large-v3",
+  "model_substituted": true,
+  "substitution_reason": "compatible_loaded_model"
+}
 ```
 
 Streaming ответ (`stream=true`) отдаётся как `text/event-stream`:
@@ -60,7 +66,7 @@ print(result.text)
 
 ## `GET /v1/models`
 
-Возвращает OpenAI-compatible список моделей. Первым идёт `whisper-1`, дальше локальные faster-whisper модели.
+Возвращает OpenAI-compatible список моделей. Первым идёт `whisper-1`, дальше локальные Whisper- и Parakeet-модели.
 
 ## `POST /transcribe`
 
@@ -69,7 +75,7 @@ print(result.text)
 | Поле | Описание |
 |---|---|
 | `file` | файл |
-| `model` | модель, по умолчанию `MODEL` из окружения или `base` |
+| `model` | модель, по умолчанию `MODEL` из окружения или `parakeet-v3` |
 | `language` | язык |
 | `stream` | `true` для NDJSON streaming |
 | `words` | `true` для word-level timestamps |

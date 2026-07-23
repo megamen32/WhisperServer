@@ -7,7 +7,7 @@ git clone https://github.com/megamen32/WhisperServer.git
 cd WhisperServer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 cp .env.example .env
 python main.py
 ```

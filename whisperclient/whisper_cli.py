@@ -13,6 +13,11 @@ from pathlib import Path
 # Heavy imports ONLY here — loaded only when CLI is invoked
 from faster_whisper import WhisperModel
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from parakeet_backend import ParakeetModel
+
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -28,6 +33,13 @@ def _determine_compute_type(device: str) -> str:
     return "int8"  # CPU: faster + less memory
 
 
+def _load_model(model_name: str, device: str):
+    """Load a local model through its native backend."""
+    if model_name == "parakeet-v3":
+        return ParakeetModel.from_pretrained(device=device)
+    return WhisperModel(model_name, device=device, compute_type=_determine_compute_type(device))
+
+
 def transcribe_oneshot(
     audio_path: str,
     model_name: str,
@@ -35,8 +47,7 @@ def transcribe_oneshot(
     include_words: bool,
 ) -> dict:
     """Run full transcription and return complete result."""
-    compute_type = _determine_compute_type(device)
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model = _load_model(model_name, device)
 
     segments, info = model.transcribe(
         audio_path,
@@ -83,8 +94,7 @@ def transcribe_streaming(
     include_words: bool,
 ):
     """Yield transcription segments as NDJSON lines."""
-    compute_type = _determine_compute_type(device)
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model = _load_model(model_name, device)
 
     segments, info = model.transcribe(
         audio_path,
@@ -139,8 +149,8 @@ def main():
     parser.add_argument("file", help="Path to audio file (ogg, wav, mp3, etc.)")
     parser.add_argument(
         "--model",
-        default="base",
-        choices=["tiny", "base", "small", "medium", "large-v3"],
+        default="parakeet-v3",
+        choices=["tiny", "base", "small", "medium", "large-v3", "parakeet-v3"],
         help="Model size",
     )
     parser.add_argument(

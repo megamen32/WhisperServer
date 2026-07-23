@@ -7,22 +7,22 @@ git clone https://github.com/megamen32/WhisperServer.git
 cd WhisperServer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e "."
 cp .env.example .env
 ```
 
 Для разработки дополнительно:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e ".[dev]"
 ```
 
 ## 2. Настройка `.env`
 
 ```bash
 API_KEY=dev-local-key
-MODEL=base
-OPENAI_DEFAULT_MODEL=large-v3
+MODEL=parakeet-v3
+OPENAI_DEFAULT_MODEL=parakeet-v3
 TG_BOT_ENABLED=false
 ```
 

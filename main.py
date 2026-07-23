@@ -5,7 +5,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import shutil
 import secrets
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
@@ -19,6 +18,7 @@ import os
 import hashlib
 from contextlib import asynccontextmanager
 from faster_whisper import WhisperModel
+from parakeet_backend import ParakeetModel
 try:
     from cudabroker_client import ManagedModel
 except Exception:
@@ -26,6 +26,18 @@ except Exception:
 from diskcache import Cache
 from dotenv import load_dotenv
 import torch
+from metrics import (
+    append_cache_metric,
+    append_metric,
+    audio_duration_seconds,
+    configure_metrics,
+    model_metadata,
+    peak_vram_mb,
+    reset_cuda_peak_memory,
+    transcription_response_payload,
+)
+from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES
+from model_registry import select_compatible_loaded_model as _select_compatible_loaded_model
 
 load_dotenv()
 
@@ -33,17 +45,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Поддерживаемые модели и их приоритет
-MODEL_PRIORITY = {
-    "tiny": 1,
-    "base": 2,
-    "small": 3,
-    "medium": 4,
-    "distil-large-v3": 5,
-    "large-v3": 6,
-    "large-v2": 7,
-    "large": 8,
-}
+DEFAULT_MODEL = os.getenv("MODEL", "parakeet-v3")
+METRICS_JSONL_PATH = os.getenv("WHISPER_METRICS_JSONL", "whisper_metrics.jsonl")
+configure_metrics(METRICS_JSONL_PATH)
 
 BROKER_CLIENT_ID = os.getenv("CUDABROKER_CLIENT_ID", "whisper")
 BROKER_TTL_SECONDS = float(os.getenv("CUDABROKER_WHISPER_TTL_SECONDS", "900"))
@@ -56,8 +60,9 @@ BROKER_VRAM_MB = {
     "large-v3": 5200,
     "large-v2": 5200,
     "large": 5200,
+    "parakeet-v3": 2800,
 }
-BROKER_CPU_CAPABLE = {"tiny", "base", "small"}
+BROKER_CPU_CAPABLE = {"tiny", "base", "small", "parakeet-v3"}
 
 
 def _broker_vram_mb(model_id: str) -> int:
@@ -128,13 +133,13 @@ def _consume_webui_token(request: Request):
     return _rotate_webui_token(sid)
 
 
-# Map OpenAI model names to faster-whisper models.
-# whisper-1 is resolved inside the model worker: it reuses an already loaded
-# model when its priority is >= OPENAI_WHISPER_MIN_MODEL.
+# Map OpenAI model names to local speech-to-text models.
 OPENAI_WHISPER_ALIAS = "whisper-1"
 OPENAI_WHISPER_INTERNAL_MODEL = "__openai_whisper_1__"
-OPENAI_WHISPER_MIN_MODEL = os.getenv("OPENAI_WHISPER_MIN_MODEL", "medium")
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "large-v3")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "parakeet-v3")
+if OPENAI_DEFAULT_MODEL not in MODEL_PRIORITY:
+    logger.warning("Unknown OPENAI_DEFAULT_MODEL=%s; falling back to parakeet-v3", OPENAI_DEFAULT_MODEL)
+    OPENAI_DEFAULT_MODEL = "parakeet-v3"
 
 # Speech filtering defaults. Silero VAD runs before decoding, so silence and
 # short noise bursts never reach Whisper. The decoder thresholds provide a
@@ -173,35 +178,19 @@ def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: 
     return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}"
 
 
-def _model_priority(model_id):
-    return MODEL_PRIORITY.get(model_id, 999)
+def _select_openai_whisper_model(model_cache: dict) -> str:
+    """Reuse the strongest loaded model, or load Parakeet v3 by default."""
+    loaded_models = [model_id for model_id in model_cache if model_id in MODEL_PRIORITY]
+    if loaded_models:
+        return max(loaded_models, key=MODEL_PRIORITY.get)
+    return OPENAI_DEFAULT_MODEL
 
 
-def _min_openai_whisper_priority():
-    if OPENAI_WHISPER_MIN_MODEL not in MODEL_PRIORITY:
-        logger.warning(
-            "Unknown OPENAI_WHISPER_MIN_MODEL=%s; falling back to medium",
-            OPENAI_WHISPER_MIN_MODEL,
-        )
-    return MODEL_PRIORITY.get(OPENAI_WHISPER_MIN_MODEL, MODEL_PRIORITY["medium"])
-
-
-def _select_openai_whisper_model(model_cache):
-    """Choose a concrete faster-whisper model for the OpenAI whisper-1 alias."""
-    min_priority = _min_openai_whisper_priority()
-    loaded_candidates = [
-        model_id
-        for model_id in model_cache.keys()
-        if MODEL_PRIORITY.get(model_id, -1) >= min_priority
-    ]
-    if loaded_candidates:
-        return sorted(loaded_candidates, key=_model_priority, reverse=True)[0]
-
-    if _model_priority(OPENAI_DEFAULT_MODEL) >= min_priority:
-        return OPENAI_DEFAULT_MODEL
-
-    # Default is smaller than the configured minimum: load the minimum model.
-    return OPENAI_WHISPER_MIN_MODEL if OPENAI_WHISPER_MIN_MODEL in MODEL_PRIORITY else "medium"
+def _load_model(model_name: str, device: str, compute_type: str):
+    """Load a registered model using its native inference backend."""
+    if model_name == "parakeet-v3":
+        return ParakeetModel.from_pretrained(device=device)
+    return WhisperModel(model_name, device=device, compute_type=compute_type)
 
 
 
@@ -224,8 +213,11 @@ def _openai_delta_event(text, segment_id=None):
     return event
 
 
-def _openai_done_event(text):
-    return {"type": "transcript.text.done", "text": text or ""}
+def _openai_done_event(text, metadata: dict | None = None):
+    event = {"type": "transcript.text.done", "text": text or ""}
+    if metadata:
+        event.update(metadata)
+    return event
 
 def _get_openai_model_ids():
     """Return OpenAI-compatible model ids: alias first, then concrete local models."""
@@ -264,6 +256,22 @@ def _require_openai_api_key(request: Request):
 # Cache with 10GB limit and 1 month TTL for entries
 CACHE_TTL = 60 * 60 * 24 * 30
 cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
+
+
+def _get_cached_result(cache_key: str):
+    """Return a cached transcription result and discard legacy invalid values."""
+    if cache_key not in cache:
+        return None
+
+    cached_result = cache[cache_key]
+    if isinstance(cached_result, dict):
+        return cached_result
+
+    # Older cache writers could store a boolean success marker. Treat it as a
+    # miss so OpenAI-compatible clients receive a real transcription response.
+    logger.warning("Discarding invalid transcription cache entry: %s", cache_key)
+    cache.delete(cache_key)
+    return None
 
 request_queue = None
 response_queue = None
@@ -320,7 +328,7 @@ def start_bot_subprocess():
 
     env = os.environ.copy()
     env.setdefault("TG_BOT_API_KEY", os.getenv("API_KEY", "bad-key"))
-    env.setdefault("TG_BOT_MODEL", os.getenv("MODEL", "base"))
+    env.setdefault("TG_BOT_MODEL", os.getenv("MODEL", DEFAULT_MODEL))
     env.setdefault("TG_BOT_SERVER_URL", "http://127.0.0.1:7653/transcribe")
     env.setdefault("WHISPER_URL", env["TG_BOT_SERVER_URL"])
 
@@ -388,7 +396,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
             all_requests.sort(key=lambda r: MODEL_PRIORITY.get(r["model"], 999))
 
             for request in all_requests:
-                model_name = request["model"]
+                requested_model_name = request["model"]
+                public_requested_model = request.get("requested_model", requested_model_name)
                 audio_bytes = request["audio_bytes"]
                 request_id = request["request_id"]
                 lang = request.get("language")
@@ -397,25 +406,56 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 temperature = request.get("temperature", 0.0)
                 stream = request.get("stream")
                 vad_filter = request.get("vad_filter", WHISPER_VAD_ENABLED)
-
+                model_name = requested_model_name
+                model_substituted = False
+                substitution_reason = None
+                temp_path = None
+                success = False
+                error_text = None
+                audio_seconds = None
+                load_ms = 0.0
+                inference_ms = 0.0
+                queue_ms = max(0.0, (time.perf_counter() - request.get("queued_at", time.perf_counter())) * 1000)
+                cold_load = False
+                info = None
                 try:
-                    requested_model_name = model_name
+                    with tempfile.NamedTemporaryFile(delete=False) as temp:
+                        temp.write(audio_bytes)
+                        temp.flush()
+                        temp_path = temp.name
+                    audio_seconds = audio_duration_seconds(temp_path)
+
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
+                        model_substituted = model_name != "parakeet-v3"
+                        substitution_reason = "loaded_model_alias" if model_substituted else "default_model"
                         logger.info(
-                            "Resolved %s to %s (min=%s, loaded=%s)",
+                            "Resolved %s to %s (loaded=%s)",
                             OPENAI_WHISPER_ALIAS,
                             model_name,
-                            OPENAI_WHISPER_MIN_MODEL,
-                            sorted(model_cache.keys(), key=_model_priority),
+                            sorted(model_cache.keys(), key=MODEL_PRIORITY.get),
                         )
+                    else:
+                        compatible_model = _select_compatible_loaded_model(model_name, model_cache)
+                        if compatible_model is not None:
+                            model_name = compatible_model
+                            model_substituted = True
+                            substitution_reason = "compatible_loaded_model"
+                            logger.info(
+                                "Serving %s with already loaded compatible model %s",
+                                public_requested_model,
+                                model_name,
+                            )
 
+                    reset_cuda_peak_memory()
+                    cold_load = model_name not in model_cache
+                    load_started = time.perf_counter()
                     if model_name not in model_cache:
-                        logger.info(f"Preparing broker-managed model: {model_name}")
+                        logger.info("Preparing broker-managed model: %s", model_name)
                         if ManagedModel is not None:
                             model_cache[model_name] = ManagedModel(
                                 model_id=f"whisper-{model_name}",
-                                loader=lambda mn=model_name: WhisperModel(
+                                loader=lambda mn=model_name: _load_model(
                                     mn,
                                     device="cuda" if torch.cuda.is_available() else "cpu",
                                     compute_type="float16" if torch.cuda.is_available() else "int8",
@@ -425,107 +465,129 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                                 cpu_capable=_broker_cpu_capable(model_name),
                                 ttl_seconds=BROKER_TTL_SECONDS,
                                 cpu_fallback=(
-                                    lambda mn=model_name: WhisperModel(mn, device="cpu", compute_type="int8")
+                                    lambda mn=model_name: _load_model(mn, device="cpu", compute_type="int8")
                                 ) if _broker_cpu_capable(model_name) else None,
                                 client_id=BROKER_CLIENT_ID,
                             )
                         else:
-                            logger.warning("cudabroker_client not available, loading WhisperModel without broker")
+                            logger.warning("cudabroker_client not available, loading model without broker")
                             device = "cuda" if torch.cuda.is_available() else "cpu"
                             compute = "float16" if device == "cuda" else "int8"
-                            model_cache[model_name] = WhisperModel(model_name, device=device, compute_type=compute)
-                    usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
-                    if requested_model_name != model_name:
-                        usage_dict[requested_model_name] = usage_dict.get(requested_model_name, 0) + 1
+                            model_cache[model_name] = _load_model(model_name, device=device, compute_type=compute)
 
                     model_entry = model_cache[model_name]
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                         model = model_entry.acquire()
                     else:
                         model = model_entry
+                    load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
+                    usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
+                    if public_requested_model != model_name:
+                        usage_dict[public_requested_model] = usage_dict.get(public_requested_model, 0) + 1
 
-                    with tempfile.NamedTemporaryFile(delete=False) as temp:
-                        temp.write(audio_bytes)
-                        temp.flush()
-                        temp_path = temp.name
+                    if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                        model_entry.touch(active=True)
+                    inference_started = time.perf_counter()
+                    segments, info = model.transcribe(
+                        temp_path,
+                        beam_size=beam_size,
+                        language=lang,
+                        temperature=temperature,
+                        word_timestamps=request.get("words", False),
+                        condition_on_previous_text=False,
+                        **build_vad_transcribe_options(vad_filter),
+                        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                    )
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                    all_segments = []
+                    all_words = []
 
-                    try:
+                    for seg in segments:
                         if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                             model_entry.touch(active=True)
-                        segments, info = model.transcribe(
-                            temp_path,
-                            beam_size=beam_size,
-                            language=lang,
-                            temperature=temperature,
-                            word_timestamps=request.get("words", False),
-                            condition_on_previous_text=False,
-                            **build_vad_transcribe_options(vad_filter),
-                            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-                        )
-                        all_segments = []
-                        all_words = []
-
-                        for seg in segments:
-                            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                                model_entry.touch(active=True)
-                            seg_text = (seg.text or "").strip()
-                            if not seg_text:
-                                logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
-                                continue
-                            seg_data = {
-                                "start": seg.start,
-                                "end": seg.end,
-                                "text": seg_text,
-                                "avg_logprob": getattr(seg, "avg_logprob", None),
-                                "no_speech_prob": getattr(seg, "no_speech_prob", None),
-                                "compression_ratio": getattr(seg, "compression_ratio", None),
-                            }
-                            logger.info(f'{model_name} processed segment: {seg_data}')
-                            all_segments.append(seg_data)
-                            if request.get("words", False) and getattr(seg, "words", None):
-                                words = [
-                                    {"start": w.start, "end": w.end, "word": w.word}
-                                    for w in seg.words
-                                ]
-                                all_words.extend(words)
-                            else:
-                                words = []
-
-                            if stream:
-                                payload = {"request_id": request_id, "segment": seg_data}
-                                if request.get("words", False):
-                                    payload["words"] = words
-                                response_queue.put(payload)
-
-                        result = {
-                            "text": " ".join([s["text"] for s in all_segments]),
-                            "segments": all_segments,
-                            "language": info.language,
-                            "language_probability": info.language_probability,
+                        seg_text = (seg.text or "").strip()
+                        if not seg_text:
+                            logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
+                            continue
+                        seg_data = {
+                            "start": seg.start,
+                            "end": seg.end,
+                            "text": seg_text,
+                            "avg_logprob": getattr(seg, "avg_logprob", None),
+                            "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                            "compression_ratio": getattr(seg, "compression_ratio", None),
                         }
-                        if request.get("words", False):
-                            result["words"] = all_words
+                        logger.info("%s processed segment: %s", model_name, seg_data)
+                        all_segments.append(seg_data)
+                        if request.get("words", False) and getattr(seg, "words", None):
+                            words = [
+                                {"start": w.start, "end": w.end, "word": w.word}
+                                for w in seg.words
+                            ]
+                            all_words.extend(words)
+                        else:
+                            words = []
 
-                        if cache_key:
-                            cache.set(cache_key, result, expire=CACHE_TTL)
+                        if stream:
+                            payload = {"request_id": request_id, "segment": seg_data}
+                            if request.get("words", False):
+                                payload["words"] = words
+                            response_queue.put(payload)
 
-                        response_queue.put({
-                            "request_id": request_id,
-                            "result": result,
-                            "final": True,
-                        })
+                    result = {
+                        "text": " ".join([s["text"] for s in all_segments]),
+                        "segments": all_segments,
+                        "language": info.language,
+                        "language_probability": info.language_probability,
+                        "requested_model": public_requested_model,
+                        "served_model": model_name,
+                        "model_substituted": model_substituted,
+                        "substitution_reason": substitution_reason,
+                    }
+                    if request.get("words", False):
+                        result["words"] = all_words
 
-                    finally:
-                        os.remove(temp_path)
+                    if cache_key:
+                        cache.set(cache_key, result, expire=CACHE_TTL)
+
+                    response_queue.put({
+                        "request_id": request_id,
+                        "result": result,
+                        "final": True,
+                    })
+                    success = True
 
                 except Exception as e:
+                    error_text = str(e)
                     logger.exception("Ошибка в worker:")
                     response_queue.put({
                         "request_id": request_id,
                         "error": str(e)
                     })
+                finally:
+                    if temp_path:
+                        Path(temp_path).unlink(missing_ok=True)
+                    duration = audio_seconds or getattr(info, "duration", None)
+                    metric = {
+                        "requested_model": public_requested_model,
+                        "served_model": model_name,
+                        "model_substituted": model_substituted,
+                        "substitution_reason": substitution_reason,
+                        "device": "cuda" if torch.cuda.is_available() else "cpu",
+                        "cold_load": cold_load if "cold_load" in locals() else False,
+                        "load_ms": round(load_ms, 3),
+                        "queue_ms": round(queue_ms, 3),
+                        "audio_seconds": round(duration, 3) if duration is not None else None,
+                        "inference_ms": round(inference_ms, 3),
+                        "rtf": round(inference_ms / 1000 / duration, 5) if duration and duration > 0 else None,
+                        "peak_vram_mb": peak_vram_mb(),
+                        "success": success,
+                    }
+                    if error_text:
+                        metric["error"] = error_text
+                    append_metric(metric)
 
         except Exception as e:
             logger.exception("Фатальная ошибка в loop:")
@@ -658,12 +720,14 @@ async def _transcribe_impl(
     audio_hash = hash_bytes(audio_bytes)
     cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words)
 
-    if cache_key in cache and not stream:
+    cached_result = _get_cached_result(cache_key)
+    if cached_result is not None and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
-        return cache[cache_key]
-    if cache_key in cache and stream:
+        append_cache_metric(cached_result, model)
+        return cached_result
+    if cached_result is not None and stream:
         logger.info(f"[CACHE HIT] {cache_key}")
-        cached_result = globals()["cache"][cache_key]
+        append_cache_metric(cached_result, model)
         async def cached():
             for segment in cached_result.get("segments", []):
                 yield json.dumps({"segment": segment}) + "\n"
@@ -689,6 +753,7 @@ async def _transcribe_impl(
         "request_id": request_id,
         "audio_bytes": audio_bytes,
         "model": actual_model,
+        "requested_model": model,
         "language": language,
         "cache_key": cache_key,
         "beam_size": beam_size,
@@ -696,6 +761,7 @@ async def _transcribe_impl(
         "stream": stream,
         "words": words,
         "vad_filter": vad_filter,
+        "queued_at": time.perf_counter(),
     })
 
     if stream:
@@ -727,7 +793,7 @@ async def _transcribe_impl(
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
-    model: str = Query("base"),
+    model: str = Query(DEFAULT_MODEL),
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
     temperature: float = Query(0.0),
@@ -745,7 +811,7 @@ async def transcribe(
 async def web_transcribe(
     request: Request,
     file: UploadFile = File(...),
-    model: str = Query("base"),
+    model: str = Query(DEFAULT_MODEL),
     language: Optional[str] = Query(None),
     beam_size: Optional[int] = Query(5),
     temperature: float = Query(0.0),
@@ -771,7 +837,7 @@ async def openai_transcribe(
     response_format: str = Form("json"),
     stream: bool = Form(False),
     vad_filter: bool = Form(True),
-    cache: bool = Form(True),
+    use_cache: bool = Form(True, alias="cache"),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
@@ -795,18 +861,23 @@ async def openai_transcribe(
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
-    cache_key = transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter) if cache else None
+    cache_key = (
+        transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
+        if use_cache
+        else None
+    )
 
     # Check cache
-    if cache_key and cache_key in globals()["cache"]:
+    cached_result = _get_cached_result(cache_key) if cache_key else None
+    if cached_result is not None:
         logger.info(f"[CACHE HIT] {cache_key}")
-        cached_result = cache[cache_key]
+        append_cache_metric(cached_result, model)
         cached_text = cached_result.get("text", "")
         if stream:
             async def cached_stream_generator():
                 if cached_text:
                     yield _openai_sse(_openai_delta_event(cached_text))
-                yield _openai_sse(_openai_done_event(cached_text))
+                yield _openai_sse(_openai_done_event(cached_text, model_metadata(cached_result)))
 
             return StreamingResponse(
                 cached_stream_generator(),
@@ -818,7 +889,7 @@ async def openai_transcribe(
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-        return JSONResponse({"text": cached_text})
+        return JSONResponse(transcription_response_payload(cached_result))
 
     # Queue the request
     request_id = id(audio_bytes)
@@ -834,6 +905,7 @@ async def openai_transcribe(
         "request_id": request_id,
         "audio_bytes": audio_bytes,
         "model": actual_model,
+        "requested_model": model,
         "language": language,
         "cache_key": cache_key,
         "beam_size": 5,
@@ -841,6 +913,7 @@ async def openai_transcribe(
         "stream": stream,
         "words": False,
         "vad_filter": vad_filter,
+        "queued_at": time.perf_counter(),
     })
 
     if stream:
@@ -858,7 +931,9 @@ async def openai_transcribe(
                         yield _openai_sse(_openai_delta_event(text, segment.get("id")))
                     elif "result" in item:
                         result = item["result"]
-                        yield _openai_sse(_openai_done_event(result.get("text", final_text)))
+                        yield _openai_sse(
+                            _openai_done_event(result.get("text", final_text), model_metadata(result))
+                        )
             finally:
                 pending_streams.pop(request_id, None)
 
@@ -875,7 +950,7 @@ async def openai_transcribe(
 
     try:
         result = await asyncio.wait_for(future, timeout=600)
-        return JSONResponse({"text": result.get("text", "")})
+        return JSONResponse(transcription_response_payload(result))
     except asyncio.TimeoutError:
         pending_results.pop(request_id, None)
         return JSONResponse({"error": "Transcription timeout"}, status_code=504)
