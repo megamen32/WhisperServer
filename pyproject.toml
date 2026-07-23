@@ -12,6 +12,7 @@ dependencies = [
     "silero-vad",
     "torch",
     "torchaudio",
+    "onnxruntime==1.23.2; python_version < '3.11'",
     "python-multipart",
     "python-dotenv",
     "aiohttp",

@@ -255,22 +255,25 @@ def _require_openai_api_key(request: Request):
 
 # Cache with 10GB limit and 1 month TTL for entries
 CACHE_TTL = 60 * 60 * 24 * 30
-cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
+transcription_cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
+# Keep the short name as a module-level compatibility reference. Runtime code
+# uses the explicit name so form fields cannot shadow the disk cache object.
+cache = transcription_cache
 
 
 def _get_cached_result(cache_key: str):
     """Return a cached transcription result and discard legacy invalid values."""
-    if cache_key not in cache:
+    if cache_key not in transcription_cache:
         return None
 
-    cached_result = cache[cache_key]
+    cached_result = transcription_cache[cache_key]
     if isinstance(cached_result, dict):
         return cached_result
 
     # Older cache writers could store a boolean success marker. Treat it as a
     # miss so OpenAI-compatible clients receive a real transcription response.
     logger.warning("Discarding invalid transcription cache entry: %s", cache_key)
-    cache.delete(cache_key)
+    transcription_cache.delete(cache_key)
     return None
 
 request_queue = None
@@ -550,7 +553,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         result["words"] = all_words
 
                     if cache_key:
-                        cache.set(cache_key, result, expire=CACHE_TTL)
+                        transcription_cache.set(cache_key, result, expire=CACHE_TTL)
 
                     response_queue.put({
                         "request_id": request_id,
@@ -837,7 +840,7 @@ async def openai_transcribe(
     response_format: str = Form("json"),
     stream: bool = Form(False),
     vad_filter: bool = Form(True),
-    use_cache: bool = Form(True, alias="cache"),
+    cache: bool = Form(True),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
@@ -863,7 +866,7 @@ async def openai_transcribe(
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
     cache_key = (
         transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
-        if use_cache
+        if cache
         else None
     )
 
