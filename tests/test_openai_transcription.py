@@ -11,19 +11,60 @@ from multiprocessing import Queue, Manager, Event
 
 # Import main app
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import main
 from main import app
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     """Create a test client with mocked message queue."""
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    async def mock_startup():
+        """Provide lifecycle state without starting a worker process."""
+        loop = asyncio.get_running_loop()
+        completed_task = loop.create_future()
+        completed_task.set_result(None)
+
+        class FakeRequestQueue:
+            """Return a deterministic worker result for endpoint contract tests."""
+
+            def put(self, request):
+                future = main.pending_results.pop(request["request_id"])
+                future.set_result({
+                    "text": "",
+                    "segments": [],
+                    "language": request.get("language") or "unknown",
+                    "language_probability": 0.0,
+                    "requested_model": request.get("requested_model", request["model"]),
+                    "served_model": "parakeet-v3",
+                    "model_substituted": False,
+                    "substitution_reason": "default_model",
+                })
+
+        main.pending_results.clear()
+        app.state.request_queue = FakeRequestQueue()
+        app.state.response_queue = MagicMock()
+        app.state.executor = MagicMock()
+        app.state.response_listener_task = completed_task
+        app.state.stop_event = MagicMock()
+        app.state.lifecycle_stop = asyncio.Event()
+        app.state.bot_process = None
+        app.state.bot_monitor_task = completed_task
+        app.state.model_process = MagicMock()
+        app.state.model_process.is_alive.return_value = False
+        app.state.manager = MagicMock()
+
+    async def mock_shutdown():
+        """Avoid touching multiprocessing resources in endpoint unit tests."""
+        return None
+
+    monkeypatch.setattr("main.startup_event", mock_startup)
+    monkeypatch.setattr("main.shutdown_event", mock_shutdown)
+
     with TestClient(app) as test_client:
-        # Mock the message queue infrastructure since tests can't access multiprocessing state
-        test_client.app.state.request_queue = MagicMock()
-        test_client.app.state.response_queue = MagicMock()
-        test_client.app.state.executor = MagicMock()
-        test_client.app.state.response_listener_task = MagicMock()
         yield test_client
+    main.pending_results.clear()
 
 
 @pytest.fixture
