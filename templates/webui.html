@@ -573,18 +573,26 @@
         }
 
         async function refreshStatus() {
+            if (!isProcessing) {
+                return;
+            }
             try {
                 const response = await fetch('/status');
                 if (!response.ok) {
                     throw new Error('Не удалось получить статус');
                 }
                 const payload = await response.json();
+                if (!isProcessing) {
+                    return;
+                }
                 const queueSize = Number(payload.queue_size || 0);
                 estimatedWait = queueSize * 3 + 1;
                 setStatus(queueSize ? `В очереди: ${queueSize}` : 'Обработка запроса...');
                 updateProgress();
             } catch (error) {
-                setStatus('Не удалось обновить статус очереди');
+                if (isProcessing) {
+                    setStatus('Не удалось обновить статус очереди');
+                }
             }
         }
 
