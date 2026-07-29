@@ -149,7 +149,7 @@ def main():
     parser.add_argument("file", help="Path to audio file (ogg, wav, mp3, etc.)")
     parser.add_argument(
         "--model",
-        default="parakeet-v3",
+        default="large-v3",
         choices=["tiny", "base", "small", "medium", "large-v3", "parakeet-v3"],
         help="Model size",
     )

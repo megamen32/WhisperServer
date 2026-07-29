@@ -9,11 +9,15 @@ MODEL_PRIORITY = {
     "small": 3,
     "medium": 4,
     "distil-large-v3": 5,
-    "large-v3": 6,
-    "large-v2": 7,
-    "large": 8,
+    "large-v2": 6,
+    "large": 7,
+    "large-v3": 8,
     "parakeet-v3": 9,
 }
+
+# Parakeet remains available as an explicit backend, but it must not be
+# selected implicitly for the OpenAI Whisper alias or automatic Whisper mode.
+WHISPER_MODEL_IDS = tuple(model_id for model_id in MODEL_PRIORITY if model_id != "parakeet-v3")
 
 # Only same-family Whisper models are interchangeable. Parakeet has different
 # language and decoding guarantees, so it is intentionally excluded.

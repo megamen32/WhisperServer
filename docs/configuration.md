@@ -7,8 +7,8 @@
 | Переменная | Значение по умолчанию | Описание |
 |---|---|---|
 | `API_KEY` | пусто / disabled | ключ для OpenAI-compatible endpoint и внутренних клиентов |
-| `MODEL` | `parakeet-v3` | модель по умолчанию для `/transcribe` |
-| `OPENAI_DEFAULT_MODEL` | `parakeet-v3` | fallback-модель для умного alias `whisper-1`, если ничего не загружено |
+| `MODEL` | `large-v3` | модель по умолчанию для `/transcribe` |
+| `OPENAI_DEFAULT_MODEL` | `large-v3` | fallback-модель для умного alias `whisper-1`, если ничего не загружено |
 | `WHISPER_METRICS_JSONL` | `whisper_metrics.jsonl` | путь к JSONL-телеметрии каждой транскрибации; пустое значение отключает запись |
 | `WHISPER_VAD_ENABLED` | `1` | включить VAD по умолчанию |
 | `WHISPER_VAD_THRESHOLD` | `0.50` | порог Silero VAD |

@@ -75,7 +75,7 @@ print(result.text)
 | Поле | Описание |
 |---|---|
 | `file` | файл |
-| `model` | модель, по умолчанию `MODEL` из окружения или `parakeet-v3` |
+| `model` | модель, по умолчанию `MODEL` из окружения или `large-v3` |
 | `language` | язык |
 | `stream` | `true` для NDJSON streaming |
 | `words` | `true` для word-level timestamps |

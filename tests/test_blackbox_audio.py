@@ -95,7 +95,7 @@ def _transcribe(client: httpx.Client, audio: bytes, model: str) -> str:
 @pytest.fixture(scope="module")
 def blackbox_model(blackbox_client: httpx.Client) -> str:
     """Return the model used by the black-box audio cases."""
-    model = os.getenv("BLACKBOX_MODEL", "parakeet-v3")
+    model = os.getenv("BLACKBOX_MODEL", "large-v3")
     response = blackbox_client.get("/v1/models")
     assert response.status_code == 200, response.text
     available = {entry["id"] for entry in response.json().get("data", [])}

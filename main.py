@@ -36,7 +36,7 @@ from metrics import (
     reset_cuda_peak_memory,
     transcription_response_payload,
 )
-from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES
+from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES, WHISPER_MODEL_IDS
 from model_registry import select_compatible_loaded_model as _select_compatible_loaded_model
 
 load_dotenv()
@@ -45,7 +45,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.getenv("MODEL", "parakeet-v3")
+CPU_FALLBACK_MODEL = os.getenv("CPU_FALLBACK_MODEL", "small")
+if CPU_FALLBACK_MODEL not in WHISPER_MODEL_IDS:
+    logger.warning("Unknown CPU_FALLBACK_MODEL=%s; falling back to small", CPU_FALLBACK_MODEL)
+    CPU_FALLBACK_MODEL = "small"
+DEFAULT_MODEL = os.getenv("MODEL") or (
+    "large-v3" if torch.cuda.is_available() else CPU_FALLBACK_MODEL
+)
 METRICS_JSONL_PATH = os.getenv("WHISPER_METRICS_JSONL", "whisper_metrics.jsonl")
 configure_metrics(METRICS_JSONL_PATH)
 
@@ -136,10 +142,10 @@ def _consume_webui_token(request: Request):
 # Map OpenAI model names to local speech-to-text models.
 OPENAI_WHISPER_ALIAS = "whisper-1"
 OPENAI_WHISPER_INTERNAL_MODEL = "__openai_whisper_1__"
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "parakeet-v3")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "large-v3")
 if OPENAI_DEFAULT_MODEL not in MODEL_PRIORITY:
-    logger.warning("Unknown OPENAI_DEFAULT_MODEL=%s; falling back to parakeet-v3", OPENAI_DEFAULT_MODEL)
-    OPENAI_DEFAULT_MODEL = "parakeet-v3"
+    logger.warning("Unknown OPENAI_DEFAULT_MODEL=%s; falling back to large-v3", OPENAI_DEFAULT_MODEL)
+    OPENAI_DEFAULT_MODEL = "large-v3"
 
 # Speech filtering defaults. Silero VAD runs before decoding, so silence and
 # short noise bursts never reach Whisper. The decoder thresholds provide a
@@ -179,10 +185,17 @@ def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: 
 
 
 def _select_openai_whisper_model(model_cache: dict) -> str:
-    """Reuse the strongest loaded model, or load Parakeet v3 by default."""
-    loaded_models = [model_id for model_id in model_cache if model_id in MODEL_PRIORITY]
+    """Reuse the strongest loaded Whisper model, or load Large V3 by default."""
+    loaded_models = [model_id for model_id in model_cache if model_id in WHISPER_MODEL_IDS]
     if loaded_models:
         return max(loaded_models, key=MODEL_PRIORITY.get)
+    if not torch.cuda.is_available():
+        logger.info(
+            "CUDA unavailable; resolving %s to CPU fallback model %s",
+            OPENAI_WHISPER_ALIAS,
+            CPU_FALLBACK_MODEL,
+        )
+        return CPU_FALLBACK_MODEL
     return OPENAI_DEFAULT_MODEL
 
 
@@ -191,6 +204,41 @@ def _load_model(model_name: str, device: str, compute_type: str):
     if model_name == "parakeet-v3":
         return ParakeetModel.from_pretrained(device=device)
     return WhisperModel(model_name, device=device, compute_type=compute_type)
+
+
+def _create_model_entry(model_name: str):
+    """Create a broker-managed entry only when CUDA can actually be used."""
+    cuda_available = torch.cuda.is_available()
+    if ManagedModel is not None and cuda_available:
+        return ManagedModel(
+            model_id=f"whisper-{model_name}",
+            loader=lambda mn=model_name: _load_model(
+                mn,
+                device="cuda",
+                compute_type="float16",
+            ),
+            vram_mb=_broker_vram_mb(model_name),
+            gpu_priority=MODEL_PRIORITY.get(model_name, 0),
+            cpu_capable=_broker_cpu_capable(model_name),
+            ttl_seconds=BROKER_TTL_SECONDS,
+            cpu_fallback=(
+                lambda mn=model_name: _load_model(mn, device="cpu", compute_type="int8")
+            ) if _broker_cpu_capable(model_name) else None,
+            client_id=BROKER_CLIENT_ID,
+        )
+
+    if cuda_available:
+        logger.warning(
+            "cudabroker_client unavailable; loading %s directly on GPU.",
+            model_name,
+        )
+        return _load_model(model_name, device="cuda", compute_type="float16")
+
+    logger.warning(
+        "CUDA unavailable; loading %s directly on CPU without a broker lease.",
+        model_name,
+    )
+    return _load_model(model_name, device="cpu", compute_type="int8")
 
 
 
@@ -430,7 +478,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
 
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
-                        model_substituted = model_name != "parakeet-v3"
+                        model_substituted = model_name != OPENAI_DEFAULT_MODEL
                         substitution_reason = "loaded_model_alias" if model_substituted else "default_model"
                         logger.info(
                             "Resolved %s to %s (loaded=%s)",
@@ -454,29 +502,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     cold_load = model_name not in model_cache
                     load_started = time.perf_counter()
                     if model_name not in model_cache:
-                        logger.info("Preparing broker-managed model: %s", model_name)
-                        if ManagedModel is not None:
-                            model_cache[model_name] = ManagedModel(
-                                model_id=f"whisper-{model_name}",
-                                loader=lambda mn=model_name: _load_model(
-                                    mn,
-                                    device="cuda" if torch.cuda.is_available() else "cpu",
-                                    compute_type="float16" if torch.cuda.is_available() else "int8",
-                                ),
-                                vram_mb=_broker_vram_mb(model_name),
-                                gpu_priority=MODEL_PRIORITY.get(model_name, 0),
-                                cpu_capable=_broker_cpu_capable(model_name),
-                                ttl_seconds=BROKER_TTL_SECONDS,
-                                cpu_fallback=(
-                                    lambda mn=model_name: _load_model(mn, device="cpu", compute_type="int8")
-                                ) if _broker_cpu_capable(model_name) else None,
-                                client_id=BROKER_CLIENT_ID,
-                            )
-                        else:
-                            logger.warning("cudabroker_client not available, loading model without broker")
-                            device = "cuda" if torch.cuda.is_available() else "cpu"
-                            compute = "float16" if device == "cuda" else "int8"
-                            model_cache[model_name] = _load_model(model_name, device=device, compute_type=compute)
+                        model_cache[model_name] = _create_model_entry(model_name)
 
                     model_entry = model_cache[model_name]
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
@@ -631,7 +657,10 @@ async def response_listener(stop_event, response_queue):
 
 async def startup_event():
     global model_usage
-    ctx = mp.get_context()
+    # CUDA cannot be initialized safely in a forked child after the parent
+    # imports/inspects torch. Spawn gives the model worker a clean interpreter
+    # and prevents the post-driver-reboot CUDA initialization failure.
+    ctx = mp.get_context("spawn")
     stop_event = ctx.Event()
     manager = ctx.Manager()
     model_usage = manager.dict()

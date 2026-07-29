@@ -135,7 +135,7 @@ def transcribe_sync(
         device = "cuda" if _has_cuda() else "cpu"
         proc = _run_cli_sync(
             file_path=file_path,
-            model=model_name or "parakeet-v3",
+            model=model_name or "large-v3",
             device=device,
             include_words=False,
             stream=False,
@@ -201,7 +201,7 @@ def transcribe_stream_sync(
         device = "cuda" if _has_cuda() else "cpu"
         proc = _run_cli_sync(
             file_path=file_path,
-            model=model_name or "parakeet-v3",
+            model=model_name or "large-v3",
             device=device,
             include_words=False,
             stream=True,
@@ -269,7 +269,7 @@ async def transcribe_with_fallback(
             None,
             _run_cli_sync,
             file_path,
-            model_name or "parakeet-v3",
+            model_name or "large-v3",
             device,
             False,  # include_words
             False,  # stream
@@ -337,7 +337,7 @@ async def transcribe_stream_with_fallback(
             sys.executable,
             _get_cli_path(),
             file_path,
-            "--model", model_name or "base",
+            "--model", model_name or "large-v3",
             "--device", device,
             "--stream",
         ]

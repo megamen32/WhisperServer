@@ -171,7 +171,8 @@ async def transcribe_stream(file_path: Path, lang: Optional[str]) -> AsyncGenera
     assembled: list[str] = []
     last_text = ""
 
-    # whisper-1 is intentionally mapped to Parakeet v3 by the server.
+    # whisper-1 resolves to the strongest loaded Whisper model and falls back
+    # to Large V3; Parakeet remains an explicit opt-in model.
     model = whisperclient.model
 
     async for chunk in whisperclient.transcribe_stream_with_fallback(

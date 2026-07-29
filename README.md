@@ -9,7 +9,7 @@
 - **OpenAI-compatible API**: `POST /v1/audio/transcriptions`, `GET /v1/models`.
 - **Обычный API**: `POST /transcribe` для прямого использования без OpenAI SDK.
 - **Streaming**: Server-Sent Events для OpenAI endpoint и NDJSON для локального endpoint.
-- **OpenAI alias**: `whisper-1` переиспользует сильнейшую загруженную модель, а при пустом worker загружает `parakeet-v3`.
+- **OpenAI alias**: `whisper-1` переиспользует сильнейшую загруженную Whisper-модель, а при пустом worker загружает `large-v3`.
 - **Очередь и приоритеты**: более лёгкие модели получают более высокий приоритет, тяжёлые не блокируют весь сервер.
 - **Lazy loading + TTL**: модели грузятся по требованию и могут выгружаться после простоя через CUDA broker.
 - **Кеширование**: повторная отправка того же файла возвращает результат из `diskcache`.
@@ -89,9 +89,9 @@ curl -N http://127.0.0.1:7653/v1/audio/transcriptions \
 
 Поддерживаются `tiny`, `base`, `small`, `medium`, `distil-large-v3`, `large-v3`, `large-v2`, `large`, `parakeet-v3` и OpenAI alias `whisper-1`. Parakeet v3 загружается как `nvidia/parakeet-tdt-0.6b-v3` через NeMo и распознаёт 25 европейских языков.
 
-`whisper-1` — умный alias: если в worker уже загружена модель, используется
-сильнейшая загруженная модель; если ничего нет, по умолчанию загружается
-`parakeet-v3`.
+`whisper-1` — умный alias: если в worker уже загружена Whisper-модель, используется
+сильнейшая загруженная Whisper-модель; если ничего нет, по умолчанию загружается
+`large-v3`.
 
 Для Whisper-запросов worker может обслужить слабую модель уже загруженной
 совместимой более сильной моделью. Реальное решение возвращается в полях
@@ -102,8 +102,8 @@ curl -N http://127.0.0.1:7653/v1/audio/transcriptions \
 
 ```bash
 API_KEY=dev-local-key
-MODEL=parakeet-v3
-OPENAI_DEFAULT_MODEL=parakeet-v3
+MODEL=large-v3
+OPENAI_DEFAULT_MODEL=large-v3
 TG_BOT_ENABLED=false
 ```
 
@@ -116,7 +116,7 @@ import whisperclient
 from whisperclient import transcribe_sync, transcribe_stream_sync
 
 whisperclient.api_key = "dev-local-key"
-whisperclient.model = "parakeet-v3"
+whisperclient.model = "large-v3"
 whisperclient.whisper_url = "http://127.0.0.1:7653/transcribe"
 
 print(transcribe_sync("voice.ogg"))

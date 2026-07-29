@@ -31,8 +31,8 @@ FastAPI main.py
 ## Model selection
 
 `whisper-1` — умный alias: worker переиспользует сильнейшую уже загруженную
-модель, а если cache пуст, загружает `OPENAI_DEFAULT_MODEL` (по умолчанию
-`parakeet-v3`). Whisper-модели работают через faster-whisper, а `parakeet-v3`
+Whisper-модель, а если cache пуст, загружает `OPENAI_DEFAULT_MODEL` (по умолчанию
+`large-v3`). Whisper-модели работают через faster-whisper, а `parakeet-v3`
 — через NeMo.
 
 Если в worker уже загружена более сильная совместимая Whisper-модель, запрос

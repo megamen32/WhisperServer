@@ -8,6 +8,8 @@ dependencies = [
     "fastapi~=0.115.12",
     "diskcache~=5.6.3",
     "faster-whisper",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12>=9,<10",
     "nemo_toolkit[asr]",
     "silero-vad",
     "torch",

@@ -37,7 +37,7 @@ def client(monkeypatch):
                     "language": request.get("language") or "unknown",
                     "language_probability": 0.0,
                     "requested_model": request.get("requested_model", request["model"]),
-                    "served_model": "parakeet-v3",
+                    "served_model": "large-v3",
                     "model_substituted": False,
                     "substitution_reason": "default_model",
                 })

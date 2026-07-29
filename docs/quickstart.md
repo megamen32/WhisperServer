@@ -21,8 +21,8 @@ pip install -e ".[dev]"
 
 ```bash
 API_KEY=dev-local-key
-MODEL=parakeet-v3
-OPENAI_DEFAULT_MODEL=parakeet-v3
+MODEL=large-v3
+OPENAI_DEFAULT_MODEL=large-v3
 TG_BOT_ENABLED=false
 ```
 

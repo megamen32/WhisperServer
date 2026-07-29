@@ -34,6 +34,18 @@ pytest -m integration tests/test_blackbox_audio.py -q
 
 Можно выбрать другую модель через `BLACKBOX_MODEL`. Без `BLACKBOX_TESTS=1` этот набор пропускается.
 
+Реальный браузерный smoke-тест Web UI запускается отдельно: он открывает Chromium через
+`playwright-cli`, выбирает `large-v3`, загружает TTS-файл и проверяет результат транскрибации:
+
+```bash
+BROWSER_TESTS=1 \
+BROWSER_BASE_URL=http://127.0.0.1:7653 \
+pytest -m integration tests/test_webui_browser.py -q
+```
+
+Для визуального запуска добавьте `BROWSER_HEADED=1`. Тест требует `npx`, `espeak` или
+`espeak-ng` и заранее запущенный WhisperServer.
+
 ## Syntax check
 
 ```bash
