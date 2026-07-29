@@ -33,3 +33,15 @@ Result:
 - No `ROADMAP.md` exists; no roadmap status change was possible.
 
 Final status: P0 CONFIRMED — transcription is working end-to-end through the live service, with CPU fallback active while the host GPU driver remains unavailable.
+
+Recovery update — 2026-07-29 12:30 MSK:
+
+- Repaired NVIDIA driver/kernel mismatches on both `.5` and `.75`; `.75` now reports an RTX 3080 Ti with matching driver and kernel module `580.173.02`.
+- Changed the worker multiprocessing context to `spawn`, preventing CUDA initialization in a forked process.
+- Made the missing `cudabroker_client` path load models directly on GPU instead of silently falling back to CPU.
+- Added CUDA 12 cuBLAS/cuDNN runtime dependencies required by CTranslate2/faster-whisper GPU inference.
+- Targeted tests: 20 passed, 3 skipped.
+- Live OpenAI-compatible `whisper-1` request: HTTP 200 in 6 seconds, served by `large-v3` and consumed 4.3 GiB of VRAM.
+- Browser Web UI test: selected a real WAV through the file chooser; `/web/transcribe?stream=true&model=large-v3` returned 200, completed with `Готово`, and the browser console had 0 errors.
+
+Final status: P0 CONFIRMED — GPU-backed Whisper transcription is working end-to-end through both API and Web UI.
