@@ -45,3 +45,10 @@ Recovery update — 2026-07-29 12:30 MSK:
 - Browser Web UI test: selected a real WAV through the file chooser; `/web/transcribe?stream=true&model=large-v3` returned 200, completed with `Готово`, and the browser console had 0 errors.
 
 Final status: P0 CONFIRMED — GPU-backed Whisper transcription is working end-to-end through both API and Web UI.
+
+Deployment update — 2026-07-29 12:54 MSK:
+
+- Pushed `e6f3f1d` (GPU-backed transcription) and `fd899f4` (Web UI completion-status race fix) to `origin/master`.
+- Restarted `whisperserver.service` from the pushed revision.
+- Final browser smoke: selected `large-v3`, uploaded WAV through the file chooser, received `POST /web/transcribe?stream=true&model=large-v3` HTTP 200, and the rendered Web UI reached `Готово`.
+- Browser console: 0 errors and 0 warnings. Runtime queue: 0; Telegram bot is running.
