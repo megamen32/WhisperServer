@@ -16,7 +16,7 @@ import logging
 import time
 import os
 import hashlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from faster_whisper import WhisperModel
 from parakeet_backend import ParakeetModel
 try:
@@ -228,17 +228,23 @@ def _create_model_entry(model_name: str):
         )
 
     if cuda_available:
-        logger.warning(
-            "cudabroker_client unavailable; loading %s directly on GPU.",
-            model_name,
+        raise RuntimeError(
+            f"cudabroker_client is required for CUDA model {model_name}; "
+            "refusing an unmanaged GPU load"
         )
-        return _load_model(model_name, device="cuda", compute_type="float16")
 
     logger.warning(
         "CUDA unavailable; loading %s directly on CPU without a broker lease.",
         model_name,
     )
     return _load_model(model_name, device="cpu", compute_type="int8")
+
+
+def _model_inference_context(model_entry):
+    """Keep a broker lease non-preemptible through lazy segment iteration."""
+    if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+        return model_entry.inference()
+    return nullcontext(model_entry)
 
 
 
@@ -506,64 +512,59 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
 
                     model_entry = model_cache[model_name]
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                        model = model_entry.acquire()
-                    else:
-                        model = model_entry
+                        model_entry.acquire()
                     load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
                     usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
                     if public_requested_model != model_name:
                         usage_dict[public_requested_model] = usage_dict.get(public_requested_model, 0) + 1
 
-                    if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                        model_entry.touch(active=True)
-                    inference_started = time.perf_counter()
-                    segments, info = model.transcribe(
-                        temp_path,
-                        beam_size=beam_size,
-                        language=lang,
-                        temperature=temperature,
-                        word_timestamps=request.get("words", False),
-                        condition_on_previous_text=False,
-                        **build_vad_transcribe_options(vad_filter),
-                        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-                    )
-                    inference_ms = (time.perf_counter() - inference_started) * 1000
                     all_segments = []
                     all_words = []
+                    inference_started = time.perf_counter()
+                    with _model_inference_context(model_entry) as model:
+                        segments, info = model.transcribe(
+                            temp_path,
+                            beam_size=beam_size,
+                            language=lang,
+                            temperature=temperature,
+                            word_timestamps=request.get("words", False),
+                            condition_on_previous_text=False,
+                            **build_vad_transcribe_options(vad_filter),
+                            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                        )
 
-                    for seg in segments:
-                        if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                            model_entry.touch(active=True)
-                        seg_text = (seg.text or "").strip()
-                        if not seg_text:
-                            logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
-                            continue
-                        seg_data = {
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg_text,
-                            "avg_logprob": getattr(seg, "avg_logprob", None),
-                            "no_speech_prob": getattr(seg, "no_speech_prob", None),
-                            "compression_ratio": getattr(seg, "compression_ratio", None),
-                        }
-                        logger.info("%s processed segment: %s", model_name, seg_data)
-                        all_segments.append(seg_data)
-                        if request.get("words", False) and getattr(seg, "words", None):
-                            words = [
-                                {"start": w.start, "end": w.end, "word": w.word}
-                                for w in seg.words
-                            ]
-                            all_words.extend(words)
-                        else:
-                            words = []
+                        for seg in segments:
+                            seg_text = (seg.text or "").strip()
+                            if not seg_text:
+                                logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
+                                continue
+                            seg_data = {
+                                "start": seg.start,
+                                "end": seg.end,
+                                "text": seg_text,
+                                "avg_logprob": getattr(seg, "avg_logprob", None),
+                                "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                                "compression_ratio": getattr(seg, "compression_ratio", None),
+                            }
+                            logger.info("%s processed segment: %s", model_name, seg_data)
+                            all_segments.append(seg_data)
+                            if request.get("words", False) and getattr(seg, "words", None):
+                                words = [
+                                    {"start": w.start, "end": w.end, "word": w.word}
+                                    for w in seg.words
+                                ]
+                                all_words.extend(words)
+                            else:
+                                words = []
 
-                        if stream:
-                            payload = {"request_id": request_id, "segment": seg_data}
-                            if request.get("words", False):
-                                payload["words"] = words
-                            response_queue.put(payload)
+                            if stream:
+                                payload = {"request_id": request_id, "segment": seg_data}
+                                if request.get("words", False):
+                                    payload["words"] = words
+                                response_queue.put(payload)
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
 
                     result = {
                         "text": " ".join([s["text"] for s in all_segments]),

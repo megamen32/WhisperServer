@@ -38,8 +38,8 @@ def test_cpu_model_loading_bypasses_broker_when_cuda_is_unavailable(monkeypatch)
     assert main._create_model_entry("large-v3") == ("large-v3", "cpu", "int8")
 
 
-def test_gpu_model_loading_bypasses_missing_broker_client(monkeypatch):
-    """A working GPU must remain usable when the optional broker client is absent."""
+def test_gpu_model_loading_fails_closed_when_broker_client_is_missing(monkeypatch):
+    """A missing broker client must never create an unmanaged GPU model."""
     monkeypatch.setattr(main, "ManagedModel", None)
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
@@ -48,7 +48,36 @@ def test_gpu_model_loading_bypasses_missing_broker_client(monkeypatch):
         lambda model_name, device, compute_type: (model_name, device, compute_type),
     )
 
-    assert main._create_model_entry("large-v3") == ("large-v3", "cuda", "float16")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="cudabroker_client is required"):
+        main._create_model_entry("large-v3")
+
+
+def test_managed_inference_context_returns_guarded_model(monkeypatch):
+    events = []
+
+    class FakeManagedModel:
+        def inference(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def guarded():
+                events.append("begin")
+                try:
+                    yield "guarded-model"
+                finally:
+                    events.append("end")
+
+            return guarded()
+
+    monkeypatch.setattr(main, "ManagedModel", FakeManagedModel)
+    entry = FakeManagedModel()
+
+    with main._model_inference_context(entry) as model:
+        assert model == "guarded-model"
+        assert events == ["begin"]
+    assert events == ["begin", "end"]
 
 
 def test_openai_alias_uses_cpu_fallback_without_cuda(monkeypatch):
