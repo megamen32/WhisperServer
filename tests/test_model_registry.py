@@ -7,6 +7,7 @@ from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES, WHISPER_MODEL_IDS
 def test_parakeet_is_advertised_as_a_local_model():
     """The model list source must expose Parakeet to API clients."""
     assert "parakeet-v3" in MODEL_PRIORITY
+    assert "gigaam-v3" in MODEL_PRIORITY
 
 
 def test_large_v3_can_serve_large_v2_and_tiny_can_use_base():
@@ -19,6 +20,7 @@ def test_large_v3_is_the_strongest_automatic_whisper_model():
     """Automatic Whisper selection must prefer Large V3 over legacy variants."""
     assert WHISPER_MODEL_IDS[-1] == "large-v3"
     assert "parakeet-v3" not in WHISPER_MODEL_IDS
+    assert "gigaam-v3" not in WHISPER_MODEL_IDS
 
 
 def test_cpu_model_loading_bypasses_broker_when_cuda_is_unavailable(monkeypatch):

@@ -46,7 +46,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "telegram_bot", "parakeet_backend", "vad_backend", "metrics", "model_registry"]
+py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry"]
 
 [tool.setuptools.packages.find]
 include = ["whisperclient*"]

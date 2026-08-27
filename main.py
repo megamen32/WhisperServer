@@ -18,6 +18,7 @@ import os
 import hashlib
 from contextlib import asynccontextmanager
 from faster_whisper import WhisperModel
+from gigaam_backend import GigaAMModel
 from parakeet_backend import ParakeetModel
 try:
     from cudabroker_client import ManagedModel
@@ -67,8 +68,9 @@ BROKER_VRAM_MB = {
     "large-v2": 5200,
     "large": 5200,
     "parakeet-v3": 2800,
+    "gigaam-v3": 2000,
 }
-BROKER_CPU_CAPABLE = {"tiny", "base", "small", "parakeet-v3"}
+BROKER_CPU_CAPABLE = {"tiny", "base", "small", "parakeet-v3", "gigaam-v3"}
 
 
 def _broker_vram_mb(model_id: str) -> int:
@@ -203,6 +205,8 @@ def _load_model(model_name: str, device: str, compute_type: str):
     """Load a registered model using its native inference backend."""
     if model_name == "parakeet-v3":
         return ParakeetModel.from_pretrained(device=device)
+    if model_name == "gigaam-v3":
+        return GigaAMModel.from_pretrained(device=device)
     return WhisperModel(model_name, device=device, compute_type=compute_type)
 
 
