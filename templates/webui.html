@@ -204,6 +204,12 @@
             font-size: 0.95rem;
             color: #b2d2ff;
         }
+        .paste-hint {
+            display: inline-block;
+            margin-top: 8px;
+            color: #a9b6cb;
+            font-size: 0.9rem;
+        }
         .output {
             margin-top: 24px;
             max-height: 320px;
@@ -331,7 +337,8 @@
             <div class="drop-zone" id="drop-zone">
                 <p>
                     <strong>Перетащите файл сюда</strong><br>
-                    или <span class="button-link" id="select-file-button">нажмите, чтобы выбрать файл</span>
+                    или <span class="button-link" id="select-file-button">нажмите, чтобы выбрать файл</span><br>
+                    <span class="paste-hint">или скопируйте файл и нажмите ⌘V / Ctrl+V</span>
                 </p>
                 <input type="file" id="file-input" accept="audio/*" />
             </div>
@@ -839,6 +846,23 @@
             xhr.send(form);
         }
 
+        function getClipboardFile(clipboardData) {
+            const file = clipboardData?.files?.[0];
+            if (file) {
+                return file;
+            }
+            for (const item of clipboardData?.items || []) {
+                if (item.kind !== 'file') {
+                    continue;
+                }
+                const itemFile = item.getAsFile();
+                if (itemFile) {
+                    return itemFile;
+                }
+            }
+            return null;
+        }
+
         dropZone.addEventListener('click', () => fileInput.click());
         dropZone.addEventListener('dragenter', (event) => {
             event.preventDefault();
@@ -859,6 +883,14 @@
         });
         fileInput.addEventListener('change', () => {
             const selectedFile = fileInput.files?.[0];
+            transcribeFile(selectedFile);
+        });
+        document.addEventListener('paste', (event) => {
+            const selectedFile = getClipboardFile(event.clipboardData);
+            if (!selectedFile) {
+                return;
+            }
+            event.preventDefault();
             transcribeFile(selectedFile);
         });
         micIcon.addEventListener('click', () => {

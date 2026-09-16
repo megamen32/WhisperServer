@@ -272,5 +272,14 @@ class TestWebUISessionRefresh:
         assert response.status_code == 403
 
 
+class TestWebUIClipboardPaste:
+    def test_page_handles_clipboard_files(self, client):
+        response = client.get("/")
+
+        assert response.status_code == 200
+        assert "getClipboardFile(event.clipboardData)" in response.text
+        assert "document.addEventListener('paste'" in response.text
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
