@@ -649,6 +649,22 @@
             hideUploadProgress(false);
         }
 
+        async function refreshWebuiToken() {
+            const response = await fetch('/web/session', {
+                method: 'POST',
+                credentials: 'same-origin',
+                cache: 'no-store',
+            });
+            if (!response.ok) {
+                throw new Error('Не удалось обновить сессию');
+            }
+            const payload = await response.json();
+            if (!payload.token) {
+                throw new Error('Сервер не вернул токен сессии');
+            }
+            webuiCsrfToken = payload.token;
+        }
+
         async function loadModels() {
             try {
                 const response = await fetch('/models');
@@ -699,6 +715,14 @@
             const requestUrl = new URL('/web/transcribe', window.location.origin);
             requestUrl.searchParams.set('stream', 'true');
             requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
+
+            try {
+                await refreshWebuiToken();
+            } catch (error) {
+                errorOutput.textContent = error.message;
+                cleanupProcessing({ finalMessage: 'Ошибка транскрипции', success: false });
+                return;
+            }
 
             let buffer = '';
             let responseOffset = 0;

@@ -249,5 +249,28 @@ class TestOpenAISpecCompliance:
             assert "error" in data, "Error response should include 'error' field"
 
 
+class TestWebUISessionRefresh:
+    def test_refresh_issues_a_fresh_same_origin_token(self, client):
+        import main
+
+        main._webui_sessions.clear()
+        try:
+            first = client.post("/web/session", headers={"Origin": "http://testserver"})
+            second = client.post("/web/session", headers={"Origin": "http://testserver"})
+
+            assert first.status_code == 200
+            assert second.status_code == 200
+            assert first.json()["token"] != second.json()["token"]
+            assert second.headers["cache-control"] == "no-store"
+            assert main.WEBUI_SESSION_COOKIE in second.headers["set-cookie"]
+        finally:
+            main._webui_sessions.clear()
+
+    def test_refresh_rejects_a_cross_origin_request(self, client):
+        response = client.post("/web/session", headers={"Origin": "https://example.invalid"})
+
+        assert response.status_code == 403
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -93,6 +93,19 @@ def _parse_cli_output(output: str) -> Optional[dict]:
     return last_result
 
 
+def _server_stream_payload(payload: dict) -> Optional[dict]:
+    """Normalize local CLI NDJSON to the server streaming response format."""
+    if payload.get("error"):
+        raise RuntimeError(payload["error"])
+    if payload.get("type") == "segment":
+        return {"segment": payload}
+    if payload.get("type") == "result":
+        return {"result": payload}
+    if payload.get("type") == "info":
+        return None
+    return payload
+
+
 def transcribe_sync(
     file_path: str,
     language: Optional[str] = None,
@@ -186,7 +199,9 @@ def transcribe_stream_sync(
                 if resp.ok:
                     for line in resp.iter_lines():
                         if line:
-                            yield json.loads(line.decode("utf-8"))
+                            payload = _server_stream_payload(json.loads(line.decode("utf-8")))
+                            if payload is not None:
+                                yield payload
                     return
                 else:
                     logging.warning(
@@ -210,7 +225,9 @@ def transcribe_stream_sync(
         if proc.returncode == 0:
             for line in proc.stdout.strip().split("\n"):
                 if line.strip():
-                    yield json.loads(line)
+                    payload = _server_stream_payload(json.loads(line))
+                    if payload is not None:
+                        yield payload
         else:
             logging.error(f"CLI streaming failed: {proc.stderr[:300]}")
             yield {"result": {"text": "[TRANSCRIPTION ERROR]"}}
@@ -319,7 +336,9 @@ async def transcribe_stream_with_fallback(
                         async for line in resp.content:
                             line = line.decode("utf-8").strip()
                             if line:
-                                yield json.loads(line)
+                                payload = _server_stream_payload(json.loads(line))
+                                if payload is not None:
+                                    yield payload
                         return
                     else:
                         error_text = await resp.text()
@@ -350,7 +369,9 @@ async def transcribe_stream_with_fallback(
             async for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8").strip()
                 if line:
-                    yield json.loads(line)
+                    payload = _server_stream_payload(json.loads(line))
+                    if payload is not None:
+                        yield payload
             await proc.wait()
         finally:
             if proc.returncode != 0:

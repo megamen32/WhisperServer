@@ -128,6 +128,18 @@ def _same_origin_request(request: Request):
     return origin.rstrip("/") == expected.rstrip("/")
 
 
+def _set_webui_session_cookie(response: Response, request: Request, sid: str) -> None:
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
+    response.set_cookie(
+        WEBUI_SESSION_COOKIE,
+        sid,
+        max_age=WEBUI_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=(scheme == "https"),
+        samesite="strict",
+    )
+
+
 def _consume_webui_token(request: Request):
     _prune_webui_sessions()
     sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
@@ -843,6 +855,16 @@ async def transcribe(
     return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter)
 
 
+@app.post("/web/session")
+async def refresh_webui_session(request: Request):
+    if not _same_origin_request(request):
+        raise HTTPException(status_code=403, detail="Invalid request origin")
+    sid, token = _create_webui_session()
+    response = JSONResponse({"token": token}, headers={"Cache-Control": "no-store"})
+    _set_webui_session_cookie(response, request, sid)
+    return response
+
+
 @app.post("/web/transcribe")
 async def web_transcribe(
     request: Request,
@@ -1039,15 +1061,7 @@ async def webui(request: Request):
     sid, token = _create_webui_session()
     html = TEMPLATE_PATH.read_text().replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
     response = HTMLResponse(html)
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
-    response.set_cookie(
-        WEBUI_SESSION_COOKIE,
-        sid,
-        max_age=WEBUI_SESSION_TTL_SECONDS,
-        httponly=True,
-        secure=(scheme == "https"),
-        samesite="strict",
-    )
+    _set_webui_session_cookie(response, request, sid)
     return response
 
 if __name__ == "__main__":
