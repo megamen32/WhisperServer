@@ -174,7 +174,9 @@ WHISPER_NO_SPEECH_THRESHOLD = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.
 WHISPER_LOG_PROB_THRESHOLD = float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-1.0"))
 WHISPER_COMPRESSION_RATIO_THRESHOLD = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
 OPENAI_MODEL_MAP = {
-    OPENAI_WHISPER_ALIAS: OPENAI_WHISPER_INTERNAL_MODEL,
+    OPENAI_WHISPER_ALIAS: (OPENAI_WHISPER_INTERNAL_MODEL
+                           if OPENAI_DEFAULT_MODEL in WHISPER_MODEL_IDS
+                           else OPENAI_DEFAULT_MODEL),
 }
 
 
@@ -196,6 +198,9 @@ def build_vad_transcribe_options(enabled: bool) -> dict:
 def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: str, *, vad_filter: bool, words: bool | None = None) -> str:
     """Build a cache key that never mixes VAD-enabled and raw decoding."""
     words_part = "" if words is None else f":{words}"
+    routed_model = OPENAI_MODEL_MAP.get(model, model)
+    if model == OPENAI_WHISPER_ALIAS and routed_model != OPENAI_WHISPER_INTERNAL_MODEL:
+        model = f"{model}@{routed_model}"
     return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}"
 
 
