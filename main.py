@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import secrets
+from uuid import uuid4
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
@@ -648,7 +649,13 @@ async def response_listener(stop_event, response_queue):
             logger.info(f'response_listener get from queue result {result}')
             request_id = result["request_id"]
             if request_id in pending_results:
+                # A late segment is not a terminal response for a non-stream
+                # request. In particular it must not kill the shared listener.
+                if "result" not in result and "error" not in result:
+                    continue
                 future = pending_results.pop(request_id)
+                if future.done():
+                    continue
                 if "error" in result:
                     future.set_exception(Exception(result["error"]))
                 else:
@@ -670,6 +677,8 @@ async def response_listener(stop_event, response_queue):
                     pending_streams.pop(request_id, None)
         except asyncio.CancelledError:
             break
+        except Exception:
+            logger.exception("Failed to dispatch worker response; continuing")
 
 async def startup_event():
     global model_usage
@@ -788,7 +797,7 @@ async def _transcribe_impl(
         }
         return StreamingResponse(cached(), media_type="application/x-ndjson", headers=headers)
 
-    request_id = id(audio_bytes)
+    request_id = uuid4().hex
     loop = asyncio.get_event_loop()
     if stream:
         queue = asyncio.Queue()
@@ -814,11 +823,14 @@ async def _transcribe_impl(
 
     if stream:
         async def generator():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                yield json.dumps(item) + "\n"
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    yield json.dumps(item) + "\n"
+            finally:
+                pending_streams.pop(request_id, None)
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -950,7 +962,7 @@ async def openai_transcribe(
         return JSONResponse(transcription_response_payload(cached_result))
 
     # Queue the request
-    request_id = id(audio_bytes)
+    request_id = uuid4().hex
     loop = asyncio.get_event_loop()
     if stream:
         queue = asyncio.Queue()
