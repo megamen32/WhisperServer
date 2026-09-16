@@ -17,7 +17,7 @@ import logging
 import time
 import os
 import hashlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, ExitStack
 from faster_whisper import WhisperModel
 from gigaam_backend import GigaAMModel
 from parakeet_backend import ParakeetModel
@@ -486,6 +486,9 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 queue_ms = max(0.0, (time.perf_counter() - request.get("queued_at", time.perf_counter())) * 1000)
                 cold_load = False
                 info = None
+                model = None
+                segments = None
+                model_session = ExitStack()
                 try:
                     with tempfile.NamedTemporaryFile(delete=False) as temp:
                         temp.write(audio_bytes)
@@ -523,7 +526,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
 
                     model_entry = model_cache[model_name]
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                        model = model_entry.acquire()
+                        model_entry.acquire()
+                        model = model_session.enter_context(model_entry.inference())
                     else:
                         model = model_entry
                     load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
@@ -613,6 +617,14 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         "error": str(e)
                     })
                 finally:
+                    # Drop worker-local references before marking the cached
+                    # model idle so broker eviction can actually free VRAM.
+                    model = None
+                    segments = None
+                    try:
+                        model_session.close()
+                    except Exception:
+                        logger.exception("Failed to mark model idle")
                     if temp_path:
                         Path(temp_path).unlink(missing_ok=True)
                     duration = audio_seconds or getattr(info, "duration", None)
@@ -901,7 +913,7 @@ async def web_transcribe(
 async def openai_transcribe(
     request: Request,
     file: UploadFile = File(...),
-    model: str = Form("whisper-1"),
+    model: str = Form(DEFAULT_MODEL),
     language: Optional[str] = Form(None),
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
@@ -1071,7 +1083,9 @@ async def status():
 async def webui(request: Request):
     _prune_webui_sessions()
     sid, token = _create_webui_session()
-    html = TEMPLATE_PATH.read_text().replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
+    html = (TEMPLATE_PATH.read_text()
+            .replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
+            .replace("__DEFAULT_MODEL__", json.dumps(DEFAULT_MODEL)))
     response = HTMLResponse(html)
     _set_webui_session_cookie(response, request, sid)
     return response
