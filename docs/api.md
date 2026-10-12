@@ -24,6 +24,7 @@ OpenAI-compatible endpoint.
 | `language` | нет | ISO language code, например `ru`, `en`, `de` |
 | `temperature` | нет | принимается для совместимости с OpenAI API |
 | `stream` | нет | `true` включает SSE streaming |
+| `response_format` | нет | `json` по умолчанию; `verbose_json` сохраняет временные сегменты backend при `stream=false` |
 
 Обычный ответ включает текст и фактическую модель обслуживания:
 
@@ -36,6 +37,14 @@ OpenAI-compatible endpoint.
   "substitution_reason": "compatible_loaded_model"
 }
 ```
+
+При `response_format=verbose_json` тот же объект дополнительно содержит
+`segments` с исходными `start`, `end`, `text` и полями сегмента; язык и длительность
+добавляются только если backend их предоставил. Это одинаково для свежего ответа
+и попадания в кеш. Схема кеша и обычного JSON не меняется. Времена GigaAM при
+`vad_filter=true` обозначают исходные окна VAD/декодирования, а не выравнивание
+каждого слова. Старый кеш только с текстом возвращает пустой массив сегментов:
+времена из текста не вычисляются. SSE сохраняет прежний формат событий.
 
 Streaming ответ (`stream=true`) отдаётся как `text/event-stream`:
 

@@ -976,7 +976,7 @@ async def openai_transcribe(
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-        return JSONResponse(transcription_response_payload(cached_result))
+        return JSONResponse(transcription_response_payload(cached_result, response_format))
 
     # Queue the request
     request_id = uuid4().hex
@@ -1037,7 +1037,7 @@ async def openai_transcribe(
 
     try:
         result = await asyncio.wait_for(future, timeout=600)
-        return JSONResponse(transcription_response_payload(result))
+        return JSONResponse(transcription_response_payload(result, response_format))
     except asyncio.TimeoutError:
         pending_results.pop(request_id, None)
         return JSONResponse({"error": "Transcription timeout"}, status_code=504)

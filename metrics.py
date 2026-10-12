@@ -87,10 +87,15 @@ def model_metadata(result: dict) -> dict:
     return {field: result[field] for field in fields if field in result}
 
 
-def transcription_response_payload(result: dict) -> dict:
-    """Build an OpenAI-compatible response with truthful model metadata."""
+def transcription_response_payload(result: dict, response_format: str = "json") -> dict:
+    """Default JSON stays compact; verbose JSON preserves native timing only."""
     payload = {"text": result.get("text", "")}
     payload.update(model_metadata(result))
+    if response_format == "verbose_json":
+        payload["segments"] = result.get("segments", [])
+        for field in ("language", "language_probability", "duration"):
+            if field in result:
+                payload[field] = result[field]
     return payload
 
 
