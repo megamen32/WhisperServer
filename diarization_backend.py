@@ -71,9 +71,9 @@ class Community1Model:
         self.pipeline = None
         self.device = "unloaded"
 
-    def diarize(self, samples, hook=None):
+    def diarize(self, samples, hook=None, num_speakers=None):
         import torch
-        output = self.pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": SAMPLE_RATE}, hook=hook)
+        output = self.pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": SAMPLE_RATE}, hook=hook, num_speakers=num_speakers)
         labels, turns = {}, []
         for turn, label in output.exclusive_speaker_diarization:
             speaker = labels.setdefault(label, f"SPEAKER_{len(labels):02d}")
