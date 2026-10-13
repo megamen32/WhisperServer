@@ -311,3 +311,20 @@ def test_unload_drops_embedding_retained_by_frame_cache():
     del embedding,pipeline,Pipeline
     gc.collect()
     assert ref() is None
+
+
+
+def test_gigaam_tiny_turn_does_not_crash_fft_or_extend_timestamps(monkeypatch):
+    import wave,torch
+    monkeypatch.setattr(gigaam_backend,'decode_audio',lambda *a,**k:np.ones(16000,dtype=np.float32)*.1)
+    class Decoder:
+        def transcribe(self,path):
+            with wave.open(path,'rb') as audio:
+                waveform=torch.from_numpy(np.frombuffer(audio.readframes(audio.getnframes()),dtype='<i2').astype('float32'))
+            # Real GigaAM failure: FFT window320 exceeded the270-sample input.
+            spectrum=torch.stft(waveform,n_fft=320,hop_length=160,center=False,return_complex=True)
+            assert spectrum.shape[1]>0
+            return 'реплика'
+    turns=[dict(start=0,end=270/16000,speaker='SPEAKER_00')]
+    segments,_=gigaam_backend.GigaAMModel(Decoder()).transcribe('audio.wav',speaker_turns=turns)
+    assert [(s.start,s.end) for s in segments]==[(0,270/16000)]

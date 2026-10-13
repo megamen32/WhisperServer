@@ -23,6 +23,8 @@ from parakeet_backend import ParakeetInfo, ParakeetSegment
 
 GIGAAM_V3_HF_ID = "ai-sage/GigaAM-v3"
 GIGAAM_V3_REVISION = "e2e_rnnt"
+# Valid feature frames even for tiny turns/tails; original timestamps stay unchanged.
+MIN_DECODER_SAMPLES = 3200
 
 
 class GigaAMModel:
@@ -79,6 +81,8 @@ class GigaAMModel:
                 for start in range(region['start'], region['end'], limit):
                     end = min(start + limit, region['end'])
                     pcm = (np.clip(audio[start:end], -1, 1) * 32767).astype('<i2')
+                    if len(pcm) < MIN_DECODER_SAMPLES:
+                        pcm = np.pad(pcm, (0, MIN_DECODER_SAMPLES - len(pcm)))
                     with wave.open(path, 'wb') as out:
                         out.setnchannels(1)
                         out.setsampwidth(2)
