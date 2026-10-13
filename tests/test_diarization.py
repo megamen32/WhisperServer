@@ -22,6 +22,17 @@ TURNS = [
 ]
 
 
+def test_gated_model_error_explains_required_access():
+    from diarization_backend import _load_pipeline
+    from huggingface_hub.errors import GatedRepoError
+    class Gated:
+        @staticmethod
+        def from_pretrained(*a, **k):
+            raise GatedRepoError('restricted model')
+    with pytest.raises(RuntimeError, match='Community-1.*HF_TOKEN'):
+        _load_pipeline(Gated)
+
+
 def test_word_changes_split_segment_and_preserve_returning_speaker():
     words = [dict(start=0.1, end=0.8, word=" Привет!"),
              dict(start=1.1, end=1.8, word=" Здравствуйте!"),

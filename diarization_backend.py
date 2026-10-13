@@ -8,6 +8,23 @@ import subprocess
 
 MODEL_ID = "pyannote/speaker-diarization-community-1"
 MAX_AUDIO_SECONDS = 1200
+ACCESS_ERROR = 'Community-1 недоступна: примите условия модели в Hugging Face и настройте HF_TOKEN на сервере'
+
+
+def _load_pipeline(pipeline_type):
+    """Translate gated/invalid credentials into an actionable server-side error."""
+    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+    try:
+        pipeline = pipeline_type.from_pretrained(
+            MODEL_ID, token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
+        )
+    except HfHubHTTPError as exc:
+        if isinstance(exc, GatedRepoError) or getattr(exc.response, 'status_code', None) in {401, 403}:
+            raise RuntimeError(ACCESS_ERROR) from exc
+        raise
+    if pipeline is None:
+        raise RuntimeError(ACCESS_ERROR)
+    return pipeline
 
 
 def diarize_audio(audio_path: str) -> list[dict]:
@@ -37,11 +54,7 @@ def diarize_audio(audio_path: str) -> list[dict]:
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(min(previous_threads, 2))
-        pipeline = Pipeline.from_pretrained(
-            MODEL_ID, token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
-        )
-        if pipeline is None:
-            raise RuntimeError('Community-1 недоступна: примите условия модели в Hugging Face и настройте HF_TOKEN на сервере')
+        pipeline = _load_pipeline(Pipeline)
         pipeline.to(torch.device("cpu"))
         output = pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": 16000})
         labels = {}
