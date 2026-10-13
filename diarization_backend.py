@@ -55,6 +55,8 @@ def diarize_audio(audio_path: str) -> list[dict]:
     try:
         torch.set_num_threads(min(previous_threads, 2))
         pipeline = _load_pipeline(Pipeline)
+        pipeline.segmentation_batch_size = 1
+        pipeline.embedding_batch_size = 1
         pipeline.to(torch.device("cpu"))
         output = pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": 16000})
         labels = {}
