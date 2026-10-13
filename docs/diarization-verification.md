@@ -99,3 +99,52 @@ AgentBrowser на server-88, выбрать gigaam-v3, включить гово
 consumer canary прошёл в прежних RAM/tasks-пределах. Эта более низкая
 параллельность рекомендована для повторения; серверный ASR-бюджет не менялся.
 Собственная браузерная сессия и unit завершены, чужие процессы не затрагивались.
+
+## Managed GPU and real long recordings: PASS
+
+2026-10-13: deployed `2e64328` on the existing server-88 service. Community-1
+uses CUDA through ManagedModel/cudabroker,1536MiB reservation and priority11;
+its active lease protects the whole model pass. Weights and WeSpeaker frame
+caches are released before the ASR stage. Cudabroker client0.2.1 is pinned;
+sync/async heartbeat no longer renews its own activity grace, and model
+finalizers run before acknowledging free memory. SDK source reconciled with
+previously deployed client code; the broker server itself was not restarted.
+
+Real GPU canary: two consecutive25.04s recordings retained two voices and the
+returning first voice. Two load/inference/unload cycles took9.48s excluding
+import; peak CUDA allocated119.62MiB, reserved154MiB, RAM1566273536bytes.
+Model CUDA bytes after each unload:0 above the original8.125MiB cuBLAS
+workspace. Initial39MiB WeSpeaker LRU retention was reproduced and repaired;
+failed initial attempts were not GREEN.
+
+After the final intentional restart, a fresh public OpenAI SDK request used
+model=whisper-1, response_format=diarized_json, chunking_strategy=auto,
+cache=false. The observer saw an active whisper-community-1 lease, priority11,
+and no such service lease after the result. Two speaker labels and the
+returning first remained correct.63 focused checks plus deployment/restart/API
+canary completed in57.89s, below180s. Evidence:
+`.tmp/diarization-practice-20261013/gpu-api-accepted.json` and `gpu-canary.json`.
+Old queued requests were allowed to finish before the deployment.
+
+Full user-provided video47:17: CUDA diarization116.39s, whole worker319.48s.
+Automatic clustering proposed four voices when the user expected three;
+the additional short cluster had about22s in40turns. Preserve this baseline.
+The separate run with official pyannote num_speakers=3 took331.11s and
+returned three labelled voices,653 nonempty ASR segments. This number is
+conditioned on the user's hint, not an independent count-accuracy claim.
+
+Full user audio1:26:06: CUDA diarization236.72s, automatically three voices;
+1132 source turns and1040 nonempty ASR segments. A combined two-file
+verification process hit systemd-oomd pressure after saving the audio turns.
+The second file was resumed alone using the verified saved CUDA turns;
+recognition took343.03s. Productive phase total579.75s (~9:40), excluding
+failed work and implementation time. RAM/GPU limits were not raised; files,
+checkpoints and completed results were retained. This is authorized user-file
+processing, not nightly benchmark coverage or a dense-voice release test.
+
+The real video also exposed a270-sample turn shorter than GigaAM's320-sample
+FFT window. Decoder input is padded to200ms, with original segment boundaries
+unchanged. A real CPU FFT regression check and the full CUDA worker rerun pass.
+No user recordings/transcript content are committed. Local artifacts:
+`video-2026-10-13*.json/txt/srt`, `shkolny-bulvar-30.json/txt/srt`, `summary.json`
+and `Проверка.md` inside `.tmp/diarization-practice-20261013/`.
