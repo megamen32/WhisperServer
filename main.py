@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager, ExitStack
 from faster_whisper import WhisperModel
 from gigaam_backend import GigaAMModel
 from parakeet_backend import ParakeetModel
+from diarization_backend import diarize_audio, attribute_segment, speaker_text
 try:
     from cudabroker_client import ManagedModel
 except Exception:
@@ -195,13 +196,14 @@ def build_vad_transcribe_options(enabled: bool) -> dict:
     }
 
 
-def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: str, *, vad_filter: bool, words: bool | None = None) -> str:
+def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: str, *, vad_filter: bool, words: bool | None = None, diarize: bool = False) -> str:
     """Build a cache key that never mixes VAD-enabled and raw decoding."""
     words_part = "" if words is None else f":{words}"
     routed_model = OPENAI_MODEL_MAP.get(model, model)
     if model == OPENAI_WHISPER_ALIAS and routed_model != OPENAI_WHISPER_INTERNAL_MODEL:
         model = f"{model}@{routed_model}"
-    return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}"
+    speaker_part = ":community-1-v1" if diarize else ""
+    return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}{speaker_part}"
 
 
 def _select_openai_whisper_model(model_cache: dict) -> str:
@@ -500,6 +502,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         temp.flush()
                         temp_path = temp.name
                     audio_seconds = audio_duration_seconds(temp_path)
+                    diarize = request.get("diarize", False)
+                    speaker_turns = diarize_audio(temp_path) if diarize else []
 
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
@@ -548,7 +552,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         beam_size=beam_size,
                         language=lang,
                         temperature=temperature,
-                        word_timestamps=request.get("words", False),
+                        word_timestamps=request.get("words", False) or diarize,
+                        **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
                         condition_on_previous_text=False,
                         **build_vad_transcribe_options(vad_filter),
                         no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
@@ -575,21 +580,23 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             "compression_ratio": getattr(seg, "compression_ratio", None),
                         }
                         logger.info("%s processed segment: %s", model_name, seg_data)
-                        all_segments.append(seg_data)
-                        if request.get("words", False) and getattr(seg, "words", None):
+                        if (request.get("words", False) or diarize) and getattr(seg, "words", None):
                             words = [
                                 {"start": w.start, "end": w.end, "word": w.word}
                                 for w in seg.words
                             ]
-                            all_words.extend(words)
                         else:
                             words = []
 
+                        attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
+                        all_segments.extend(attributed)
+                        all_words.extend(words)
                         if stream:
-                            payload = {"request_id": request_id, "segment": seg_data}
-                            if request.get("words", False):
-                                payload["words"] = words
-                            response_queue.put(payload)
+                            for part in attributed:
+                                payload = {"request_id": request_id, "segment": part}
+                                if request.get("words", False):
+                                    payload["words"] = [w for w in words if w["start"] >= part["start"] and w["end"] <= part["end"]]
+                                response_queue.put(payload)
 
                     result = {
                         "text": " ".join([s["text"] for s in all_segments]),
@@ -603,6 +610,10 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     }
                     if request.get("words", False):
                         result["words"] = all_words
+                    if diarize:
+                        result["speaker_text"] = speaker_text(all_segments)
+                        result["speaker_turns"] = speaker_turns
+                        result["diarization_model"] = "pyannote/speaker-diarization-community-1"
 
                     if cache_key:
                         transcription_cache.set(cache_key, result, expire=CACHE_TTL)
@@ -785,14 +796,16 @@ async def _transcribe_impl(
     stream: bool,
     words: bool,
     vad_filter: bool,
+    diarize: bool = False,
 ):
+    diarize = diarize is True
     actual_model = OPENAI_MODEL_MAP.get(model, model)
     if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
         return JSONResponse({"error": "Unsupported model"}, status_code=400)
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
-    cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words)
+    cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words, diarize=diarize)
 
     cached_result = _get_cached_result(cache_key)
     if cached_result is not None and not stream:
@@ -804,7 +817,11 @@ async def _transcribe_impl(
         append_cache_metric(cached_result, model)
         async def cached():
             for segment in cached_result.get("segments", []):
-                yield json.dumps({"segment": segment}) + "\n"
+                payload = {"segment": segment}
+                if words:
+                    payload["words"] = [w for w in cached_result.get("words", [])
+                                        if w["start"] >= segment["start"] and w["end"] <= segment["end"]]
+                yield json.dumps(payload) + "\n"
             yield json.dumps({"result": cached_result}) + "\n"
         headers = {
             "Cache-Control": "no-cache",
@@ -835,6 +852,7 @@ async def _transcribe_impl(
         "stream": stream,
         "words": words,
         "vad_filter": vad_filter,
+        "diarize": diarize,
         "queued_at": time.perf_counter(),
     })
 
@@ -878,10 +896,11 @@ async def transcribe(
     words: bool = Query(False),
     vad_filter: bool = Query(True),
     api_key: str = Query(...),
+    diarize: bool = Query(False),
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
-    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter)
+    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize)
 
 
 @app.post("/web/session")
@@ -905,10 +924,11 @@ async def web_transcribe(
     stream: bool = Query(False),
     words: bool = Query(False),
     vad_filter: bool = Query(True),
+    diarize: bool = Query(False),
 ):
     """First-party Web UI tunnel: API_KEY stays server-side; CSRF token is one-use."""
     next_token = _consume_webui_token(request)
-    response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter)
+    response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize)
     if not hasattr(response, "headers"):
         response = JSONResponse(response)
     response.headers["X-Whisper-Next-CSRF"] = next_token
@@ -925,8 +945,10 @@ async def openai_transcribe(
     stream: bool = Form(False),
     vad_filter: bool = Form(True),
     cache: bool = Form(True),
+    diarize: bool = Form(False),
 ):
     """OpenAI-compatible transcription endpoint"""
+    diarize = diarize is True
     _require_openai_api_key(request)
 
     # Map OpenAI model name to actual model
@@ -949,7 +971,7 @@ async def openai_transcribe(
     audio_hash = hash_bytes(audio_bytes)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
     cache_key = (
-        transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
+        transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter, diarize=diarize)
         if cache
         else None
     )
@@ -964,7 +986,7 @@ async def openai_transcribe(
             async def cached_stream_generator():
                 if cached_text:
                     yield _openai_sse(_openai_delta_event(cached_text))
-                yield _openai_sse(_openai_done_event(cached_text, model_metadata(cached_result)))
+                yield _openai_sse(_openai_done_event(cached_text, transcription_response_payload(cached_result, response_format)))
 
             return StreamingResponse(
                 cached_stream_generator(),
@@ -1000,6 +1022,7 @@ async def openai_transcribe(
         "stream": stream,
         "words": False,
         "vad_filter": vad_filter,
+        "diarize": diarize,
         "queued_at": time.perf_counter(),
     })
 
@@ -1011,6 +1034,9 @@ async def openai_transcribe(
                     item = await asyncio.wait_for(queue.get(), timeout=600)
                     if item is None:
                         break
+                    if "error" in item:
+                        yield _openai_sse({"type": "error", "error": {"message": item["error"]}})
+                        break
                     if "segment" in item:
                         segment = item["segment"]
                         text = segment.get("text", "")
@@ -1019,7 +1045,7 @@ async def openai_transcribe(
                     elif "result" in item:
                         result = item["result"]
                         yield _openai_sse(
-                            _openai_done_event(result.get("text", final_text), model_metadata(result))
+                            _openai_done_event(result.get("text", final_text), transcription_response_payload(result, response_format))
                         )
             finally:
                 pending_streams.pop(request_id, None)

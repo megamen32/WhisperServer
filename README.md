@@ -163,3 +163,10 @@ python -m py_compile main.py telegram_bot.py whisperclient/*.py tests/*.py
 ## License
 
 MIT.
+
+## Speaker labels
+
+Enable **Различать говорящих** in the web UI, or send `diarize=true` to the API,
+to get a transcript labelled by speaker using local Community-1.
+Requires the optional `diarization` extra and Hugging Face model access.
+See [setup, API fields and limits](docs/diarization.md).

@@ -91,8 +91,13 @@ def transcription_response_payload(result: dict, response_format: str = "json") 
     """Default JSON stays compact; verbose JSON preserves native timing only."""
     payload = {"text": result.get("text", "")}
     payload.update(model_metadata(result))
+    for field in ("speaker_text", "diarization_model"):
+        if field in result:
+            payload[field] = result[field]
     if response_format == "verbose_json":
         payload["segments"] = result.get("segments", [])
+        if "speaker_turns" in result:
+            payload["speaker_turns"] = result["speaker_turns"]
         for field in ("language", "language_probability", "duration"):
             if field in result:
                 payload[field] = result[field]

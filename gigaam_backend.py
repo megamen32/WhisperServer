@@ -42,10 +42,11 @@ class GigaAMModel:
 
     def transcribe(self, audio_path: str, *, language: str | None = None,
                    vad_filter: bool = False, vad_parameters: dict | None = None,
+                   speaker_turns: list[dict] | None = None,
                    **_: Any) -> tuple[Iterable[ParakeetSegment], ParakeetInfo]:
         """Decode one audio file and normalize GigaAM's text-only result."""
         info = ParakeetInfo(language=language or "ru", language_probability=1.0 if language else 0.0)
-        if not vad_filter:
+        if not vad_filter and speaker_turns is None:
             try:
                 text = str(self._model.transcribe(audio_path) or "").strip()
                 return ([ParakeetSegment(start=0.0, end=0.0, text=text)] if text else []), info
@@ -58,7 +59,13 @@ class GigaAMModel:
         rate = 16000
         limit = 20 * rate
         audio = decode_audio(audio_path, sampling_rate=rate)
-        if vad_filter:
+        if speaker_turns is not None:
+            # Decode each exclusive speaker turn separately: GigaAM has no word
+            # timestamps, so tagging a whole VAD region would mix speakers.
+            regions = [{'start': max(0, int(turn['start'] * rate)),
+                        'end': min(len(audio), int(turn['end'] * rate))}
+                       for turn in speaker_turns]
+        elif vad_filter:
             options = dict(vad_parameters or {})
             options['max_speech_duration_s'] = 20
             regions = get_speech_timestamps(audio, VadOptions(**options))

@@ -24,6 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+diarization = ["pyannote.audio>=4.0,<5"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
@@ -46,7 +47,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry"]
+py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend"]
 
 [tool.setuptools.packages.find]
 include = ["whisperclient*"]

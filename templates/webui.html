@@ -351,6 +351,10 @@
                     <span>API-ключ</span>
                 </label>
                 <button type="button" id="toggle-times">Показать таймкоды</button>
+                <label class="control">
+                    <span><input type="checkbox" id="diarize"> Различать говорящих</span>
+                    <small>Для записей до 20 минут; обработка займёт больше времени</small>
+                </label>
             </div>
             <div class="upload-track hidden">
                 <div class="upload-bar" id="upload-bar"></div>
@@ -615,7 +619,10 @@
             timestamp.textContent = `${formatTime(segment.start)} → ${formatTime(segment.end)}`;
             const text = document.createElement('div');
             text.className = 'segment-text';
-            text.textContent = segment.text;
+            const speaker = segment.speaker
+                ? `Спикер ${Number(segment.speaker.split('_').pop()) + 1}: `
+                : (Object.hasOwn(segment, 'speaker') ? 'Неизвестный спикер: ' : '');
+            text.textContent = speaker + segment.text;
             wrapper.appendChild(timestamp);
             wrapper.appendChild(text);
             transcriptContainer.appendChild(wrapper);
@@ -722,6 +729,7 @@
             const requestUrl = new URL('/web/transcribe', window.location.origin);
             requestUrl.searchParams.set('stream', 'true');
             requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
+            requestUrl.searchParams.set('diarize', document.getElementById('diarize').checked);
 
             try {
                 await refreshWebuiToken();
@@ -759,7 +767,7 @@
                     appendSegment(payload.segment);
                 }
                 if (payload.result && payload.result.text) {
-                    finalOutput.textContent = payload.result.text;
+                    finalOutput.textContent = payload.result.speaker_text || payload.result.text;
                     showCopyButton();
                 }
             }

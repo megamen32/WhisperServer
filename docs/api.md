@@ -102,3 +102,10 @@ curl -N -F "file=@audio.mp3" "http://127.0.0.1:7653/transcribe?model=base&stream
 | `GET /status` | размер очереди, cache stats, loaded models |
 | `GET /` | web UI |
 | `POST /web/transcribe` | upload из web UI; защищён cookie + одноразовым CSRF token |
+
+## Speaker diarization
+
+Use `diarize=true` to add Community-1 speaker labels. Native endpoints accept a
+query parameter; `/v1/audio/transcriptions` accepts a multipart form field.
+`speaker_text` contains labelled dialogue; `response_format=verbose_json` also
+includes `segments[].speaker` and `speaker_turns`. See [setup and limits](diarization.md).
