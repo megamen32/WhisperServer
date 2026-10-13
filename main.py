@@ -14,15 +14,16 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import logging
+import traceback
 import time
 import os
 import hashlib
-from contextlib import asynccontextmanager, ExitStack
+from contextlib import asynccontextmanager, contextmanager, ExitStack
 from faster_whisper import WhisperModel
 from gigaam_backend import GigaAMModel
 from parakeet_backend import ParakeetModel
 from metrics import diarized_segment
-from diarization_backend import diarize_audio, attribute_segment, speaker_text
+from diarization_backend import diarize_audio, attribute_segment, speaker_text, Community1Model
 try:
     from cudabroker_client import ManagedModel
 except Exception:
@@ -267,6 +268,57 @@ def _create_model_entry(model_name: str):
 
 
 
+DIARIZATION_VRAM_MB = 1536
+
+
+def _create_diarization_entry():
+    if not torch.cuda.is_available():
+        return Community1Model.from_pretrained("cpu")
+    if ManagedModel is None:
+        raise RuntimeError("Community-1 GPU requires cudabroker_client")
+    return ManagedModel(
+        model_id="whisper-community-1",
+        loader=lambda: Community1Model.from_pretrained("cuda"),
+        vram_mb=DIARIZATION_VRAM_MB,
+        gpu_priority=MODEL_PRIORITY.get("gigaam-v3", 10) + 1,
+        cpu_capable=False,
+        ttl_seconds=900,
+        client_id=BROKER_CLIENT_ID,
+    )
+
+
+@contextmanager
+def _diarization_model_session():
+    """Keep the lease active for inference; free it before the ASR stage."""
+    entry = _create_diarization_entry()
+    model = None
+    scope = ExitStack()
+    try:
+        if ManagedModel is not None and isinstance(entry, ManagedModel):
+            entry.acquire()
+            model = scope.enter_context(entry.inference())
+        else:
+            model = entry
+        logger.info("Community-1 inference on %s", model.device)
+        yield model
+    finally:
+        try:
+            if model is not None:
+                model.unload()
+        except Exception as exc:
+            # Inactive exception frames otherwise retain the CUDA model itself.
+            traceback.clear_frames(exc.__traceback__)
+            raise
+        finally:
+            model = None
+            try:
+                scope.close()
+            finally:
+                if ManagedModel is not None and isinstance(entry, ManagedModel):
+                    entry.release()
+                entry = None
+
+
 def _is_truthy(value):
     if isinstance(value, bool):
         return value
@@ -504,7 +556,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         temp_path = temp.name
                     audio_seconds = audio_duration_seconds(temp_path)
                     diarize = request.get("diarize", False)
-                    speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter) if diarize else []
+                    speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter, model_provider=_diarization_model_session) if diarize else []
 
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
@@ -616,6 +668,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         result["speaker_text"] = speaker_text(all_segments)
                         result["speaker_turns"] = speaker_turns
                         result["diarization_model"] = "pyannote/speaker-diarization-community-1"
+                        result["diarization_device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
                     if cache_key:
                         transcription_cache.set(cache_key, result, expire=CACHE_TTL)
@@ -668,6 +721,12 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
         except Exception as e:
             logger.exception("Фатальная ошибка в loop:")
             time.sleep(1)
+
+    # Normal worker shutdown must release cached ASR leases as well.
+    for entry in model_cache.values():
+        if ManagedModel is not None and isinstance(entry, ManagedModel):
+            entry.release()
+
 
 async def response_listener(stop_event, response_queue):
     loop = asyncio.get_running_loop()

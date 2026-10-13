@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import traceback
+from contextlib import contextmanager
 import os
 import subprocess
 import tempfile
@@ -29,6 +31,64 @@ def _load_pipeline(pipeline_type):
     if pipeline is None:
         raise RuntimeError(ACCESS_ERROR)
     return pipeline
+
+
+class Community1Model:
+    """A pipeline owned by the same broker lifecycle as ASR models."""
+
+    def __init__(self, pipeline, device):
+        self.pipeline = pipeline
+        self.device = device
+
+    @classmethod
+    def from_pretrained(cls, device="cpu"):
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError as exc:
+            raise RuntimeError('Разделение говорящих требует установки whisper-server[diarization]') from exc
+        import torch
+        pipeline = _load_pipeline(Pipeline)
+        pipeline.segmentation_batch_size = 1
+        pipeline.embedding_batch_size = 1
+        pipeline.to(torch.device(device))
+        return cls(pipeline, device)
+
+    def unload(self):
+        """Free CUDA tensors, including WeSpeaker's class-level frame caches."""
+        import torch
+        pipeline = self.pipeline
+        if pipeline is None:
+            return
+        pipeline.to(torch.device("cpu"))
+        embedding = getattr(getattr(pipeline, "_embedding", None), "model_", None)
+        models = list(getattr(pipeline, "_models", {}).values())
+        if embedding is not None:
+            models.extend([embedding, getattr(embedding, "resnet", None)])
+        for model in models:
+            cached = getattr(model, "num_frames", None)
+            if hasattr(cached, "cache_clear"):
+                cached.cache_clear()
+        self.pipeline = None
+        self.device = "unloaded"
+
+    def diarize(self, samples, hook=None):
+        import torch
+        output = self.pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": SAMPLE_RATE}, hook=hook)
+        labels, turns = {}, []
+        for turn, label in output.exclusive_speaker_diarization:
+            speaker = labels.setdefault(label, f"SPEAKER_{len(labels):02d}")
+            turns.append({"start": float(turn.start), "end": float(turn.end), "speaker": speaker})
+        return turns
+
+
+@contextmanager
+def _cpu_model():
+    model = Community1Model.from_pretrained("cpu")
+    try:
+        yield model
+    finally:
+        model.unload()
+        model = None
 
 
 def _compact_speech(samples, path):
@@ -64,15 +124,11 @@ def _restore_turns(turns, mapping):
     return restored
 
 
-def diarize_audio(audio_path: str, vad_filter: bool = True) -> list[dict]:
-    """Decode to bounded disk storage, then cluster all speech together on CPU."""
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError as exc:
-        raise RuntimeError('Разделение говорящих требует установки whisper-server[diarization]') from exc
+def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None) -> list[dict]:
+    """Decode/VAD first, then reserve GPU only for the global model pass."""
     import numpy as np
     import torch
-    pipeline = None
+    model = None
     previous_threads = torch.get_num_threads()
     try:
         with tempfile.TemporaryDirectory(prefix="whisper-diarization-") as directory:
@@ -93,18 +149,18 @@ def diarize_audio(audio_path: str, vad_filter: bool = True) -> list[dict]:
                 if samples is None:
                     return []
             torch.set_num_threads(min(previous_threads, 2))
-            pipeline = _load_pipeline(Pipeline)
-            pipeline.segmentation_batch_size = 1
-            pipeline.embedding_batch_size = 1
-            pipeline.to(torch.device("cpu"))
-            output = pipeline({"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": SAMPLE_RATE})
-            labels, turns = {}, []
-            for turn, label in output.exclusive_speaker_diarization:
-                speaker = labels.setdefault(label, f"SPEAKER_{len(labels):02d}")
-                turns.append({"start": float(turn.start), "end": float(turn.end), "speaker": speaker})
+            with (model_provider or _cpu_model)() as model:
+                try:
+                    turns = model.diarize(samples)
+                except Exception as exc:
+                    traceback.clear_frames(exc.__traceback__)
+                    raise
+                finally:
+                    # Drop the live pipeline reference before the provider releases VRAM.
+                    model = None
             return _restore_turns(turns, mapping) if mapping is not None else turns
     finally:
-        pipeline = None
+        model = None
         gc.collect()
         torch.set_num_threads(previous_threads)
 

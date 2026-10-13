@@ -26,6 +26,9 @@ def test_worker_reuses_models_and_marks_inference_idle_after_each_request(monkey
                 calls.append(('end', self.name))
         def touch(self, **kwargs):
             pass
+        def release(self):
+            assert not self.active
+            calls.append(('release', self.name))
         def transcribe(self, *args, **kwargs):
             assert self.active, 'lease must be pinned for the entire inference'
             return [], SimpleNamespace(language='ru', language_probability=1)
@@ -46,3 +49,4 @@ def test_worker_reuses_models_and_marks_inference_idle_after_each_request(monkey
     assert sum(kind == 'begin' for kind, _ in calls) == 3
     assert sum(kind == 'end' for kind, _ in calls) == 3
     assert not any(e.active for e in entries)
+    assert sum(kind == 'release' for kind, _ in calls) == 2

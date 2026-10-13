@@ -234,3 +234,80 @@ def test_vad_blocks_are_bounded_and_overlap_is_merged(monkeypatch, tmp_path):
     assert max(lengths) <= 302 * SAMPLE_RATE
     assert len(compact) == len(samples)
     assert mapping == [(0, 601, 0)]
+
+
+def test_community_gpu_load_uses_broker_and_no_unmanaged_fallback(monkeypatch):
+    monkeypatch.setattr(main.torch.cuda, 'is_available', lambda: True)
+    calls=[]
+    monkeypatch.setattr(main, 'ManagedModel', lambda **kwargs: calls.append(kwargs) or kwargs)
+    entry=main._create_diarization_entry()
+    assert entry['model_id']=='whisper-community-1'
+    assert entry['vram_mb']==1536
+    assert entry['cpu_capable'] is False
+    assert entry['client_id']==main.BROKER_CLIENT_ID
+    monkeypatch.setattr(main, 'ManagedModel', None)
+    with pytest.raises(RuntimeError,match='cudabroker_client'):
+        main._create_diarization_entry()
+
+
+@pytest.mark.parametrize('failure', [None, 'inference', 'idle', 'unload'])
+def test_community_releases_gpu_even_on_errors_and_drops_live_reference(monkeypatch, failure):
+    import weakref
+    from contextlib import contextmanager
+    events=[]
+    class Model:
+        device='cuda'
+        def unload(self):
+            events.append('unload')
+            if failure=='unload':raise RuntimeError('unload failed')
+    class Managed:
+        def acquire(self):
+            self.model=Model()
+            self.ref=weakref.ref(self.model)
+            events.append('load')
+        @contextmanager
+        def inference(self):
+            events.append('active')
+            try:yield self.model
+            finally:
+                events.append('idle')
+                if failure=='idle':raise RuntimeError('idle failed')
+        def release(self):
+            self.model=None
+            assert self.ref() is None,'live model reference prevents VRAM release'
+            events.append('release')
+    entry=Managed()
+    monkeypatch.setattr(main,'ManagedModel',Managed)
+    monkeypatch.setattr(main,'_create_diarization_entry',lambda:entry)
+    def run():
+        with main._diarization_model_session() as model:
+            assert model.device=='cuda'
+            model=None
+            if failure=='inference':raise ValueError('inference failed')
+    if failure:
+        with pytest.raises((ValueError,RuntimeError)):run()
+    else:run()
+    assert events==['load','active','unload','idle','release']
+
+
+
+def test_unload_drops_embedding_retained_by_frame_cache():
+    import gc,weakref
+    from functools import lru_cache
+    from diarization_backend import Community1Model
+    class Embedding:
+        @lru_cache
+        def num_frames(self,n):return n
+    embedding=Embedding();embedding.num_frames(100)
+    ref=weakref.ref(embedding)
+    class Pipeline:
+        _models={}
+        _embedding=SimpleNamespace(model_=embedding)
+        def to(self,device):pass
+    pipeline=Pipeline();model=Community1Model(pipeline,'cuda')
+    model.unload()
+    assert embedding.num_frames.cache_info().currsize==0
+    assert model.pipeline is None
+    del embedding,pipeline,Pipeline
+    gc.collect()
+    assert ref() is None
