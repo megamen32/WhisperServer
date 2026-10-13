@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager, ExitStack
 from faster_whisper import WhisperModel
 from gigaam_backend import GigaAMModel
 from parakeet_backend import ParakeetModel
+from metrics import diarized_segment
 from diarization_backend import diarize_audio, attribute_segment, speaker_text
 try:
     from cudabroker_client import ManagedModel
@@ -202,7 +203,7 @@ def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: 
     routed_model = OPENAI_MODEL_MAP.get(model, model)
     if model == OPENAI_WHISPER_ALIAS and routed_model != OPENAI_WHISPER_INTERNAL_MODEL:
         model = f"{model}@{routed_model}"
-    speaker_part = ":community-1-v1" if diarize else ""
+    speaker_part = ":community-1-v2" if diarize else ""
     return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}{speaker_part}"
 
 
@@ -503,7 +504,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         temp_path = temp.name
                     audio_seconds = audio_duration_seconds(temp_path)
                     diarize = request.get("diarize", False)
-                    speaker_turns = diarize_audio(temp_path) if diarize else []
+                    speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter) if diarize else []
 
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
@@ -611,6 +612,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if request.get("words", False):
                         result["words"] = all_words
                     if diarize:
+                        result["duration"] = audio_seconds or 0.0
                         result["speaker_text"] = speaker_text(all_segments)
                         result["speaker_turns"] = speaker_turns
                         result["diarization_model"] = "pyannote/speaker-diarization-community-1"
@@ -858,9 +860,17 @@ async def _transcribe_impl(
 
     if stream:
         async def generator():
+            deadline = time.monotonic() + (int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600)
             try:
                 while True:
-                    item = await queue.get()
+                    if time.monotonic() >= deadline:
+                        yield json.dumps({"error": "Transcription timeout"}) + "\n"
+                        break
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=min(15, deadline - time.monotonic()))
+                    except asyncio.TimeoutError:
+                        yield json.dumps({"status": "processing"}) + "\n"
+                        continue
                     if item is None:
                         break
                     yield json.dumps(item) + "\n"
@@ -875,7 +885,7 @@ async def _transcribe_impl(
         return StreamingResponse(generator(), media_type="application/x-ndjson", headers=headers)
     else:
         try:
-            result = await asyncio.wait_for(future, timeout=600)
+            result = await asyncio.wait_for(future, timeout=(int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600))
             return result
         except asyncio.TimeoutError:
             pending_results.pop(request_id, None)
@@ -942,14 +952,17 @@ async def openai_transcribe(
     language: Optional[str] = Form(None),
     temperature: float = Form(0.0),
     response_format: str = Form("json"),
+    chunking_strategy: Optional[str] = Form(None),
     stream: bool = Form(False),
     vad_filter: bool = Form(True),
     cache: bool = Form(True),
     diarize: bool = Form(False),
 ):
     """OpenAI-compatible transcription endpoint"""
-    diarize = diarize is True
     _require_openai_api_key(request)
+    if isinstance(chunking_strategy, str) and chunking_strategy != "auto":
+        return JSONResponse({"error": "Supported chunking_strategy: auto"}, status_code=400)
+    diarize = diarize is True or response_format == "diarized_json"
 
     # Map OpenAI model name to actual model
     actual_model = OPENAI_MODEL_MAP.get(model, model)
@@ -984,6 +997,9 @@ async def openai_transcribe(
         cached_text = cached_result.get("text", "")
         if stream:
             async def cached_stream_generator():
+                if response_format == "diarized_json":
+                    for i, segment in enumerate(cached_result.get("segments", [])):
+                        yield _openai_sse(diarized_segment(segment, i))
                 if cached_text:
                     yield _openai_sse(_openai_delta_event(cached_text))
                 yield _openai_sse(_openai_done_event(cached_text, transcription_response_payload(cached_result, response_format)))
@@ -1029,9 +1045,18 @@ async def openai_transcribe(
     if stream:
         async def openai_stream_generator():
             final_text = ""
+            segment_index = 0
+            deadline = time.monotonic() + (int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600)
             try:
                 while True:
-                    item = await asyncio.wait_for(queue.get(), timeout=600)
+                    if time.monotonic() >= deadline:
+                        yield _openai_sse({"type": "error", "error": {"message": "Transcription timeout"}})
+                        break
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=min(15, deadline - time.monotonic()))
+                    except asyncio.TimeoutError:
+                        yield ": processing\n\n"
+                        continue
                     if item is None:
                         break
                     if "error" in item:
@@ -1041,6 +1066,9 @@ async def openai_transcribe(
                         segment = item["segment"]
                         text = segment.get("text", "")
                         final_text += text
+                        if response_format == "diarized_json":
+                            yield _openai_sse(diarized_segment(segment, segment_index))
+                            segment_index += 1
                         yield _openai_sse(_openai_delta_event(text, segment.get("id")))
                     elif "result" in item:
                         result = item["result"]
@@ -1062,7 +1090,7 @@ async def openai_transcribe(
         )
 
     try:
-        result = await asyncio.wait_for(future, timeout=600)
+        result = await asyncio.wait_for(future, timeout=(int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600))
         return JSONResponse(transcription_response_payload(result, response_format))
     except asyncio.TimeoutError:
         pending_results.pop(request_id, None)

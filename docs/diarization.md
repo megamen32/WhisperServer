@@ -20,6 +20,36 @@ pip install -e '.[diarization]'
 
 ## API
 
+Для OpenAI SDK используйте существующие параметры OpenAI:
+`response_format="diarized_json"` включает Community-1,
+`chunking_strategy="auto"` выбирает автоматическую обработку. Параметр можно
+опустить; локальная автоматическая обработка включена по умолчанию.
+Произвольные VAD-объекты chunking_strategy пока не поддерживаются (400).
+Модель здесь локальная: `whisper-1` использует настроенный ASR alias,
+сейчас GigaAM v3. Можно явно выбрать `gigaam-v3`, `tiny` и другие локальные
+модели. Облачный `gpt-4o-transcribe-diarize` не является локальной моделью.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="https://whisper.bezrabotnyi.com/v1",
+                api_key=os.environ["WHISPER_API_KEY"], timeout=86400)
+with open("conversation.mp3", "rb") as audio:
+    result = client.audio.transcriptions.create(
+        model="whisper-1", file=audio,
+        response_format="diarized_json", chunking_strategy="auto")
+for segment in result.segments:
+    print(segment.speaker, segment.start, segment.end, segment.text)
+```
+
+Ответ содержит `text`, `task="transcribe"`, полную `duration` и `segments`
+с `id`, `type`, `speaker` (A, B, …), `start`, `end`, `text`.
+Для длинных разговоров предпочтителен `stream=True`: читайте события
+`event.type == "transcript.text.segment"`. Сервер отправляет SSE keepalive,
+пока выполняется глобальное разделение говорящих. При обычном POST таймаут
+прокси или клиента может истечь раньше серверного, поэтому используйте стрим.
+
 `POST /transcribe` и `POST /web/transcribe`: query-параметр `diarize=true`.
 `POST /v1/audio/transcriptions`: multipart-поле `diarize=true`.
 Для временных границ и меток используйте `response_format=verbose_json`.
@@ -36,7 +66,8 @@ curl https://whisper.bezrabotnyi.com/v1/audio/transcriptions \
 исходные эксклюзивные интервалы Community-1, `diarization_model` — модель.
 При `words=true` нативный API возвращает также `words[].speaker`.
 Кэш с говорящими отделён от обычного. NDJSON выдаёт подписанные сегменты;
-SSE OpenAI выдаёт обычные текстовые delta и данные говорящих в done-событии.
+SSE с diarized_json выдаёт transcript.text.segment с говорящим, временем и текстом;
+также сохраняются delta и done-события.
 Диаризация всего файла выполняется до выдачи первых сегментов: это не
 потоковое узнавание людей в реальном времени.
 
@@ -55,9 +86,19 @@ Whisper и Parakeet разделяют фрагменты по времени с
 Community-1 работает только на CPU, двумя PyTorch потоками, одним заданием
 и с пакетами segmentation/embedding по одному фрагменту.
 в существующем последовательном worker. Pipeline освобождается после запроса;
-GPU и новый постоянный процесс не используются. Длина ограничена 1200 секунд,
-ffmpeg декодирует максимум 1201 секунду mono 16 kHz float32 (~77 MB), timeout
-декодирования 60 секунд. Временный файл удаляется worker. Дополнительный
+GPU и новый постоянный процесс не используются. Ограничения длительности в
+20 минут нет. ffmpeg декодирует весь файл в mono 16 kHz float32 на диск,
+через prlimit с пределом файла 2 GiB и timeout 600 секунд; превышение приводит
+к ошибке, а не усечению. Исходный и компактный PCM вместе занимают до 4 GiB,
+перед запуском требуется этот бюджет плюс 20 GiB свободного резерва. PCM
+читается через memmap. При включённом VAD записи длиннее 5 минут проходят
+VAD блоками до 302 секунд; тишина удаляется перед единым глобальным проходом
+Community-1. Таймкоды возвращаются на исходную шкалу, спикеры не сбрасываются
+между блоками. При vad_filter=false тишина сохраняется. Временные файлы
+удаляются при успехе и ошибке. Прежние пределы сервиса не повышаются.
+Проверено перед изменением: ~132 GiB свободного диска, прежний измеренный
+пик Community-1 ~905 MiB. Запрос диаризации ожидает до 24 часов
+(WHISPER_DIARIZATION_TIMEOUT_SECONDS), стрим получает keepalive каждые 15 секунд. Дополнительный
 дисковый бюджет для весов/зависимостей — 2 GiB; проверить перед первой загрузкой.
 Первый короткий реальный запуск достиг ~2,2 GiB и был остановлен systemd-oomd
 при MemoryHigh=2 GiB. Для проверочного процесса мягкий лимит пересмотрен

@@ -87,8 +87,26 @@ def model_metadata(result: dict) -> dict:
     return {field: result[field] for field in fields if field in result}
 
 
+def diarized_segment(segment: dict, index: int) -> dict:
+    speaker = segment.get("speaker")
+    number = int(speaker.rsplit("_", 1)[1]) if speaker else None
+    label = ""
+    if number is not None:
+        number += 1
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            label = chr(65 + remainder) + label
+    return {"id": f"seg_{index}", "type": "transcript.text.segment",
+            "start": segment["start"], "end": segment["end"],
+            "speaker": label or "unknown", "text": segment["text"]}
+
+
 def transcription_response_payload(result: dict, response_format: str = "json") -> dict:
     """Default JSON stays compact; verbose JSON preserves native timing only."""
+    if response_format == "diarized_json":
+        return {"text": result.get("text", ""), "task": "transcribe",
+                "duration": result.get("duration") or 0.0,
+                "segments": [diarized_segment(segment, i) for i, segment in enumerate(result.get("segments", []))]}
     payload = {"text": result.get("text", "")}
     payload.update(model_metadata(result))
     for field in ("speaker_text", "diarization_model"):

@@ -75,7 +75,7 @@ def test_worker_returns_labelled_segments_and_words(monkeypatch, stream):
             words = [SimpleNamespace(start=.1, end=.8, word=" Привет"),
                      SimpleNamespace(start=1.1, end=1.8, word=" Пока")]
             return [SimpleNamespace(start=0, end=2, text="Привет Пока", words=words)], SimpleNamespace(language="ru", language_probability=1)
-    monkeypatch.setattr(main, "diarize_audio", lambda p: TURNS)
+    monkeypatch.setattr(main, "diarize_audio", lambda p, **k: TURNS)
     monkeypatch.setattr(main, "_create_model_entry", lambda p: ASR())
     monkeypatch.setattr(main, "ManagedModel", None)
     monkeypatch.setattr(main, "audio_duration_seconds", lambda p: 4)
@@ -123,7 +123,7 @@ def test_openai_fresh_and_cached_diarization(monkeypatch, cached):
     monkeypatch.setattr(main, "append_cache_metric", lambda *a: None)
     def put(request):
         assert request["diarize"] is True
-        assert "community-1-v1" in request["cache_key"]
+        assert "community-1-v2" in request["cache_key"]
         main.pending_results.pop(request["request_id"]).set_result(result)
     monkeypatch.setattr(main.app.state, "request_queue", SimpleNamespace(put=put), raising=False)
     response = TestClient(main.app).post("/v1/audio/transcriptions",
@@ -169,3 +169,68 @@ def test_openai_stream_surfaces_diarization_failure(monkeypatch):
     event = json.loads(response.text.removeprefix("data: ").strip())
     assert event == {"type": "error", "error": {"message": "Community-1 недоступна"}}
     assert not main.pending_streams
+
+
+def test_long_gap_restores_original_timing_and_identity():
+    from diarization_backend import _restore_turns
+    turns = [dict(start=0, end=4, speaker="SPEAKER_00"),
+             dict(start=4, end=6, speaker="SPEAKER_01")]
+    restored = _restore_turns(turns, [(0, 2, 0), (2, 6, 1262)])
+    assert [(t['start'], t['end'], t['speaker']) for t in restored] == [
+        (0, 2, 'SPEAKER_00'), (1262, 1264, 'SPEAKER_00'), (1264, 1266, 'SPEAKER_01')]
+
+
+@pytest.mark.parametrize('cached', [True, False])
+@pytest.mark.parametrize('stream', [True, False])
+def test_standard_openai_diarized_format(monkeypatch, cached, stream):
+    import json
+    from openai.types.audio.transcription_diarized import TranscriptionDiarized
+    monkeypatch.setenv('API_KEY', 'DIARIZATION_TEST_ONLY')
+    monkeypatch.setattr(main, 'pending_results', {})
+    monkeypatch.setattr(main, 'pending_streams', {})
+    result = dict(text='Привет Пока', duration=1266, segments=[
+        dict(start=0, end=1, speaker='SPEAKER_00', text='Привет'),
+        dict(start=1265, end=1266, speaker='SPEAKER_01', text='Пока')])
+    monkeypatch.setattr(main, '_get_cached_result', lambda k: result if cached else None)
+    monkeypatch.setattr(main, 'append_cache_metric', lambda *a: None)
+    def put(request):
+        assert request['diarize'] is True
+        if stream:
+            queue = main.pending_streams[request['request_id']]
+            for seg in result['segments']:
+                queue.put_nowait({'segment': seg})
+            queue.put_nowait({'result': result})
+            queue.put_nowait(None)
+        else:
+            main.pending_results.pop(request['request_id']).set_result(result)
+    monkeypatch.setattr(main.app.state, 'request_queue', SimpleNamespace(put=put), raising=False)
+    response = TestClient(main.app).post('/v1/audio/transcriptions',
+        headers={'Authorization': 'Bearer DIARIZATION_TEST_ONLY'},
+        files={'file': ('voice.flac', b'fixture', 'audio/flac')},
+        data=dict(model='whisper-1', response_format='diarized_json', chunking_strategy='auto', stream=str(stream).lower()))
+    assert response.status_code == 200
+    if stream:
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+        segments = [e for e in events if e['type'] == 'transcript.text.segment']
+        assert [e['speaker'] for e in segments] == ['A', 'B']
+        assert segments[1]['start'] == 1265
+    else:
+        parsed = TranscriptionDiarized.model_validate(response.json())
+        assert parsed.duration == 1266
+        assert parsed.task == 'transcribe'
+        assert [s.speaker for s in parsed.segments] == ['A', 'B']
+
+
+def test_vad_blocks_are_bounded_and_overlap_is_merged(monkeypatch, tmp_path):
+    from diarization_backend import _compact_speech, SAMPLE_RATE
+    import faster_whisper.vad
+    lengths = []
+    def vad(audio, options):
+        lengths.append(len(audio))
+        return [dict(start=0, end=len(audio))]
+    monkeypatch.setattr(faster_whisper.vad, 'get_speech_timestamps', vad)
+    samples = np.zeros(601 * SAMPLE_RATE, dtype=np.float32)
+    compact, mapping = _compact_speech(samples, tmp_path / 'speech.pcm')
+    assert max(lengths) <= 302 * SAMPLE_RATE
+    assert len(compact) == len(samples)
+    assert mapping == [(0, 601, 0)]
