@@ -26,7 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 diarization = [
     "pyannote.audio>=4.0,<5",
-    "cudabroker @ git+https://github.com/megamen32/cudabroker.git@ca45654",
+    "cudabroker @ git+https://github.com/megamen32/cudabroker.git@48d7141",
 ]
 dev = [
     "pytest>=7.0",
