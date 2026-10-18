@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="utf-8">
-    <title>Whisper сервер</title>
+    <title>Whisper — расшифровка</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         :root {
@@ -329,64 +329,135 @@
             }
         }
     </style>
+    <style>
+        :root { color-scheme: dark; font-family: Inter, 'Segoe UI', system-ui, sans-serif; background: #0d1118; color: #e8edf5; }
+        * { box-sizing: border-box; }
+        body { margin: 0; min-width: 320px; background: radial-gradient(ellipse at 50% -20%, #26364b 0, #101722 46rem, #0d1118 82rem); display: block; }
+        button, input, select { font: inherit; }
+        button, select, input { color: inherit; }
+        button:focus-visible, input:focus-visible, select:focus-visible, #drop-zone:focus-visible { outline: 2px solid #7ec9ff; outline-offset: 2px; }
+        .page { width: min(1100px, 100%); margin: 0 auto; padding: 38px 28px 100px; display: block; }
+        .brand { margin-bottom: 24px; }
+        .eyebrow { color: #8fa2ba; font-size: .76rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+        h1 { margin: 7px 0 0; font-size: clamp(1.8rem, 4vw, 2.65rem); letter-spacing: -.04em; }
+        .subtitle { margin: 8px 0 0; max-width: 670px; color: #9aa8ba; line-height: 1.6; }
+        .panel { border: 1px solid #293445; border-radius: 20px; background: rgba(18, 25, 36, .9); box-shadow: 0 20px 60px #05080d55; }
+        .setup { width: 100%; padding: 22px; }
+        .drop-zone { display: grid; min-height: 132px; place-content: center; border: 1px dashed #50627a; border-radius: 15px; padding: 20px; text-align: center; line-height: 1.55; cursor: pointer; background: #141d29; transition: .18s ease; }
+        .drop-zone.active, .drop-zone:hover { border-color: #7ec9ff; background: #19283a; }
+        .drop-zone.working { border-color: #5bd3b0; }
+        .drop-icon { display: block; margin-bottom: 6px; color: #82caff; font-size: 1.5rem; }
+        .drop-zone strong { font-size: 1.05rem; }
+        .button-link { color: #8ccfff; text-decoration: underline; text-underline-offset: 3px; }
+        .paste-hint { display: block; margin-top: 8px; color: #8292a7; font-size: .85rem; }
+        #file-input { display: none; }
+        .controls { display: grid; grid-template-columns: minmax(190px, 1.2fr) minmax(190px, 1fr) auto auto; gap: 16px; align-items: end; margin-top: 20px; }
+        .control { display: flex; flex-direction: column; gap: 7px; color: #aab7c8; font-size: .88rem; }
+        .control select { min-height: 44px; width: 100%; padding: 9px 12px; border: 1px solid #374559; border-radius: 10px; background: #101721; }
+        .switch-control { min-height: 44px; justify-content: center; gap: 4px; }
+        .switch-line { display: flex; gap: 9px; align-items: center; color: #e4eaf3; font-size: .93rem; cursor: pointer; }
+        .switch-line input { width: 18px; height: 18px; accent-color: #6cbfff; }
+        .control small { color: #8291a5; font-size: .75rem; }
+        .action { min-height: 42px; border: 1px solid #3a4a60; border-radius: 10px; padding: 9px 13px; background: #1a2533; cursor: pointer; }
+        .action:hover { background: #223247; }
+        .status-bar { margin-top: 16px; color: #a8bad0; font-size: .88rem; }
+        .progress-track, .upload-track { width: 100%; height: 7px; margin-top: 15px; overflow: hidden; border-radius: 99px; background: #273242; }
+        .progress-bar, .upload-bar { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #69d6c1, #77bfff); transition: width .3s ease; }
+        .upload-track { height: 4px; margin-top: 8px; }
+        .upload-track.hidden { display: none; }
+        .progress-meta { display: none; justify-content: space-between; gap: 12px; margin-top: 8px; color: #879ab2; font-size: .78rem; }
+        .progress-meta.visible { display: flex; }
+        .output { width: 100%; max-height: none; overflow: visible; margin-top: 28px; padding: 0; border: 0; border-radius: 0; background: transparent; }
+        .transcript-toolbar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; border: 1px solid #293445; border-radius: 14px; background: #111923ed; backdrop-filter: blur(14px); }
+        .search-box { flex: 1 1 250px; display: flex; align-items: center; gap: 9px; min-width: 0; padding: 0 11px; border: 1px solid #344154; border-radius: 10px; background: #0d131c; }
+        .search-box span { color: #7e91a9; }
+        .search-box input { width: 100%; min-width: 0; height: 40px; border: 0; outline: 0; background: transparent; }
+        .match-count { min-width: 76px; color: #93a3b8; font-size: .82rem; text-align: center; }
+        .tool-button { min-height: 38px; border: 1px solid #344154; border-radius: 9px; padding: 7px 10px; background: #182230; cursor: pointer; }
+        .tool-button:hover { background: #243247; }
+        .document { padding: 30px clamp(2px, 3vw, 32px); }
+        .document-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 17px; border-bottom: 1px solid #25303e; }
+        .document-heading h2 { margin: 0; font-size: 1.2rem; font-weight: 650; }
+        .document-meta { color: #8190a3; font-size: .82rem; }
+        .transcript-container { display: flex; flex-direction: column; gap: 0; padding-top: 12px; }
+        .empty-state { padding: 58px 16px; color: #8796aa; text-align: center; line-height: 1.7; }
+        .segment { display: grid; grid-template-columns: 0 minmax(0, 1fr); column-gap: 0; padding: 11px 8px; border-radius: 8px; line-height: 1.75; overflow-wrap: anywhere; transition: background .2s ease; }
+        .transcript-container.show-times .segment { grid-template-columns: 92px minmax(0, 1fr); column-gap: 14px; }
+        .segment.current-match { background: #293244; box-shadow: inset 3px 0 #77c9ff; }
+        .segment.filtered-out { display: none; }
+        .timecode { display: none; color: #7f95ad; font-size: .78rem; font-variant-numeric: tabular-nums; padding-top: 3px; white-space: nowrap; }
+        .show-times .timecode { display: block; }
+        .speaker { display: inline; color: #8ccfff; font-size: .86em; font-weight: 700; }
+        .segment-text { min-width: 0; color: #e1e7ef; font-size: 1rem; }
+        mark { border-radius: 3px; background: #a87d2b; color: #fff7dc; }
+        .final-output-wrapper { display: none; }
+        .final-output { white-space: pre-wrap; color: #c8d5e4; }
+        .copy-result-button { border: 1px solid #38485c; border-radius: 9px; margin: 0; padding: 9px 13px; color: #d9e6f5; background: #182230; cursor: pointer; }
+        .copy-result-button.hidden { display: none; }
+        .error-output { margin-top: 12px; color: #ff9ea4; }
+        .mic-icon, .mic-label { display: none; }
+        @media (max-width: 820px) { .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 560px) {
+            .page { padding: 25px 14px 72px; } .setup { padding: 14px; } .drop-zone { min-height: 118px; padding: 14px; }
+            .controls { grid-template-columns: 1fr; gap: 13px; } .switch-control { align-items: flex-start; } .action { width: 100%; }
+            .transcript-toolbar { top: 0; gap: 7px; padding: 8px; } .search-box { flex-basis: 100%; }
+            .match-count { flex: 1; text-align: left; } .document { padding: 20px 4px; }
+            .document-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
+            .segment { padding: 10px 5px; font-size: .98rem; }
+            .transcript-container.show-times .segment { grid-template-columns: 1fr; gap: 1px; }
+            .show-times .timecode { font-size: .73rem; } .progress-meta { flex-direction: column; }
+        }
+    </style>
 </head>
 <body>
-    <div class="page">
-        <div class="ui-card">
+    <main class="page">
+        <header class="brand">
+            <div class="eyebrow">Whisper Studio</div>
+            <h1>Расшифровка аудио</h1>
+            <p class="subtitle">Загрузите запись и получите полный текст. Длинные расшифровки остаются на странице — ищите по тексту и переходите между совпадениями.</p>
+        </header>
+        <section class="panel setup" aria-label="Настройки расшифровки">
             <div class="mic-icon" aria-hidden="true">🎙️</div>
             <div class="mic-label" id="mic-label">Нажмите, чтобы записать</div>
-            <div class="drop-zone" id="drop-zone">
-                <p>
-                    <strong>Перетащите файл сюда</strong><br>
+            <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Выбрать аудиофайл">
+                <span class="drop-icon" aria-hidden="true">↥</span>
+                <p><strong>Перетащите файл сюда</strong><br>
                     или <span class="button-link" id="select-file-button">нажмите, чтобы выбрать файл</span><br>
                     <span class="paste-hint">или скопируйте файл и нажмите ⌘V / Ctrl+V</span>
                 </p>
                 <input type="file" id="file-input" accept="audio/*" />
             </div>
             <div class="controls">
-                <label class="control">
-                    <span>Модель (по умолчанию стандартная)</span>
-                    <select id="model-select"></select>
+                <label class="control"><span>Модель распознавания</span><select id="model-select"></select></label>
+                <label class="control switch-control">
+                    <span class="switch-line"><input type="checkbox" id="diarize"> Размечать говорящих</span>
+                    <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
-                <label class="control" style="display: none;">
-                    <span>API-ключ</span>
-                </label>
-                <button type="button" id="toggle-times">Показать таймкоды</button>
-                <label class="control">
-                    <span><input type="checkbox" id="diarize"> Различать говорящих</span>
-                    <small>Обработка с разделением говорящих займёт больше времени</small>
-                </label>
+                <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
+                <button type="button" id="copy-result-button" class="copy-result-button hidden" title="Скопировать результат">Скопировать текст</button>
             </div>
-            <div class="upload-track hidden">
-                <div class="upload-bar" id="upload-bar"></div>
-            </div>
-            <div class="progress-track">
-                <div class="progress-bar" id="progress-bar"></div>
-            </div>
-            <div class="progress-meta">
-                <span id="speed-label">Скорость: —</span>
-                <span id="estimate-label">Ожидание: —</span>
-            </div>
+            <div class="upload-track hidden"><div class="upload-bar" id="upload-bar"></div></div>
+            <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
+            <div class="progress-meta"><span id="speed-label">Скорость: —</span><span id="estimate-label">Ожидание: —</span></div>
             <div class="status-bar" id="status-bar">Готово</div>
-            <div class="output">
-                <div id="transcript" class="transcript-container"></div>
-                <div class="final-output-wrapper">
-                    <div id="final-output" class="final-output"></div>
-                    <button
-                        type="button"
-                        id="copy-result-button"
-                        class="copy-result-button hidden"
-                        title="Скопировать результат"
-                    >
-                        <span class="copy-icon" aria-hidden="true">📋</span>
-                        <span class="copy-label">Скопировать</span>
-                    </button>
-                </div>
-                <div id="error-output" class="error-output" aria-live="assertive"></div>
+        </section>
+        <section class="output" aria-label="Текст расшифровки">
+            <div class="transcript-toolbar" role="search">
+                <label class="search-box"><span aria-hidden="true">⌕</span><input id="transcript-search" type="search" placeholder="Найти в расшифровке…" autocomplete="off" aria-label="Найти в расшифровке"></label>
+                <span class="match-count" id="match-count" aria-live="polite">0 фрагментов</span>
+                <button type="button" class="tool-button" id="previous-match" aria-label="Предыдущее совпадение">↑</button>
+                <button type="button" class="tool-button" id="next-match" aria-label="Следующее совпадение">↓</button>
             </div>
-        </div>
+            <article class="panel document">
+                <div class="document-heading"><h2>Расшифровка</h2><span class="document-meta" id="document-meta">Текст появится здесь после загрузки аудио</span></div>
+                <div id="transcript" class="transcript-container" aria-live="polite"><div class="empty-state">Загрузите аудиофайл, чтобы начать.<br>Расшифровка будет показана целиком в документе ниже.</div></div>
+                <div class="final-output-wrapper"><div id="final-output" class="final-output"></div></div>
+            </article>
+            <div id="error-output" class="error-output" aria-live="assertive"></div>
+        </section>
+    </main>
     <script>
-        const DEFAULT_MODEL = __DEFAULT_MODEL__;
+        const DEFAULT_MODEL = 'large-v3';
         let webuiCsrfToken = __WEBUI_CSRF_TOKEN__;
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
@@ -405,6 +476,11 @@
         const micLabel = document.getElementById('mic-label');
         const copyResultButton = document.getElementById('copy-result-button');
         const progressMeta = document.querySelector('.progress-meta');
+        const transcriptSearch = document.getElementById('transcript-search');
+        const matchCount = document.getElementById('match-count');
+        const documentMeta = document.getElementById('document-meta');
+        const previousMatchButton = document.getElementById('previous-match');
+        const nextMatchButton = document.getElementById('next-match');
 
         const UPLOAD_SPEED_PREFIX = 'Скорость загрузки:';
         const UPLOAD_ESTIMATE_PREFIX = 'Осталось:';
@@ -425,6 +501,8 @@
         let pendingReprocess = false;
         let uploadStartTime = 0;
         let currentUploadTotal = 0;
+        let matchingSegments = [];
+        let activeMatchIndex = -1;
 
         const recordingSupported = typeof MediaRecorder !== 'undefined';
 
@@ -615,20 +693,90 @@
             segmentsProcessed += 1;
             const wrapper = document.createElement('div');
             wrapper.className = 'segment';
+            wrapper.dataset.searchText = segment.text || '';
             const timestamp = document.createElement('span');
             timestamp.className = 'timecode';
             timestamp.textContent = `${formatTime(segment.start)} → ${formatTime(segment.end)}`;
             const text = document.createElement('div');
             text.className = 'segment-text';
-            const speaker = segment.speaker
-                ? `Спикер ${Number(segment.speaker.split('_').pop()) + 1}: `
-                : (Object.hasOwn(segment, 'speaker') ? 'Неизвестный спикер: ' : '');
-            text.textContent = speaker + segment.text;
+            if (segment.speaker || Object.hasOwn(segment, 'speaker')) {
+                const speaker = document.createElement('span');
+                speaker.className = 'speaker';
+                speaker.textContent = segment.speaker
+                    ? `Спикер ${Number(segment.speaker.split('_').pop()) + 1}: `
+                    : 'Неизвестный спикер: ';
+                text.appendChild(speaker);
+            }
+            const body = document.createElement('span');
+            body.className = 'body-copy';
+            body.textContent = segment.text || '';
+            text.appendChild(body);
             wrapper.appendChild(timestamp);
             wrapper.appendChild(text);
             transcriptContainer.appendChild(wrapper);
-            transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
+            if (transcriptSearch.value.trim()) {
+                const query = transcriptSearch.value.trim();
+                if ((segment.text || '').toLocaleLowerCase().includes(query.toLocaleLowerCase())) {
+                    matchingSegments.push(wrapper);
+                    renderHighlightedBody(wrapper, query);
+                    updateMatchCount();
+                } else {
+                    wrapper.classList.add('filtered-out');
+                }
+            }
+            documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
             updateProgress();
+        }
+
+        function renderHighlightedBody(segment, query) {
+            const body = segment.querySelector('.body-copy');
+            const original = segment.dataset.searchText || '';
+            body.replaceChildren();
+            if (!query) {
+                body.textContent = original;
+                return;
+            }
+            const folded = original.toLocaleLowerCase();
+            const foldedQuery = query.toLocaleLowerCase();
+            let cursor = 0;
+            let found = folded.indexOf(foldedQuery, cursor);
+            while (found !== -1) {
+                body.append(document.createTextNode(original.slice(cursor, found)));
+                const mark = document.createElement('mark');
+                mark.textContent = original.slice(found, found + query.length);
+                body.append(mark);
+                cursor = found + query.length;
+                found = folded.indexOf(foldedQuery, cursor);
+            }
+            body.append(document.createTextNode(original.slice(cursor)));
+        }
+
+        function updateMatchCount() {
+            const count = matchingSegments.length;
+            matchCount.textContent = `${count.toLocaleString('ru-RU')} ${count === 1 ? 'фрагмент' : 'фрагментов'}`;
+            matchingSegments.forEach((segment, index) => segment.classList.toggle('current-match', index === activeMatchIndex));
+        }
+
+        function refreshSearch() {
+            const query = transcriptSearch.value.trim();
+            const segments = Array.from(transcriptContainer.querySelectorAll('.segment'));
+            matchingSegments = [];
+            activeMatchIndex = -1;
+            for (const segment of segments) {
+                const matches = query && (segment.dataset.searchText || '').toLocaleLowerCase().includes(query.toLocaleLowerCase());
+                segment.classList.toggle('filtered-out', Boolean(query) && !matches);
+                renderHighlightedBody(segment, query);
+                if (matches) matchingSegments.push(segment);
+            }
+            if (matchingSegments.length) activeMatchIndex = 0;
+            updateMatchCount();
+        }
+
+        function moveToMatch(direction) {
+            if (!matchingSegments.length) return;
+            activeMatchIndex = (activeMatchIndex + direction + matchingSegments.length) % matchingSegments.length;
+            updateMatchCount();
+            matchingSegments[activeMatchIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
         }
 
         function cleanupProcessing({ finalMessage, success = true } = {}) {
@@ -646,10 +794,10 @@
             isProcessing = false;
             if (success) {
                 updateProgress(true);
+                documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${currentFile?.name || 'аудиофайл'}`;
                 toggleTimes.hidden = false;
                 showTimecodes = false;
                 toggleTimes.textContent = 'Показать таймкоды';
-                transcriptContainer.classList.add('segments-hidden');
                 transcriptContainer.classList.remove('show-times');
             } else {
                 progressBar.style.width = '0%';
@@ -714,6 +862,11 @@
             startTime = Date.now();
             estimatedWait = 0;
             transcriptContainer.innerHTML = '';
+            matchingSegments = [];
+            activeMatchIndex = -1;
+            transcriptSearch.value = '';
+            matchCount.textContent = '0 фрагментов';
+            documentMeta.textContent = file.name;
             finalOutput.textContent = '';
             hideCopyButton();
             errorOutput.textContent = '';
@@ -873,6 +1026,12 @@
         }
 
         dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                fileInput.click();
+            }
+        });
         dropZone.addEventListener('dragenter', (event) => {
             event.preventDefault();
             dropZone.classList.add('active');
@@ -912,12 +1071,18 @@
         toggleTimes.addEventListener('click', () => {
             showTimecodes = !showTimecodes;
             transcriptContainer.classList.toggle('show-times', showTimecodes);
-            transcriptContainer.classList.toggle('segments-hidden', !showTimecodes);
             toggleTimes.textContent = showTimecodes ? 'Скрыть таймкоды' : 'Показать таймкоды';
         });
 
+        transcriptSearch.addEventListener('input', refreshSearch);
+        previousMatchButton.addEventListener('click', () => moveToMatch(-1));
+        nextMatchButton.addEventListener('click', () => moveToMatch(1));
+
         copyResultButton.addEventListener('click', async () => {
-            const text = finalOutput.textContent.trim();
+            const transcriptText = Array.from(transcriptContainer.querySelectorAll('.segment'))
+                .map((segment) => `${segment.querySelector('.speaker')?.textContent || ''}${segment.dataset.searchText || ''}`)
+                .join('\n');
+            const text = transcriptText || finalOutput.textContent.trim();
             if (!text) {
                 setStatus('Нет результата для копирования');
                 return;
