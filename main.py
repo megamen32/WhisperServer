@@ -17,6 +17,7 @@ import logging
 import traceback
 import time
 import os
+import gc
 import hashlib
 from contextlib import asynccontextmanager, contextmanager, ExitStack
 from faster_whisper import WhisperModel
@@ -89,6 +90,114 @@ def _broker_cpu_capable(model_id: str) -> bool:
     if override is not None:
         return _is_truthy(override)
     return model_id in BROKER_CPU_CAPABLE
+
+
+# --- Physical GPU admission -------------------------------------------------
+# The broker only accounts for the leases it issued. Other GPU tenants (ollama,
+# the TTS server, captcha solvers) are invisible to it, so a granted lease does
+# not guarantee the memory is really there. Admission therefore checks the
+# physical device, and the decode batch is scaled down for long recordings.
+VRAM_HEADROOM_MB = int(os.getenv("WHISPER_VRAM_HEADROOM_MB", "768"))
+LONG_AUDIO_SECONDS = float(os.getenv("WHISPER_LONG_AUDIO_SECONDS", "600"))
+LONG_AUDIO_BATCH_SIZE = int(os.getenv("WHISPER_LONG_AUDIO_BATCH_SIZE", "2"))
+DEFAULT_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "8"))
+RETRY_BATCH_SIZE = int(os.getenv("WHISPER_RETRY_BATCH_SIZE", "1"))
+DIARIZATION_DEVICE = os.getenv("WHISPER_DIARIZATION_DEVICE", "cuda").strip().lower()
+
+
+class GpuOutOfMemoryError(RuntimeError):
+    """The physical GPU could not satisfy a transcription request."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+        self.code = "gpu_out_of_memory"
+
+
+def physical_free_vram_mb() -> float | None:
+    """Free VRAM on the physical device, ignoring tenants the broker cannot see."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free_bytes, _total = torch.cuda.mem_get_info()
+        return free_bytes / (1024 * 1024)
+    except Exception:
+        logger.debug("mem_get_info failed", exc_info=True)
+        return None
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    """Detect a GPU allocation failure raised by torch or by CTranslate2.
+
+    CTranslate2 raises a native ``RuntimeError("CUDA failed with error out of
+    memory")`` that never reaches torch's exception type.
+    """
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text or ("cuda failed with error" in text and "memory" in text)
+
+
+def release_cached_models(model_cache: dict, keep: str | None = None) -> None:
+    """Release cached models so their VRAM can be reused by the next request."""
+    for name, entry in list(model_cache.items()):
+        if keep is not None and name == keep:
+            continue
+        if ManagedModel is not None and isinstance(entry, ManagedModel):
+            try:
+                entry.release()
+            except Exception:
+                logger.warning("Failed to release cached model %s", name, exc_info=True)
+        model_cache.pop(name, None)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+    except Exception:
+        logger.debug("empty_cache failed", exc_info=True)
+
+
+def ensure_vram_for_model(model_name: str, model_cache: dict) -> None:
+    """Free what we control before the broker hands out a GPU lease.
+
+    The broker grants leases from its own registry and cannot see the unmanaged
+    tenants sharing the card, so a lease may be granted while the memory is
+    already gone. Evict our own cached models first: that is the part we own.
+    """
+    if ManagedModel is None or not torch.cuda.is_available():
+        return
+    required = _broker_vram_mb(model_name) + VRAM_HEADROOM_MB
+    free = physical_free_vram_mb()
+    if free is None or free >= required:
+        return
+    logger.warning(
+        "Free VRAM %.0f MiB is below the %.0f MiB requested for %s; releasing cached models",
+        free,
+        required,
+        model_name,
+    )
+    release_cached_models(model_cache, keep=model_name)
+    free = physical_free_vram_mb()
+    if free is not None and free < required:
+        logger.warning(
+            "Free VRAM is still %.0f MiB after releasing cached models (%.0f MiB requested)",
+            free,
+            required,
+        )
+
+
+def resolve_batch_size(audio_seconds: float) -> int:
+    """Pick a decode batch that keeps long recordings inside the VRAM budget.
+
+    faster-whisper always decodes ``batch_size`` windows in parallel, so a long
+    recording decodes many windows at once and the activation memory grows with
+    the batch, not with the file.
+    """
+    if audio_seconds and audio_seconds >= LONG_AUDIO_SECONDS:
+        return max(1, LONG_AUDIO_BATCH_SIZE)
+    return max(1, DEFAULT_BATCH_SIZE)
+
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 WEBUI_SESSION_COOKIE = "whisper_web_session"
@@ -272,6 +381,14 @@ DIARIZATION_VRAM_MB = 1536
 
 
 def _create_diarization_entry():
+    device = DIARIZATION_DEVICE
+    if device == "auto":
+        # The diarization pipeline shares the card with the ASR model. Keep it on
+        # the CPU when the physical device has no room for it.
+        free = physical_free_vram_mb()
+        device = "cuda" if (free is None or free >= DIARIZATION_VRAM_MB + VRAM_HEADROOM_MB) else "cpu"
+    if device == "cpu":
+        return Community1Model.from_pretrained("cpu")
     if not torch.cuda.is_available():
         return Community1Model.from_pretrained("cpu")
     if ManagedModel is None:
@@ -584,6 +701,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     cold_load = model_name not in model_cache
                     load_started = time.perf_counter()
                     if model_name not in model_cache:
+                        ensure_vram_for_model(model_name, model_cache)
                         model_cache[model_name] = _create_model_entry(model_name)
 
                     model_entry = model_cache[model_name]
@@ -600,56 +718,93 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                         model_entry.touch(active=True)
                     inference_started = time.perf_counter()
-                    segments, info = model.transcribe(
-                        temp_path,
-                        beam_size=beam_size,
-                        language=lang,
-                        temperature=temperature,
-                        word_timestamps=request.get("words", False) or diarize,
-                        **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
-                        condition_on_previous_text=False,
-                        **build_vad_transcribe_options(vad_filter),
-                        no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                        log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                        compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-                    )
-                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                    batch_size = resolve_batch_size(audio_seconds)
                     all_segments = []
                     all_words = []
 
-                    for seg in segments:
-                        if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                            model_entry.touch(active=True)
-                        seg_text = (seg.text or "").strip()
-                        if not seg_text:
-                            logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
-                            continue
-                        seg_data = {
-                            "start": seg.start,
-                            "end": seg.end,
-                            "text": seg_text,
-                            "avg_logprob": getattr(seg, "avg_logprob", None),
-                            "no_speech_prob": getattr(seg, "no_speech_prob", None),
-                            "compression_ratio": getattr(seg, "compression_ratio", None),
-                        }
-                        logger.info("%s processed segment: %s", model_name, seg_data)
-                        if (request.get("words", False) or diarize) and getattr(seg, "words", None):
-                            words = [
-                                {"start": w.start, "end": w.end, "word": w.word}
-                                for w in seg.words
-                            ]
-                        else:
-                            words = []
+                    def _decode(current_batch: int):
+                        """Decode the whole recording; faster-whisper decodes lazily."""
+                        segments, info = model.transcribe(
+                            temp_path,
+                            beam_size=beam_size,
+                            language=lang,
+                            temperature=temperature,
+                            batch_size=current_batch,
+                            word_timestamps=request.get("words", False) or diarize,
+                            **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
+                            condition_on_previous_text=False,
+                            **build_vad_transcribe_options(vad_filter),
+                            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                        )
+                        decoded_segments = []
+                        decoded_words = []
+                        for seg in segments:
+                            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                                model_entry.touch(active=True)
+                            seg_text = (seg.text or "").strip()
+                            if not seg_text:
+                                logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
+                                continue
+                            seg_data = {
+                                "start": seg.start,
+                                "end": seg.end,
+                                "text": seg_text,
+                                "avg_logprob": getattr(seg, "avg_logprob", None),
+                                "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                                "compression_ratio": getattr(seg, "compression_ratio", None),
+                            }
+                            logger.info("%s processed segment: %s", model_name, seg_data)
+                            if (request.get("words", False) or diarize) and getattr(seg, "words", None):
+                                words = [
+                                    {"start": w.start, "end": w.end, "word": w.word}
+                                    for w in seg.words
+                                ]
+                            else:
+                                words = []
 
-                        attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
-                        all_segments.extend(attributed)
-                        all_words.extend(words)
+                            attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
+                            decoded_segments.extend(attributed)
+                            decoded_words.extend(words)
+                            if stream:
+                                for part in attributed:
+                                    payload = {"request_id": request_id, "segment": part}
+                                    if request.get("words", False):
+                                        payload["words"] = [w for w in words if w["start"] >= part["start"] and w["end"] <= part["end"]]
+                                    response_queue.put(payload)
+                        return decoded_segments, decoded_words, info
+
+                    try:
+                        all_segments, all_words, info = _decode(batch_size)
+                    except Exception as exc:
+                        if not is_cuda_oom(exc):
+                            raise
+                        logger.warning(
+                            "CUDA out of memory during %s inference (batch=%d): %s",
+                            model_name,
+                            batch_size,
+                            exc,
+                        )
                         if stream:
-                            for part in attributed:
-                                payload = {"request_id": request_id, "segment": part}
-                                if request.get("words", False):
-                                    payload["words"] = [w for w in words if w["start"] >= part["start"] and w["end"] <= part["end"]]
-                                response_queue.put(payload)
+                            raise GpuOutOfMemoryError(
+                                "CUDA out of memory during streaming inference; the GPU is busy"
+                            ) from exc
+                        release_cached_models(model_cache, keep=model_name)
+                        try:
+                            all_segments, all_words, info = _decode(RETRY_BATCH_SIZE)
+                            logger.warning(
+                                "Retry with batch=%d succeeded for %s",
+                                RETRY_BATCH_SIZE,
+                                model_name,
+                            )
+                        except Exception as retry_exc:
+                            if not is_cuda_oom(retry_exc):
+                                raise
+                            raise GpuOutOfMemoryError(
+                                "CUDA out of memory: the GPU is occupied by another tenant"
+                            ) from retry_exc
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
 
                     result = {
                         "text": " ".join([s["text"] for s in all_segments]),
@@ -683,10 +838,14 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 except Exception as e:
                     error_text = str(e)
                     logger.exception("Ошибка в worker:")
-                    response_queue.put({
+                    error_payload = {
                         "request_id": request_id,
                         "error": str(e)
-                    })
+                    }
+                    if isinstance(e, GpuOutOfMemoryError):
+                        error_payload["error_code"] = e.code
+                        error_payload["retryable"] = e.retryable
+                    response_queue.put(error_payload)
                 finally:
                     # Drop worker-local references before marking the cached
                     # model idle so broker eviction can actually free VRAM.
@@ -746,7 +905,10 @@ async def response_listener(stop_event, response_queue):
                 if future.done():
                     continue
                 if "error" in result:
-                    future.set_exception(Exception(result["error"]))
+                    if result.get("error_code") == "gpu_out_of_memory":
+                        future.set_exception(GpuOutOfMemoryError(result["error"]))
+                    else:
+                        future.set_exception(Exception(result["error"]))
                 else:
                     future.set_result(result["result"])
             elif request_id in pending_streams:
@@ -951,6 +1113,12 @@ async def _transcribe_impl(
             return JSONResponse({"error": "Timeout"}, status_code=504)
         except Exception as e:
             pending_results.pop(request_id, None)
+            if isinstance(e, GpuOutOfMemoryError):
+                return JSONResponse(
+                    {"error": str(e), "code": e.code, "retryable": True},
+                    status_code=503,
+                    headers={"Retry-After": "30"},
+                )
             return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -1157,6 +1325,12 @@ async def openai_transcribe(
     except Exception as e:
         pending_results.pop(request_id, None)
         logger.exception("OpenAI transcribe error:")
+        if isinstance(e, GpuOutOfMemoryError):
+            return JSONResponse(
+                {"error": str(e), "code": e.code, "retryable": True},
+                status_code=503,
+                headers={"Retry-After": "30"},
+            )
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/v1/models")

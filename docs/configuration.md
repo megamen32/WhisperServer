@@ -40,4 +40,22 @@
 | `CUDABROKER_VRAM_MB_<MODEL>` | встроенная таблица | override оценки VRAM для модели |
 | `CUDABROKER_CPU_CAPABLE_<MODEL>` | встроенная таблица | можно ли безопасно выполнить модель на CPU |
 
+## GPU admission and long recordings
+
+The broker only accounts for the leases it issued, so WhisperServer checks the
+physical card itself before loading a model.
+
+| Переменная | Значение по умолчанию | Описание |
+|---|---|---|
+| `WHISPER_BATCH_SIZE` | `8` | размер батча декодирования для коротких записей |
+| `WHISPER_LONG_AUDIO_SECONDS` | `600` | длина записи, после которой включается уменьшенный батч |
+| `WHISPER_LONG_AUDIO_BATCH_SIZE` | `2` | батч для длинных записей: faster-whisper декодирует окна пачками, поэтому память растёт с батчем, а не с длиной файла |
+| `WHISPER_RETRY_BATCH_SIZE` | `1` | батча повторной попытки после `CUDA out of memory` |
+| `WHISPER_VRAM_HEADROOM_MB` | `768` | запас свободной VRAM сверх оценки модели при проверке перед загрузкой |
+| `WHISPER_DIARIZATION_DEVICE` | `cuda` | устройство диаризации: `cuda` (через брокер), `cpu` или `auto` (cuda, если на карте есть место) |
+
+`CUDA out of memory` больше не превращается в сырую 500: запрос повторяется с
+уменьшенным батчем, а если памяти всё равно нет — клиент получает `503` с
+`Retry-After` и кодом `gpu_out_of_memory`.
+
 `.env.example` безопасен для git. Реальный `.env` должен оставаться локальным и уже исключён через `.gitignore`.

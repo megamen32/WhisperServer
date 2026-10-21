@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -57,10 +58,21 @@ def reset_cuda_peak_memory() -> None:
 
 
 def peak_vram_mb() -> int:
-    """Return peak reserved CUDA memory for the current worker process."""
+    """Return peak CUDA memory for the current worker process.
+
+    CTranslate2 allocates outside torch's allocator, so the torch peak stays
+    near zero for whisper models and a real GPU exhaustion stays invisible.
+    Report the larger of both views.
+    """
     if not torch.cuda.is_available():
         return 0
-    return int(torch.cuda.max_memory_reserved() / (1024 * 1024))
+    torch_peak = int(torch.cuda.max_memory_reserved() / (1024 * 1024))
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        device_used = int((total_bytes - free_bytes) / (1024 * 1024))
+        return max(torch_peak, device_used)
+    except Exception:
+        return torch_peak
 
 
 def append_metric(record: dict) -> None:
@@ -70,6 +82,8 @@ def append_metric(record: dict) -> None:
     try:
         metrics_path = Path(_metrics_path).expanduser()
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        record = dict(record)
+        record.setdefault("ts", datetime.now(timezone.utc).isoformat())
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
