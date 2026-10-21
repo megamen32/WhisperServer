@@ -25,10 +25,16 @@ TURNS = [
 def test_gated_model_error_explains_required_access():
     from diarization_backend import _load_pipeline
     from huggingface_hub.errors import GatedRepoError
+    class FakeResponse:
+        # huggingface_hub 2.x made `response` a required keyword-only argument,
+        # and both versions read `headers` and `request` from it.
+        status_code = 403
+        headers: dict = {}
+        request = None
     class Gated:
         @staticmethod
         def from_pretrained(*a, **k):
-            raise GatedRepoError('restricted model')
+            raise GatedRepoError('restricted model', response=FakeResponse())
     with pytest.raises(RuntimeError, match='Community-1.*HF_TOKEN'):
         _load_pipeline(Gated)
 
