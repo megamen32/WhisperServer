@@ -98,10 +98,7 @@ def _broker_cpu_capable(model_id: str) -> bool:
 # not guarantee the memory is really there. Admission therefore checks the
 # physical device, and the decode batch is scaled down for long recordings.
 VRAM_HEADROOM_MB = int(os.getenv("WHISPER_VRAM_HEADROOM_MB", "768"))
-LONG_AUDIO_SECONDS = float(os.getenv("WHISPER_LONG_AUDIO_SECONDS", "600"))
-LONG_AUDIO_BATCH_SIZE = int(os.getenv("WHISPER_LONG_AUDIO_BATCH_SIZE", "2"))
-DEFAULT_BATCH_SIZE = int(os.getenv("WHISPER_BATCH_SIZE", "8"))
-RETRY_BATCH_SIZE = int(os.getenv("WHISPER_RETRY_BATCH_SIZE", "1"))
+RETRY_BEAM_SIZE = int(os.getenv("WHISPER_RETRY_BEAM_SIZE", "1"))
 DIARIZATION_DEVICE = os.getenv("WHISPER_DIARIZATION_DEVICE", "cuda").strip().lower()
 
 
@@ -185,18 +182,6 @@ def ensure_vram_for_model(model_name: str, model_cache: dict) -> None:
             free,
             required,
         )
-
-
-def resolve_batch_size(audio_seconds: float) -> int:
-    """Pick a decode batch that keeps long recordings inside the VRAM budget.
-
-    faster-whisper always decodes ``batch_size`` windows in parallel, so a long
-    recording decodes many windows at once and the activation memory grows with
-    the batch, not with the file.
-    """
-    if audio_seconds and audio_seconds >= LONG_AUDIO_SECONDS:
-        return max(1, LONG_AUDIO_BATCH_SIZE)
-    return max(1, DEFAULT_BATCH_SIZE)
 
 
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
@@ -718,18 +703,16 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                         model_entry.touch(active=True)
                     inference_started = time.perf_counter()
-                    batch_size = resolve_batch_size(audio_seconds)
                     all_segments = []
                     all_words = []
 
-                    def _decode(current_batch: int):
+                    def _decode(current_beam: int):
                         """Decode the whole recording; faster-whisper decodes lazily."""
                         segments, info = model.transcribe(
                             temp_path,
-                            beam_size=beam_size,
+                            beam_size=current_beam,
                             language=lang,
                             temperature=temperature,
-                            batch_size=current_batch,
                             word_timestamps=request.get("words", False) or diarize,
                             **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
                             condition_on_previous_text=False,
@@ -776,14 +759,14 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         return decoded_segments, decoded_words, info
 
                     try:
-                        all_segments, all_words, info = _decode(batch_size)
+                        all_segments, all_words, info = _decode(beam_size)
                     except Exception as exc:
                         if not is_cuda_oom(exc):
                             raise
                         logger.warning(
-                            "CUDA out of memory during %s inference (batch=%d): %s",
+                            "CUDA out of memory during %s inference (beam=%d): %s",
                             model_name,
-                            batch_size,
+                            beam_size,
                             exc,
                         )
                         if stream:
@@ -792,10 +775,10 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             ) from exc
                         release_cached_models(model_cache, keep=model_name)
                         try:
-                            all_segments, all_words, info = _decode(RETRY_BATCH_SIZE)
+                            all_segments, all_words, info = _decode(RETRY_BEAM_SIZE)
                             logger.warning(
-                                "Retry with batch=%d succeeded for %s",
-                                RETRY_BATCH_SIZE,
+                                "Retry with beam=%d succeeded for %s",
+                                RETRY_BEAM_SIZE,
                                 model_name,
                             )
                         except Exception as retry_exc:

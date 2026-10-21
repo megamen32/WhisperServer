@@ -11,18 +11,23 @@ from types import SimpleNamespace
 import main
 
 
-def test_long_recordings_decode_with_a_smaller_batch():
-    assert main.resolve_batch_size(2445.7) == main.LONG_AUDIO_BATCH_SIZE
-    assert main.resolve_batch_size(2445.7) < main.resolve_batch_size(45.0)
+def test_retry_beam_size_is_configurable_and_small():
+    assert main.RETRY_BEAM_SIZE == 1
 
 
-def test_short_recordings_keep_the_default_batch():
-    assert main.resolve_batch_size(45.0) == main.DEFAULT_BATCH_SIZE
-    assert main.resolve_batch_size(0) == main.DEFAULT_BATCH_SIZE
+def test_faster_whisper_transcribe_has_no_batch_size_argument():
+    """faster-whisper 1.2.1 decodes windows one by one.
 
+    Passing batch_size to WhisperModel.transcribe() raises TypeError and broke
+    every request, so the decode call must stay inside this contract.
+    """
+    import inspect
 
-def test_batch_size_never_drops_below_one():
-    assert main.resolve_batch_size(100000.0) >= 1
+    from faster_whisper import WhisperModel
+
+    signature = inspect.signature(WhisperModel.transcribe)
+    assert "batch_size" not in signature.parameters
+    assert "beam_size" in signature.parameters
 
 
 def test_ctranslate2_oom_message_is_detected():
