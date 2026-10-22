@@ -10,6 +10,7 @@ __pycache__/
 .env
 
 whisper_cache/
+whisper_attribution/
 dist/
 *.egg-info/
 .pypirc
