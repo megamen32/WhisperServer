@@ -115,17 +115,26 @@ def diarized_segment(segment: dict, index: int) -> dict:
             "speaker": label or "unknown", "text": segment["text"]}
 
 
-def transcription_response_payload(result: dict, response_format: str = "json") -> dict:
-    """Default JSON stays compact; verbose JSON preserves native timing only."""
+def transcription_response_payload(result: dict, response_format: str = "json", client_comment: str | None = None) -> dict:
+    """Default JSON stays compact; verbose JSON preserves native timing only.
+
+    ``client_comment`` is the opt-in comment of the current request. It is
+    echoed back so the caller can confirm the server remembered it.
+    """
     if response_format == "diarized_json":
-        return {"text": result.get("text", ""), "task": "transcribe",
-                "duration": result.get("duration") or 0.0,
-                "segments": [diarized_segment(segment, i) for i, segment in enumerate(result.get("segments", []))]}
+        payload = {"text": result.get("text", ""), "task": "transcribe",
+                   "duration": result.get("duration") or 0.0,
+                   "segments": [diarized_segment(segment, i) for i, segment in enumerate(result.get("segments", []))]}
+        if client_comment:
+            payload["client_comment"] = client_comment
+        return payload
     payload = {"text": result.get("text", "")}
     payload.update(model_metadata(result))
     for field in ("speaker_text", "diarization_model"):
         if field in result:
             payload[field] = result[field]
+    if client_comment:
+        payload["client_comment"] = client_comment
     if response_format == "verbose_json":
         payload["segments"] = result.get("segments", [])
         if "speaker_turns" in result:
@@ -136,9 +145,9 @@ def transcription_response_payload(result: dict, response_format: str = "json") 
     return payload
 
 
-def append_cache_metric(result: dict, requested_model: str) -> None:
+def append_cache_metric(result: dict, requested_model: str, client_comment: str | None = None) -> None:
     """Record a successful cache hit as a zero-inference job."""
-    append_metric({
+    record = {
         "requested_model": requested_model,
         "served_model": result.get("served_model", requested_model),
         "model_substituted": result.get("model_substituted", False),
@@ -153,4 +162,7 @@ def append_cache_metric(result: dict, requested_model: str) -> None:
         "peak_vram_mb": 0,
         "success": True,
         "cache_hit": True,
-    })
+    }
+    if client_comment:
+        record["client_comment"] = client_comment
+    append_metric(record)

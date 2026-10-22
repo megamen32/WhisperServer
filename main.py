@@ -44,6 +44,7 @@ from metrics import (
 )
 from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES, WHISPER_MODEL_IDS
 from model_registry import select_compatible_loaded_model as _select_compatible_loaded_model
+from attribution import AttributionStore, normalize_comment
 
 load_dotenv()
 
@@ -486,6 +487,9 @@ transcription_cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
 # Keep the short name as a module-level compatibility reference. Runtime code
 # uses the explicit name so form fields cannot shadow the disk cache object.
 cache = transcription_cache
+# Opt-in client comments ("вебморда", "video_watching") live next to the
+# transcription cache so an operator can tell which client sent which file.
+attribution_store = AttributionStore()
 
 
 def _get_cached_result(cache_key: str):
@@ -799,6 +803,9 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         "model_substituted": model_substituted,
                         "substitution_reason": substitution_reason,
                     }
+                    client_comment = request.get("client_comment")
+                    if client_comment:
+                        result["client_comment"] = client_comment
                     if request.get("words", False):
                         result["words"] = all_words
                     if diarize:
@@ -856,6 +863,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         "peak_vram_mb": peak_vram_mb(),
                         "success": success,
                     }
+                    if request.get("client_comment"):
+                        metric["client_comment"] = request["client_comment"]
                     if error_text:
                         metric["error"] = error_text
                     append_metric(metric)
@@ -1003,8 +1012,10 @@ async def _transcribe_impl(
     words: bool,
     vad_filter: bool,
     diarize: bool = False,
+    comment: Optional[str] = None,
 ):
     diarize = diarize is True
+    client_comment = normalize_comment(comment)
     actual_model = OPENAI_MODEL_MAP.get(model, model)
     if actual_model != OPENAI_WHISPER_INTERNAL_MODEL and actual_model not in MODEL_PRIORITY:
         return JSONResponse({"error": "Unsupported model"}, status_code=400)
@@ -1013,14 +1024,30 @@ async def _transcribe_impl(
     audio_hash = hash_bytes(audio_bytes)
     cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words, diarize=diarize)
 
+    # Remember who sent this file; the cache key stays independent of it.
+    if client_comment:
+        attribution_store.record(audio_hash, client_comment, requested_model=model)
+
     cached_result = _get_cached_result(cache_key)
     if cached_result is not None and not stream:
         logger.info(f"[CACHE HIT] {cache_key}")
-        append_cache_metric(cached_result, model)
-        return cached_result
+        append_cache_metric(cached_result, model, client_comment)
+        # The stored comment belongs to whoever produced the cache entry. Never
+        # hand it to another client: report the current request instead.
+        result = dict(cached_result)
+        result.pop("client_comment", None)
+        if client_comment:
+            result["client_comment"] = client_comment
+        return result
     if cached_result is not None and stream:
         logger.info(f"[CACHE HIT] {cache_key}")
-        append_cache_metric(cached_result, model)
+        append_cache_metric(cached_result, model, client_comment)
+        # The cached comment belongs to whoever produced the entry, so it is
+        # replaced with the comment of the current request before it is sent.
+        cached_payload = dict(cached_result)
+        cached_payload.pop("client_comment", None)
+        if client_comment:
+            cached_payload["client_comment"] = client_comment
         async def cached():
             for segment in cached_result.get("segments", []):
                 payload = {"segment": segment}
@@ -1028,7 +1055,7 @@ async def _transcribe_impl(
                     payload["words"] = [w for w in cached_result.get("words", [])
                                         if w["start"] >= segment["start"] and w["end"] <= segment["end"]]
                 yield json.dumps(payload) + "\n"
-            yield json.dumps({"result": cached_result}) + "\n"
+            yield json.dumps({"result": cached_payload}) + "\n"
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -1059,6 +1086,7 @@ async def _transcribe_impl(
         "words": words,
         "vad_filter": vad_filter,
         "diarize": diarize,
+        "client_comment": client_comment,
         "queued_at": time.perf_counter(),
     })
 
@@ -1090,6 +1118,9 @@ async def _transcribe_impl(
     else:
         try:
             result = await asyncio.wait_for(future, timeout=(int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600))
+            if client_comment and isinstance(result, dict):
+                result = dict(result)
+                result["client_comment"] = client_comment
             return result
         except asyncio.TimeoutError:
             pending_results.pop(request_id, None)
@@ -1117,10 +1148,11 @@ async def transcribe(
     vad_filter: bool = Query(True),
     api_key: str = Query(...),
     diarize: bool = Query(False),
+    comment: Optional[str] = Query(None),
 ):
     if api_key not in ALLOWED_API_KEYS:
         return JSONResponse({"error": "Invalid API key"}, status_code=403)
-    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize)
+    return await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize, comment)
 
 
 @app.post("/web/session")
@@ -1167,12 +1199,14 @@ async def openai_transcribe(
     vad_filter: bool = Form(True),
     cache: bool = Form(True),
     diarize: bool = Form(False),
+    comment: Optional[str] = Form(None),
 ):
     """OpenAI-compatible transcription endpoint"""
     _require_openai_api_key(request)
     if isinstance(chunking_strategy, str) and chunking_strategy != "auto":
         return JSONResponse({"error": "Supported chunking_strategy: auto"}, status_code=400)
     diarize = diarize is True or response_format == "diarized_json"
+    client_comment = normalize_comment(comment)
 
     # Map OpenAI model name to actual model
     actual_model = OPENAI_MODEL_MAP.get(model, model)
@@ -1192,6 +1226,10 @@ async def openai_transcribe(
 
     # Create cache key for this request
     audio_hash = hash_bytes(audio_bytes)
+    # Remember who sent this file. The comment stays beside the cache and never
+    # changes the cache key, so the same file stays a cache hit for everyone.
+    if client_comment:
+        attribution_store.record(audio_hash, client_comment, requested_model=model)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
     cache_key = (
         transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter, diarize=diarize)
@@ -1203,7 +1241,7 @@ async def openai_transcribe(
     cached_result = _get_cached_result(cache_key) if cache_key else None
     if cached_result is not None:
         logger.info(f"[CACHE HIT] {cache_key}")
-        append_cache_metric(cached_result, model)
+        append_cache_metric(cached_result, model, client_comment)
         cached_text = cached_result.get("text", "")
         if stream:
             async def cached_stream_generator():
@@ -1212,7 +1250,7 @@ async def openai_transcribe(
                         yield _openai_sse(diarized_segment(segment, i))
                 if cached_text:
                     yield _openai_sse(_openai_delta_event(cached_text))
-                yield _openai_sse(_openai_done_event(cached_text, transcription_response_payload(cached_result, response_format)))
+                yield _openai_sse(_openai_done_event(cached_text, transcription_response_payload(cached_result, response_format, client_comment)))
 
             return StreamingResponse(
                 cached_stream_generator(),
@@ -1224,7 +1262,7 @@ async def openai_transcribe(
                     "X-Content-Type-Options": "nosniff",
                 },
             )
-        return JSONResponse(transcription_response_payload(cached_result, response_format))
+        return JSONResponse(transcription_response_payload(cached_result, response_format, client_comment))
 
     # Queue the request
     request_id = uuid4().hex
@@ -1249,6 +1287,7 @@ async def openai_transcribe(
         "words": False,
         "vad_filter": vad_filter,
         "diarize": diarize,
+        "client_comment": client_comment,
         "queued_at": time.perf_counter(),
     })
 
@@ -1283,7 +1322,7 @@ async def openai_transcribe(
                     elif "result" in item:
                         result = item["result"]
                         yield _openai_sse(
-                            _openai_done_event(result.get("text", final_text), transcription_response_payload(result, response_format))
+                            _openai_done_event(result.get("text", final_text), transcription_response_payload(result, response_format, client_comment))
                         )
             finally:
                 pending_streams.pop(request_id, None)
@@ -1301,7 +1340,7 @@ async def openai_transcribe(
 
     try:
         result = await asyncio.wait_for(future, timeout=(int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600))
-        return JSONResponse(transcription_response_payload(result, response_format))
+        return JSONResponse(transcription_response_payload(result, response_format, client_comment))
     except asyncio.TimeoutError:
         pending_results.pop(request_id, None)
         return JSONResponse({"error": "Transcription timeout"}, status_code=504)
@@ -1315,6 +1354,15 @@ async def openai_transcribe(
                 headers={"Retry-After": "30"},
             )
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/v1/attributions")
+async def openai_attributions(request: Request, audio_hash: Optional[str] = Query(None), comment: Optional[str] = Query(None)):
+    """Show which client sent which file, based on opt-in client comments."""
+    _require_openai_api_key(request)
+    if not audio_hash and not comment:
+        return JSONResponse({"error": "Provide audio_hash or comment"}, status_code=400)
+    return JSONResponse(attribution_store.lookup(audio_hash=audio_hash, comment=comment))
+
 
 @app.get("/v1/models")
 async def openai_models(request: Request):
