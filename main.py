@@ -489,7 +489,19 @@ transcription_cache = Cache("whisper_cache", size_limit=10 * 1024 ** 3)
 cache = transcription_cache
 # Opt-in client comments ("вебморда", "video_watching") live next to the
 # transcription cache so an operator can tell which client sent which file.
-attribution_store = AttributionStore()
+attribution_store = None
+
+
+def get_attribution_store() -> AttributionStore:
+    """Return the process-wide attribution store, creating it on first use.
+
+    The store is created lazily so that importing the module never touches the
+    filesystem, which keeps test runs away from the production directory.
+    """
+    global attribution_store
+    if attribution_store is None:
+        attribution_store = AttributionStore()
+    return attribution_store
 
 
 def _get_cached_result(cache_key: str):
@@ -1026,7 +1038,7 @@ async def _transcribe_impl(
 
     # Remember who sent this file; the cache key stays independent of it.
     if client_comment:
-        attribution_store.record(audio_hash, client_comment, requested_model=model)
+        get_attribution_store().record(audio_hash, client_comment, requested_model=model)
 
     cached_result = _get_cached_result(cache_key)
     if cached_result is not None and not stream:
@@ -1229,7 +1241,7 @@ async def openai_transcribe(
     # Remember who sent this file. The comment stays beside the cache and never
     # changes the cache key, so the same file stays a cache hit for everyone.
     if client_comment:
-        attribution_store.record(audio_hash, client_comment, requested_model=model)
+        get_attribution_store().record(audio_hash, client_comment, requested_model=model)
     cache_key_model = model if actual_model == OPENAI_WHISPER_INTERNAL_MODEL else actual_model
     cache_key = (
         transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter, diarize=diarize)
@@ -1361,7 +1373,7 @@ async def openai_attributions(request: Request, audio_hash: Optional[str] = Quer
     _require_openai_api_key(request)
     if not audio_hash and not comment:
         return JSONResponse({"error": "Provide audio_hash or comment"}, status_code=400)
-    return JSONResponse(attribution_store.lookup(audio_hash=audio_hash, comment=comment))
+    return JSONResponse(get_attribution_store().lookup(audio_hash=audio_hash, comment=comment))
 
 
 @app.get("/v1/models")
