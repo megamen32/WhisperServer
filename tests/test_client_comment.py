@@ -30,7 +30,6 @@ def attribution(tmp_path, monkeypatch):
     yield store
     store.close()
 
-
 @pytest.fixture
 def client(monkeypatch):
     """Create a test client with a deterministic worker result."""
@@ -143,8 +142,14 @@ class TestCommentDoesNotBreakTheCache:
 
     def test_same_file_from_two_clients_is_one_cache_entry(self, client, sample_audio, attribution):
         audio_hash = main.hash_bytes(sample_audio.getvalue())
+        # The endpoint resolves the public model name to its backend first, so
+        # the key follows the configured default instead of a fixed model.
+        actual_model = main.OPENAI_MODEL_MAP.get("whisper-1", "whisper-1")
+        cache_key_model = (
+            "whisper-1" if actual_model == main.OPENAI_WHISPER_INTERNAL_MODEL else actual_model
+        )
         cache_key = main.transcription_cache_key(
-            "openai", "whisper-1", None, audio_hash, vad_filter=True, diarize=False
+            "openai", cache_key_model, None, audio_hash, vad_filter=True, diarize=False
         )
         main.transcription_cache.set(cache_key, {
             "text": "из кеша",

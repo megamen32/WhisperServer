@@ -28,7 +28,16 @@ def test_whisper_alias_routes_to_gigaam(monkeypatch, endpoint):
         if endpoint == 'native':
             result = await main._transcribe_impl(Upload(), 'whisper-1', None, None, 0, False, False, True)
         else:
-            result = await main.openai_transcribe(None, Upload(), 'whisper-1', None, 0, 'json', False, True, False)
+            result = await main.openai_transcribe(
+                request=None,
+                file=Upload(),
+                model='whisper-1',
+                language=None,
+                temperature=0,
+                response_format='json',
+                stream=False,
+                vad_filter=True,
+            )
         if hasattr(result, 'body'):
             result = json.loads(result.body)
         assert result['text'] == 'готово'

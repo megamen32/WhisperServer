@@ -18,7 +18,9 @@ class FakeStreamingQueue:
 
     def put(self, request):
         assert request["stream"] is True
-        assert request["model"] == main.OPENAI_WHISPER_INTERNAL_MODEL
+        # The alias resolves to the configured backend before it is queued, so
+        # the expectation follows the deployment instead of a fixed model.
+        assert request["model"] == main.OPENAI_MODEL_MAP.get("whisper-1", "whisper-1")
         queue = pending_streams[request["request_id"]]
         queue.put_nowait({"segment": {"id": 0, "start": 0.0, "end": 1.0, "text": "hello"}})
         queue.put_nowait({"result": {"text": "hello", "segments": [{"start": 0.0, "end": 1.0, "text": "hello"}]}})
@@ -32,6 +34,18 @@ def _wav_bytes():
         b"\x40\x1f\x00\x00\x80\x3e\x00\x00"
         b"\x02\x00\x10\x00data\x00\x00\x00\x00"
     )
+
+
+def _openai_cache_key(audio_hash, model="whisper-1", language=None, vad_filter=True):
+    """Build the cache key the OpenAI endpoint uses for a public model name.
+
+    The endpoint resolves the public model name to its backend first, so the
+    key depends on the configured default. Mirroring that here keeps the test
+    independent of the deployment model.
+    """
+    actual_model = main.OPENAI_MODEL_MAP.get(model, model)
+    cache_key_model = model if actual_model == main.OPENAI_WHISPER_INTERNAL_MODEL else actual_model
+    return main.transcription_cache_key("openai", cache_key_model, language, audio_hash, vad_filter=vad_filter)
 
 
 def _sse_events(body: str):
@@ -91,7 +105,7 @@ def test_openai_v1_streaming_cache_hit_uses_sse(monkeypatch):
     cache.clear()
     audio = _wav_bytes().getvalue()
     audio_hash = main.hash_bytes(audio)
-    cache_key = main.transcription_cache_key("openai", "whisper-1", None, audio_hash, vad_filter=True)
+    cache_key = _openai_cache_key(audio_hash)
     cache[cache_key] = {"text": "cached hello"}
 
     client = TestClient(app)
@@ -115,13 +129,7 @@ def test_openai_v1_transcriptions_cache_hit_returns_json(monkeypatch):
     monkeypatch.setenv("API_KEY", "WHISPER_TEST_API_KEY")
     cache.clear()
     audio = _wav_bytes().getvalue()
-    cache_key = main.transcription_cache_key(
-        "openai",
-        "whisper-1",
-        None,
-        main.hash_bytes(audio),
-        vad_filter=True,
-    )
+    cache_key = _openai_cache_key(main.hash_bytes(audio))
     cache[cache_key] = {"text": "cached hello"}
 
     client = TestClient(app)
