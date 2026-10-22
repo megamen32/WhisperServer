@@ -21,8 +21,8 @@ pip install -e ".[dev]"
 
 ```bash
 API_KEY=dev-local-key
-MODEL=large-v3
-OPENAI_DEFAULT_MODEL=large-v3
+MODEL=gigaam-v3
+OPENAI_DEFAULT_MODEL=gigaam-v3
 TG_BOT_ENABLED=false
 ```
 

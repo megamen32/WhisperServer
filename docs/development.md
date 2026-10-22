@@ -35,7 +35,7 @@ pytest -m integration tests/test_blackbox_audio.py -q
 Можно выбрать другую модель через `BLACKBOX_MODEL`. Без `BLACKBOX_TESTS=1` этот набор пропускается.
 
 Реальный браузерный smoke-тест Web UI запускается отдельно: он открывает Chromium через
-`playwright-cli`, выбирает `large-v3`, загружает TTS-файл и проверяет результат транскрибации:
+`playwright-cli`, выбирает `gigaam-v3`, загружает TTS-файл и проверяет результат транскрибации:
 
 ```bash
 BROWSER_TESTS=1 \

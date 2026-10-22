@@ -9,7 +9,7 @@ import whisperclient
 from whisperclient import transcribe_sync
 
 whisperclient.api_key = "dev-local-key"
-whisperclient.model = "large-v3"
+whisperclient.model = "whisper-1"
 whisperclient.whisper_url = "http://127.0.0.1:7653/transcribe"
 
 text = transcribe_sync("voice.ogg")

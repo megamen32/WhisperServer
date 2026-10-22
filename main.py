@@ -57,7 +57,7 @@ if CPU_FALLBACK_MODEL not in WHISPER_MODEL_IDS:
     logger.warning("Unknown CPU_FALLBACK_MODEL=%s; falling back to small", CPU_FALLBACK_MODEL)
     CPU_FALLBACK_MODEL = "small"
 DEFAULT_MODEL = os.getenv("MODEL") or (
-    "large-v3" if torch.cuda.is_available() else CPU_FALLBACK_MODEL
+    "gigaam-v3" if torch.cuda.is_available() else CPU_FALLBACK_MODEL
 )
 METRICS_JSONL_PATH = os.getenv("WHISPER_METRICS_JSONL", "whisper_metrics.jsonl")
 configure_metrics(METRICS_JSONL_PATH)
@@ -255,10 +255,10 @@ def _consume_webui_token(request: Request):
 # Map OpenAI model names to local speech-to-text models.
 OPENAI_WHISPER_ALIAS = "whisper-1"
 OPENAI_WHISPER_INTERNAL_MODEL = "__openai_whisper_1__"
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "large-v3")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gigaam-v3")
 if OPENAI_DEFAULT_MODEL not in MODEL_PRIORITY:
-    logger.warning("Unknown OPENAI_DEFAULT_MODEL=%s; falling back to large-v3", OPENAI_DEFAULT_MODEL)
-    OPENAI_DEFAULT_MODEL = "large-v3"
+    logger.warning("Unknown OPENAI_DEFAULT_MODEL=%s; falling back to gigaam-v3", OPENAI_DEFAULT_MODEL)
+    OPENAI_DEFAULT_MODEL = "gigaam-v3"
 
 # Speech filtering defaults. Silero VAD runs before decoding, so silence and
 # short noise bursts never reach Whisper. The decoder thresholds provide a
