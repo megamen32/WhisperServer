@@ -11,6 +11,8 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 import json
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 import logging
@@ -190,6 +192,197 @@ WEBUI_SESSION_COOKIE = "whisper_web_session"
 WEBUI_CSRF_HEADER = "x-whisper-csrf"
 WEBUI_SESSION_TTL_SECONDS = int(os.getenv("WEBUI_SESSION_TTL_SECONDS", "7200"))
 _webui_sessions = {}
+
+# --- Web UI transcript store -------------------------------------------------
+# The browser never receives the summariser credential and never sends the
+# transcript back for summarisation. The server keeps the text under an opaque
+# id and the browser only sends that id; the server then forwards the text to
+# OmniRoute itself. Ids are unguessable and bound to the session that produced
+# them, so one visitor cannot ask for another visitor's transcript.
+WEBUI_TRANSCRIPT_TTL_SECONDS = int(os.getenv("WEBUI_TRANSCRIPT_TTL_SECONDS", "7200"))
+WEBUI_TRANSCRIPT_MAX_CHARS = int(os.getenv("WEBUI_TRANSCRIPT_MAX_CHARS", "2000000"))
+WEBUI_TRANSCRIPT_MAX_ENTRIES = int(os.getenv("WEBUI_TRANSCRIPT_MAX_ENTRIES", "64"))
+_webui_transcripts = {}
+
+# The public form must not become a way to spend the owner's model budget:
+# summarisation is rate limited per session and in total.
+WEBUI_SUMMARY_MAX_PER_SESSION = int(os.getenv("WEBUI_SUMMARY_MAX_PER_SESSION", "8"))
+WEBUI_SUMMARY_MAX_PER_HOUR = int(os.getenv("WEBUI_SUMMARY_MAX_PER_HOUR", "60"))
+WEBUI_SUMMARY_WINDOW_SECONDS = 3600
+_webui_summary_calls = []
+
+# --- Summariser (OmniRoute) --------------------------------------------------
+# Credentials live only in the server-side environment file, never in the page.
+OMNIROUTE_BASE_URL = os.getenv("OMNIROUTE_BASE_URL", "http://192.168.2.100:20128/v1").rstrip("/")
+# The key file lives next to the service environment, outside the repository.
+# The release directory is a git archive, so the file stays in the working tree.
+OMNIROUTE_API_KEY_FILE_CANDIDATES = [
+    path
+    for path in (
+        os.getenv("OMNIROUTE_API_KEY_FILE_DEFAULT", "").strip(),
+        str(Path(__file__).parent / ".env.omniroute"),
+        "/home/roomhacker/PycharmProjects/WhisperServer/.env.omniroute",
+    )
+    if path
+]
+OMNIROUTE_SUMMARY_MODEL = os.getenv("OMNIROUTE_SUMMARY_MODEL", "minimax-combo-m3.1")
+# A dead upstream provider must not kill the button: try the requested model
+# first and fall back to the owner's other MiniMax routes.
+OMNIROUTE_SUMMARY_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "OMNIROUTE_SUMMARY_FALLBACK_MODELS",
+        "minimax/MiniMax-M3.1-Flash,minimax-combo-m3",
+    ).split(",")
+    if model.strip()
+]
+OMNIROUTE_SUMMARY_TIMEOUT = int(os.getenv("OMNIROUTE_SUMMARY_TIMEOUT", "300"))
+OMNIROUTE_SUMMARY_MAX_CHARS = int(os.getenv("OMNIROUTE_SUMMARY_MAX_CHARS", "120000"))
+OMNIROUTE_SUMMARY_MAX_TOKENS = int(os.getenv("OMNIROUTE_SUMMARY_MAX_TOKENS", "8000"))
+SUMMARY_SYSTEM_PROMPT = (
+    "Ты — помощник, который делает краткие выжимки расшифровок аудио на русском языке. "
+    "Пиши по делу, структурно, без воды и без выдуманных фактов."
+)
+
+
+def _omniroute_api_key():
+    """Read the summariser key from the server-side environment file."""
+    candidates = []
+    configured = os.getenv("OMNIROUTE_API_KEY_FILE", "").strip()
+    if configured:
+        candidates.append(configured)
+    candidates.extend(OMNIROUTE_API_KEY_FILE_CANDIDATES)
+    for key_file in candidates:
+        if not key_file:
+            continue
+        try:
+            with open(key_file, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("OMNIROUTE_API_KEY="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return line
+        except OSError:
+            continue
+    if candidates:
+        logger.warning("No OmniRoute key found in %s", candidates)
+    return ""
+
+
+def _prune_webui_transcripts(now=None):
+    now = now or time.time()
+    stale = [tid for tid, data in _webui_transcripts.items() if data.get("expires", 0) < now]
+    for tid in stale:
+        _webui_transcripts.pop(tid, None)
+    if len(_webui_transcripts) > WEBUI_TRANSCRIPT_MAX_ENTRIES:
+        oldest = sorted(_webui_transcripts.items(), key=lambda item: item[1].get("created", 0))
+        for tid, _ in oldest[: len(_webui_transcripts) - WEBUI_TRANSCRIPT_MAX_ENTRIES]:
+            _webui_transcripts.pop(tid, None)
+
+
+def _store_webui_transcript(session_id, text):
+    """Keep the transcript text server-side and return its opaque id."""
+    _prune_webui_transcripts()
+    if not text:
+        return ""
+    transcript_id = secrets.token_urlsafe(24)
+    _webui_transcripts[transcript_id] = {
+        "session_id": session_id,
+        "text": text[:WEBUI_TRANSCRIPT_MAX_CHARS],
+        "created": time.time(),
+        "expires": time.time() + WEBUI_TRANSCRIPT_TTL_SECONDS,
+    }
+    return transcript_id
+
+
+def _get_webui_transcript(session_id, transcript_id):
+    _prune_webui_transcripts()
+    entry = _webui_transcripts.get(transcript_id or "")
+    if not entry:
+        return None
+    # The transcript belongs to the session that produced it.
+    if entry.get("session_id") != session_id:
+        return None
+    return entry.get("text") or ""
+
+
+def _summary_rate_limit(session_id):
+    """Keep the public form from spending the owner's model budget."""
+    now = time.time()
+    cutoff = now - WEBUI_SUMMARY_WINDOW_SECONDS
+    for key in [k for k in _webui_summary_calls if k[1] < cutoff]:
+        _webui_summary_calls.remove(key)
+    per_session = sum(1 for key in _webui_summary_calls if key[0] == session_id)
+    if per_session >= WEBUI_SUMMARY_MAX_PER_SESSION:
+        raise HTTPException(status_code=429, detail="Too many summaries for this session")
+    if len(_webui_summary_calls) >= WEBUI_SUMMARY_MAX_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Summariser is busy, try later")
+    _webui_summary_calls.append((session_id, now))
+
+
+def _new_webui_transcript(session_id):
+    """Reserve an opaque id before the stream starts; the text arrives later."""
+    _prune_webui_transcripts()
+    transcript_id = secrets.token_urlsafe(24)
+    _webui_transcripts[transcript_id] = {
+        "session_id": session_id,
+        "text": "",
+        "created": time.time(),
+        "expires": time.time() + WEBUI_TRANSCRIPT_TTL_SECONDS,
+    }
+    return transcript_id
+
+
+def _fill_webui_transcript(transcript_id, text):
+    """Attach the transcript text to an already reserved id."""
+    if not text:
+        return
+    entry = _webui_transcripts.get(transcript_id or "")
+    if not entry:
+        return
+    entry["text"] = text[:WEBUI_TRANSCRIPT_MAX_CHARS]
+
+
+def _transcript_text_from_payload(payload):
+    """Pull the full transcript text out of one NDJSON stream payload."""
+    if not isinstance(payload, dict):
+        return ""
+    result = payload.get("result")
+    if isinstance(result, dict):
+        payload = result
+    return payload.get("speaker_text") or payload.get("text") or ""
+
+
+async def _capture_transcript_stream(source, transcript_id):
+    """Pass the stream through untouched while collecting the transcript text."""
+    buffer = b""
+    try:
+        async for chunk in source:
+            yield chunk
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            buffer += chunk
+            while True:
+                index = buffer.find(b"\n")
+                if index == -1:
+                    break
+                line, buffer = buffer[:index], buffer[index + 1:]
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line.decode("utf-8", "replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                text = _transcript_text_from_payload(parsed)
+                if text:
+                    _fill_webui_transcript(transcript_id, text)
+                    buffer = b""
+                    break
+    finally:
+        pass
 
 
 def _new_webui_token():
@@ -1192,11 +1385,130 @@ async def web_transcribe(
 ):
     """First-party Web UI tunnel: API_KEY stays server-side; CSRF token is one-use."""
     next_token = _consume_webui_token(request)
+    session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    transcript_id = _new_webui_transcript(session_id)
     response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize)
     if not hasattr(response, "headers"):
         response = JSONResponse(response)
     response.headers["X-Whisper-Next-CSRF"] = next_token
+    response.headers["X-Whisper-Transcript-Id"] = transcript_id
+    if stream and hasattr(response, "body_iterator"):
+        response.body_iterator = _capture_transcript_stream(response.body_iterator, transcript_id)
+    else:
+        try:
+            payload = json.loads(bytes(response.body).decode("utf-8"))
+        except Exception:
+            payload = None
+        text = _transcript_text_from_payload(payload)
+        if text:
+            _fill_webui_transcript(transcript_id, text)
     return response
+
+@app.post("/web/summarize")
+async def web_summarize(request: Request):
+    """Summarise a stored transcript through OmniRoute.
+
+    The browser sends only the transcript id: the text stays on the server and
+    the OmniRoute key never leaves it.
+    """
+    next_token = _consume_webui_token(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    transcript_id = str(payload.get("transcript_id") or "")
+    text = _get_webui_transcript(session_id, transcript_id)
+    if not text:
+        raise HTTPException(status_code=404, detail="Unknown transcript id")
+    _summary_rate_limit(session_id)
+
+    api_key = _omniroute_api_key()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Summariser is not configured")
+
+    instruction = str(payload.get("instruction") or "").strip()
+    if len(instruction) > 500:
+        instruction = instruction[:500]
+    system_prompt = SUMMARY_SYSTEM_PROMPT
+    if instruction:
+        system_prompt = f"{SUMMARY_SYSTEM_PROMPT}\n\nДополнительное указание: {instruction}"
+
+    # The gateway lives on the LAN: never route it through a system proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    candidates = [OMNIROUTE_SUMMARY_MODEL] + [
+        model for model in OMNIROUTE_SUMMARY_FALLBACK_MODELS if model != OMNIROUTE_SUMMARY_MODEL
+    ]
+
+    summary = ""
+    actual_model = ""
+    served_model = ""
+    last_error = ""
+    for model in candidates:
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text[:OMNIROUTE_SUMMARY_MAX_CHARS]},
+            ],
+            "stream": False,
+            "max_tokens": OMNIROUTE_SUMMARY_MAX_TOKENS,
+        }
+        upstream = urllib.request.Request(
+            f"{OMNIROUTE_BASE_URL}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with opener.open(upstream, timeout=OMNIROUTE_SUMMARY_TIMEOUT) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            last_error = f"{model}: HTTP {error.code}"
+            logger.warning("Summariser %s", last_error)
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = f"{model}: {error}"
+            logger.warning("Summariser unreachable via %s: %s", model, error)
+            continue
+
+        try:
+            parsed = json.loads(raw)
+            choice = (parsed.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            summary = (message.get("content") or "").strip()
+            if not summary:
+                # Reasoning models may answer with reasoning only.
+                summary = (message.get("reasoning_content") or "").strip()
+            actual_model = parsed.get("model") or model
+            served_model = model
+        except (json.JSONDecodeError, IndexError, AttributeError):
+            last_error = f"{model}: unexpected response"
+            continue
+        if summary:
+            break
+        last_error = f"{model}: empty summary"
+
+    if not summary:
+        raise HTTPException(status_code=502, detail=f"Summariser failed ({last_error})")
+
+    # Report the model that actually did the work, not the one we asked for.
+    return JSONResponse(
+        {
+            "summary": summary,
+            "model": actual_model or served_model,
+            "requested_model": OMNIROUTE_SUMMARY_MODEL,
+            "served_model": served_model,
+            "transcript_id": transcript_id,
+            "source_chars": len(text),
+        },
+        headers={"X-Whisper-Next-CSRF": next_token},
+    )
+
 
 @app.post("/v1/audio/transcriptions")
 async def openai_transcribe(

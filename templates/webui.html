@@ -258,9 +258,7 @@
             padding-top: 8px;
         }
         .copy-result-button {
-            position: absolute;
-            top: -26px;
-            left: 4px;
+            position: static;
             border: none;
             border-radius: 999px;
             background: #030303;
@@ -280,6 +278,7 @@
             line-height: 1;
         }
         .copy-result-button.hidden {
+            display: none;
             opacity: 0;
             pointer-events: none;
             transform: translateY(-2px);
@@ -375,13 +374,24 @@
         .match-count { min-width: 76px; color: #93a3b8; font-size: .82rem; text-align: center; }
         .tool-button { min-height: 38px; border: 1px solid #344154; border-radius: 9px; padding: 7px 10px; background: #182230; cursor: pointer; }
         .tool-button:hover { background: #243247; }
-        .document { padding: 30px clamp(2px, 3vw, 32px); }
-        .document-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 17px; border-bottom: 1px solid #25303e; }
+        .tool-button:disabled { opacity: .45; cursor: not-allowed; }
+        .tool-button.hidden { display: none; }
+        .tool-button.accent { border-color: #3f7f6a; background: #16302a; color: #c9ffe4; }
+        .tool-button.accent:hover:not(:disabled) { background: #1c3f35; }
+        .summary-panel { margin-top: 16px; padding: 20px 22px; }
+        .summary-panel[hidden] { display: none; }
+        .summary-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding-bottom: 14px; border-bottom: 1px solid #25303e; }
+        .summary-heading h2 { margin: 0; font-size: 1.1rem; font-weight: 650; }
+        .summary-meta { color: #8190a3; font-size: .82rem; }
+        .summary-text { margin-top: 14px; white-space: pre-wrap; color: #dfe8f3; line-height: 1.7; }
+        .summary-status { margin-top: 12px; color: #a8bad0; font-size: .86rem; }
+        .document { padding: 30px clamp(2px, 3vw, 32px); max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
+        .document-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 14px 0 17px; background: #121924; border-bottom: 1px solid #25303e; }
         .document-heading h2 { margin: 0; font-size: 1.2rem; font-weight: 650; }
         .document-meta { color: #8190a3; font-size: .82rem; }
         .transcript-container { display: flex; flex-direction: column; gap: 0; padding-top: 12px; }
         .empty-state { padding: 58px 16px; color: #8796aa; text-align: center; line-height: 1.7; }
-        .segment { display: grid; grid-template-columns: 0 minmax(0, 1fr); column-gap: 0; padding: 11px 8px; border-radius: 8px; line-height: 1.75; overflow-wrap: anywhere; transition: background .2s ease; }
+        .segment { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 0; padding: 11px 8px; border-radius: 8px; line-height: 1.75; overflow-wrap: anywhere; transition: background .2s ease; }
         .transcript-container.show-times .segment { grid-template-columns: 92px minmax(0, 1fr); column-gap: 14px; }
         .segment.current-match { background: #293244; box-shadow: inset 3px 0 #77c9ff; }
         .segment.filtered-out { display: none; }
@@ -434,7 +444,6 @@
                     <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
                 <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
-                <button type="button" id="copy-result-button" class="copy-result-button hidden" title="Скопировать результат">Скопировать текст</button>
             </div>
             <div class="upload-track hidden"><div class="upload-bar" id="upload-bar"></div></div>
             <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
@@ -447,12 +456,23 @@
                 <span class="match-count" id="match-count" aria-live="polite">0 фрагментов</span>
                 <button type="button" class="tool-button" id="previous-match" aria-label="Предыдущее совпадение">↑</button>
                 <button type="button" class="tool-button" id="next-match" aria-label="Следующее совпадение">↓</button>
+                <button type="button" class="tool-button" id="copy-result-button" title="Скопировать расшифровку">Копировать</button>
+                <button type="button" class="tool-button accent" id="summarize-button" title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
             </div>
             <article class="panel document">
                 <div class="document-heading"><h2>Расшифровка</h2><span class="document-meta" id="document-meta">Текст появится здесь после загрузки аудио</span></div>
                 <div id="transcript" class="transcript-container" aria-live="polite"><div class="empty-state">Загрузите аудиофайл, чтобы начать.<br>Расшифровка будет показана целиком в документе ниже.</div></div>
                 <div class="final-output-wrapper"><div id="final-output" class="final-output"></div></div>
             </article>
+            <section class="panel summary-panel" id="summary-panel" hidden aria-label="Краткая выжимка">
+                <div class="summary-heading">
+                    <h2>Краткая выжимка</h2>
+                    <span class="summary-meta" id="summary-meta"></span>
+                </div>
+                <div class="summary-text" id="summary-text"></div>
+                <div class="summary-status" id="summary-status" aria-live="polite"></div>
+                <div style="margin-top: 14px;"><button type="button" class="tool-button" id="copy-summary-button">Скопировать выжимку</button></div>
+            </section>
             <div id="error-output" class="error-output" aria-live="assertive"></div>
         </section>
     </main>
@@ -481,6 +501,12 @@
         const documentMeta = document.getElementById('document-meta');
         const previousMatchButton = document.getElementById('previous-match');
         const nextMatchButton = document.getElementById('next-match');
+        const summarizeButton = document.getElementById('summarize-button');
+        const summaryPanel = document.getElementById('summary-panel');
+        const summaryText = document.getElementById('summary-text');
+        const summaryMeta = document.getElementById('summary-meta');
+        const summaryStatus = document.getElementById('summary-status');
+        const copySummaryButton = document.getElementById('copy-summary-button');
 
         const UPLOAD_SPEED_PREFIX = 'Скорость загрузки:';
         const UPLOAD_ESTIMATE_PREFIX = 'Осталось:';
@@ -503,6 +529,8 @@
         let currentUploadTotal = 0;
         let matchingSegments = [];
         let activeMatchIndex = -1;
+        let transcriptId = '';
+        let isSummarizing = false;
 
         const recordingSupported = typeof MediaRecorder !== 'undefined';
 
@@ -714,6 +742,8 @@
             wrapper.appendChild(timestamp);
             wrapper.appendChild(text);
             transcriptContainer.appendChild(wrapper);
+            // The copy button stays reachable from the first segment on.
+            showCopyButton();
             if (transcriptSearch.value.trim()) {
                 const query = transcriptSearch.value.trim();
                 if ((segment.text || '').toLocaleLowerCase().includes(query.toLocaleLowerCase())) {
@@ -725,6 +755,7 @@
                 }
             }
             documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
+            updateMatchCount();
             updateProgress();
         }
 
@@ -752,8 +783,15 @@
         }
 
         function updateMatchCount() {
+            const query = transcriptSearch.value.trim();
+            if (!query) {
+                // Without a query the counter shows the size of the transcript.
+                const total = segmentsProcessed;
+                matchCount.textContent = `${total.toLocaleString('ru-RU')} ${total === 1 ? 'фрагмент' : 'фрагментов'}`;
+                return;
+            }
             const count = matchingSegments.length;
-            matchCount.textContent = `${count.toLocaleString('ru-RU')} ${count === 1 ? 'фрагмент' : 'фрагментов'}`;
+            matchCount.textContent = `${count.toLocaleString('ru-RU')} ${count === 1 ? 'совпадение' : 'совпадений'}`;
             matchingSegments.forEach((segment, index) => segment.classList.toggle('current-match', index === activeMatchIndex));
         }
 
@@ -868,6 +906,12 @@
             matchCount.textContent = '0 фрагментов';
             documentMeta.textContent = file.name;
             finalOutput.textContent = '';
+            transcriptId = '';
+            summarizeButton.disabled = true;
+            summaryPanel.hidden = true;
+            summaryText.textContent = '';
+            summaryMeta.textContent = '';
+            summaryStatus.textContent = '';
             hideCopyButton();
             errorOutput.textContent = '';
             progressBar.style.width = '0%';
@@ -1001,6 +1045,13 @@
                 if (nextToken) {
                     webuiCsrfToken = nextToken;
                 }
+                // The server keeps the transcript and hands out only an id:
+                // summarisation sends that id, never the text.
+                const newTranscriptId = xhr.getResponseHeader('X-Whisper-Transcript-Id');
+                if (newTranscriptId) {
+                    transcriptId = newTranscriptId;
+                    summarizeButton.disabled = false;
+                }
                 drainResponseText(xhr.responseText, true);
                 cleanupProcessing({ finalMessage: 'Готово', success: true });
             });
@@ -1083,22 +1134,7 @@
                 .map((segment) => `${segment.querySelector('.speaker')?.textContent || ''}${segment.dataset.searchText || ''}`)
                 .join('\n');
             const text = transcriptText || finalOutput.textContent.trim();
-            if (!text) {
-                setStatus('Нет результата для копирования');
-                return;
-            }
-            try {
-                await navigator.clipboard.writeText(text);
-                setStatus('Результат скопирован');
-            } catch (error) {
-                const fallback = document.createElement('textarea');
-                fallback.value = text;
-                document.body.appendChild(fallback);
-                fallback.select();
-                document.execCommand('copy');
-                document.body.removeChild(fallback);
-                setStatus('Скопировано (резервно)');
-            }
+            await copyTextToClipboard(text, 'Результат скопирован');
         });
 
         function showCopyButton() {
@@ -1110,6 +1146,76 @@
                 copyResultButton.classList.add('hidden');
             }
         }
+
+        async function copyTextToClipboard(text, successMessage) {
+            if (!text) {
+                setStatus('Нет результата для копирования');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(text);
+                setStatus(successMessage);
+            } catch (error) {
+                const fallback = document.createElement('textarea');
+                fallback.value = text;
+                document.body.appendChild(fallback);
+                fallback.select();
+                document.execCommand('copy');
+                document.body.removeChild(fallback);
+                setStatus('Скопировано (резервно)');
+            }
+        }
+
+        summarizeButton.addEventListener('click', async () => {
+            if (isSummarizing) {
+                return;
+            }
+            if (!transcriptId) {
+                summaryStatus.textContent = 'Сначала дождитесь окончания расшифровки';
+                return;
+            }
+            isSummarizing = true;
+            summarizeButton.disabled = true;
+            summaryPanel.hidden = false;
+            summaryStatus.textContent = 'Суммаризация…';
+            summaryMeta.textContent = '';
+            try {
+                // The one-use CSRF token from the transcription response is
+                // still valid: refreshing it would rotate the session and the
+                // transcript would no longer belong to it.
+                const response = await fetch('/web/summarize', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    cache: 'no-store',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Whisper-CSRF': webuiCsrfToken,
+                    },
+                    // Only the id travels: the text and the model key stay on the server.
+                    body: JSON.stringify({ transcript_id: transcriptId }),
+                });
+                const nextToken = response.headers.get('X-Whisper-Next-CSRF');
+                if (nextToken) {
+                    webuiCsrfToken = nextToken;
+                }
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(payload.detail || `Ошибка: ${response.status}`);
+                }
+                summaryText.textContent = payload.summary || '';
+                summaryMeta.textContent = `${payload.model || 'модель неизвестна'} · ${(payload.source_chars || 0).toLocaleString('ru-RU')} симв.`;
+                summaryStatus.textContent = 'Готово';
+            } catch (error) {
+                summaryStatus.textContent = error.message || 'Не удалось суммаризировать';
+            } finally {
+                isSummarizing = false;
+                summarizeButton.disabled = !transcriptId;
+            }
+        });
+
+        copySummaryButton.addEventListener('click', async () => {
+            await copyTextToClipboard(summaryText.textContent.trim(), 'Выжимка скопирована');
+        });
 
         modelSelect.addEventListener('change', () => {
             if (!currentFile) {
