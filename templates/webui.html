@@ -385,8 +385,8 @@
         .summary-meta { color: #8190a3; font-size: .82rem; }
         .summary-text { margin-top: 14px; white-space: pre-wrap; color: #dfe8f3; line-height: 1.7; }
         .summary-status { margin-top: 12px; color: #a8bad0; font-size: .86rem; }
-        .document { padding: 30px clamp(2px, 3vw, 32px); max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
-        .document-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 14px 0 17px; background: #121924; border-bottom: 1px solid #25303e; }
+        .document { padding: 0 clamp(2px, 3vw, 32px) 30px; max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
+        .document-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 30px 0 17px; background: #121924; border-bottom: 1px solid #25303e; }
         .document-heading h2 { margin: 0; font-size: 1.2rem; font-weight: 650; }
         .document-meta { color: #8190a3; font-size: .82rem; }
         .transcript-container { display: flex; flex-direction: column; gap: 0; padding-top: 12px; }
@@ -411,7 +411,7 @@
             .page { padding: 25px 14px 72px; } .setup { padding: 14px; } .drop-zone { min-height: 118px; padding: 14px; }
             .controls { grid-template-columns: 1fr; gap: 13px; } .switch-control { align-items: flex-start; } .action { width: 100%; }
             .transcript-toolbar { top: 0; gap: 7px; padding: 8px; } .search-box { flex-basis: 100%; }
-            .match-count { flex: 1; text-align: left; } .document { padding: 20px 4px; }
+            .match-count { flex: 1; text-align: left; } .document { padding: 0 4px 20px; }
             .document-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
             .segment { padding: 10px 5px; font-size: .98rem; }
             .transcript-container.show-times .segment { grid-template-columns: 1fr; gap: 1px; }
