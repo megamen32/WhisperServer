@@ -334,17 +334,24 @@
         body { margin: 0; min-width: 320px; background: radial-gradient(ellipse at 50% -20%, #26364b 0, #101722 46rem, #0d1118 82rem); display: block; }
         button, input, select { font: inherit; }
         button, select, input { color: inherit; }
-        button:focus-visible, input:focus-visible, select:focus-visible, #drop-zone:focus-visible { outline: 2px solid #7ec9ff; outline-offset: 2px; }
+        button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible, #drop-zone:focus-visible { outline: 2px solid #7ec9ff; outline-offset: 2px; }
         .page { width: min(1100px, 100%); margin: 0 auto; padding: 38px 28px 100px; display: block; }
         .history-sidebar { position: fixed; inset: 0 auto 0 0; width: 260px; padding: 22px 12px; background: #121923; border-right: 1px solid #293445; overflow-y: auto; z-index: 5; }
         .history-sidebar h2 { margin: 0 8px 18px; font-size: 1rem; }
         .history-list { display: grid; gap: 4px; }
-        .history-item { border: 0; border-radius: 9px; padding: 11px; background: transparent; color: #c8d2df; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+        .history-row { display: flex; align-items: flex-start; min-width: 0; border-radius: 9px; }
+        .history-item { flex: 1; min-width: 0; border: 0; border-radius: 9px; padding: 11px; background: transparent; color: #c8d2df; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
         .history-item:hover, .history-item[aria-current="true"] { background: #263343; color: white; }
+        .history-actions { position: relative; }
+        .history-actions summary { display: grid; place-items: center; width: 44px; height: 44px; cursor: pointer; list-style: none; border-radius: 9px; font-size: 1.3rem; }
+        .history-actions summary::-webkit-details-marker { display: none; }
+        .history-actions summary:hover, .history-actions[open] summary { background: #263343; }
+        .history-delete { position: absolute; z-index: 2; right: 0; top: 44px; min-width: 190px; min-height: 44px; padding: 10px; border: 1px solid #48566b; border-radius: 9px; color: #ffc0c3; background: #1a2533; cursor: pointer; }
+        .history-backdrop { display: none; }
         .history-empty { padding: 10px; color: #8291a5; font-size: .85rem; }
         .history-toggle { display: none; }
         @media (min-width: 901px) { .page { width: min(1100px, calc(100% - 260px)); margin-left: calc(260px + max(0px, (100% - 260px - 1100px) / 2)); } }
-        @media (max-width: 900px) { .history-sidebar { transform: translateX(-100%); transition: transform .2s ease; box-shadow: 12px 0 30px #0008; } .history-sidebar.open { transform: translateX(0); } .history-toggle { display: inline-block; margin: 0 0 14px; } }
+        @media (max-width: 900px) { .history-sidebar { width: min(320px, 88vw); transform: translateX(-100%); transition: transform .2s ease; box-shadow: 12px 0 30px #0008; } .history-sidebar.open { transform: translateX(0); } .history-toggle { display: inline-block; margin: 0 0 14px; } .history-backdrop.open { display: block; position: fixed; inset: 0; z-index: 4; border: 0; background: #0009; } }
         .byok-settings { margin-top: 14px; padding: 14px; border: 1px solid #344154; border-radius: 12px; }
         .byok-settings summary { cursor: pointer; color: #c5d7e8; }
         .byok-fields { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 10px; margin-top: 12px; }
@@ -364,7 +371,7 @@
         .button-link { color: #8ccfff; text-decoration: underline; text-underline-offset: 3px; }
         .paste-hint { display: block; margin-top: 8px; color: #8292a7; font-size: .85rem; }
         #file-input { display: none; }
-        .controls { display: grid; grid-template-columns: minmax(190px, 1.2fr) minmax(190px, 1fr) auto auto; gap: 16px; align-items: end; margin-top: 20px; }
+        .controls { display: grid; grid-template-columns: minmax(190px, 1.2fr) minmax(190px, 1fr) auto; gap: 16px; align-items: end; margin-top: 20px; }
         .control { display: flex; flex-direction: column; gap: 7px; color: #aab7c8; font-size: .88rem; }
         .control select { min-height: 44px; width: 100%; padding: 9px 12px; border: 1px solid #374559; border-radius: 10px; background: #101721; }
         .switch-control { min-height: 44px; justify-content: center; gap: 4px; }
@@ -373,6 +380,8 @@
         .control small { color: #8291a5; font-size: .75rem; }
         .action { min-height: 42px; border: 1px solid #3a4a60; border-radius: 10px; padding: 9px 13px; background: #1a2533; cursor: pointer; }
         .action:hover { background: #223247; }
+        .action[hidden] { display: none; }
+        .action:disabled { opacity: .55; cursor: not-allowed; }
         .status-bar { margin-top: 16px; color: #a8bad0; font-size: .88rem; }
         .progress-track, .upload-track { width: 100%; height: 7px; margin-top: 15px; overflow: hidden; border-radius: 99px; background: #273242; }
         .progress-bar, .upload-bar { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #69d6c1, #77bfff); transition: width .3s ease; }
@@ -428,7 +437,8 @@
         .copy-result-button { border: 1px solid #38485c; border-radius: 9px; margin: 0; padding: 9px 13px; color: #d9e6f5; background: #182230; cursor: pointer; }
         .copy-result-button.hidden { display: none; }
         .error-output { margin-top: 12px; color: #ff9ea4; }
-        .mic-icon, .mic-label { display: none; }
+        .record-button { margin-top: 12px; min-height: 44px; }
+        .record-button.recording { border-color: #e58c93; color: #ffd9dc; }
         @media (max-width: 820px) { .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 560px) {
             .page { padding: 25px 14px 72px; } .setup { padding: 14px; } .drop-zone { min-height: 118px; padding: 14px; }
@@ -448,6 +458,7 @@
         <h2>История расшифровок</h2>
         <nav class="history-list" id="history-list" aria-label="Прошлые задания"></nav>
     </aside>
+    <button type="button" class="history-backdrop" id="history-backdrop" tabindex="-1" aria-label="Закрыть историю"></button>
     <main class="page">
         <button type="button" class="tool-button history-toggle" id="history-toggle" aria-controls="history-sidebar" aria-expanded="false">☰ История</button>
         <header class="brand">
@@ -456,8 +467,6 @@
             <p class="subtitle">Загрузите запись и получите полный текст. Длинные расшифровки остаются на странице — ищите по тексту и переходите между совпадениями.</p>
         </header>
         <section class="panel setup" aria-label="Настройки расшифровки">
-            <div class="mic-icon" aria-hidden="true">🎙️</div>
-            <div class="mic-label" id="mic-label">Нажмите, чтобы записать</div>
             <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Выбрать аудиофайл">
                 <span class="drop-icon" aria-hidden="true">↥</span>
                 <p><strong>Перетащите файл сюда</strong><br>
@@ -466,14 +475,14 @@
                 </p>
                 <input type="file" id="file-input" accept="audio/*" />
             </div>
+            <button type="button" class="action record-button" id="record-button" aria-pressed="false">🎙 Записать с микрофона</button>
             <div class="controls">
                 <label class="control"><span>Модель распознавания</span><select id="model-select"></select></label>
                 <label class="control switch-control">
                     <span class="switch-line"><input type="checkbox" id="diarize" checked> Размечать говорящих</span>
                     <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
-                <button type="button" id="cancel-job" class="action" disabled>Отменить задание</button>
-                <button type="button" id="delete-job" class="action" disabled>Удалить задание</button>
+                <button type="button" id="cancel-job" class="action" hidden disabled>Отменить задание</button>
                 <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
             </div>
             <select id="job-history" hidden aria-label="История заданий"><option value="">Нет выбранного задания</option></select>
@@ -538,8 +547,7 @@
         const uploadBar = document.getElementById('upload-bar');
         const uploadTrack = document.querySelector('.upload-track');
         const toggleTimes = document.getElementById('toggle-times');
-        const micIcon = document.querySelector('.mic-icon');
-        const micLabel = document.getElementById('mic-label');
+        const recordButton = document.getElementById('record-button');
         const copyResultButton = document.getElementById('copy-result-button');
         const progressMeta = document.querySelector('.progress-meta');
         const transcriptSearch = document.getElementById('transcript-search');
@@ -569,6 +577,7 @@
         let mediaRecorder = null;
         let mediaStream = null;
         let recordedChunks = [];
+        let recordingFailed = false;
         let activeXhr = null;
         let currentFile = null;
         let pendingReprocess = false;
@@ -588,8 +597,9 @@
         }
 
         function updateRecordingUI(active) {
-            micIcon.classList.toggle('recording', active);
-            micLabel.textContent = active ? 'Идет запись… нажмите, чтобы остановить' : 'Нажмите, чтобы записать';
+            recordButton.classList.toggle('recording', active);
+            recordButton.textContent = active ? '■ Остановить запись и расшифровать' : '🎙 Записать с микрофона';
+            recordButton.setAttribute('aria-pressed', String(active));
         }
 
         function cleanupRecordingStream() {
@@ -605,17 +615,19 @@
                 errorOutput.textContent = 'Подождите завершения текущей расшифровки';
                 return;
             }
-            if (!recordingSupported) {
+            if (!recordingSupported || !navigator.mediaDevices?.getUserMedia) {
                 errorOutput.textContent = 'Ваш браузер не поддерживает запись с микрофона';
                 return;
             }
             try {
+                recordButton.disabled = true;
+                errorOutput.textContent = '';
                 recordedChunks = [];
+                recordingFailed = false;
                 mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                    ? 'audio/webm;codecs=opus'
-                    : 'audio/webm';
-                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: preferredMime });
+                const preferredMime = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm'].find(type => MediaRecorder.isTypeSupported(type));
+                mediaRecorder = preferredMime ? new MediaRecorder(mediaStream, { mimeType: preferredMime }) : new MediaRecorder(mediaStream);
+                const actualMime = mediaRecorder.mimeType || preferredMime || 'audio/webm';
                 mediaRecorder.addEventListener('dataavailable', (event) => {
                     if (event.data && event.data.size > 0) {
                         recordedChunks.push(event.data);
@@ -624,18 +636,25 @@
                 mediaRecorder.addEventListener('stop', () => {
                     updateRecordingUI(false);
                     cleanupRecordingStream();
+                    recordButton.disabled = false;
+                    if (recordingFailed) return;
                     if (!recordedChunks.length) {
-                        setStatus('Запись отменена');
+                        setStatus('Запись пуста. Попробуйте ещё раз');
                         return;
                     }
-                    const blob = new Blob(recordedChunks, { type: preferredMime });
-                    const file = new File([blob], `recording-${Date.now()}.webm`, { type: blob.type });
+                    const type = actualMime;
+                    const blob = new Blob(recordedChunks, { type });
+                    const extension = type.includes('mp4') ? 'm4a' : 'webm';
+                    const file = new File([blob], `recording-${Date.now()}.${extension}`, { type: blob.type });
                     transcribeFile(file);
                 });
                 mediaRecorder.addEventListener('error', (event) => {
                     errorOutput.textContent = event.error?.message || 'Ошибка записи';
+                    recordingFailed = true;
+                    recordedChunks = [];
                     updateRecordingUI(false);
                     cleanupRecordingStream();
+                    recordButton.disabled = false;
                 });
                 mediaRecorder.start();
                 setStatus('Идет запись...');
@@ -644,11 +663,13 @@
                 errorOutput.textContent = error.message;
                 updateRecordingUI(false);
                 cleanupRecordingStream();
-            }
+            } finally { recordButton.disabled = false; }
         }
 
         function stopRecording() {
             if (mediaRecorder && mediaRecorder.state === 'recording') {
+                recordButton.disabled = true;
+                setStatus('Подготавливаем запись…');
                 mediaRecorder.stop();
             } else {
                 updateRecordingUI(false);
@@ -939,8 +960,14 @@
         const historyList = document.getElementById('history-list');
         const historySidebar = document.getElementById('history-sidebar');
         const historyToggle = document.getElementById('history-toggle');
+        const historyBackdrop = document.getElementById('history-backdrop');
         const summaryProvider = document.getElementById('summary-provider');
         let byokPresets = [];
+        const terminalStatuses = ['done', 'completed', 'error', 'failed', 'cancelled', 'canceled'];
+        function closeHistory() {
+            historySidebar.classList.remove('open'); historyBackdrop.classList.remove('open');
+            historyToggle.setAttribute('aria-expanded', 'false');
+        }
         function renderHistory() {
             historyList.replaceChildren();
             const options = Array.from(historySelect.options).filter(option => option.value);
@@ -948,14 +975,25 @@
                 const empty = document.createElement('div'); empty.className = 'history-empty'; empty.textContent = 'Здесь появятся ваши записи'; historyList.appendChild(empty);
             }
             for (const option of options.reverse()) {
+                const row = document.createElement('div'); row.className = 'history-row';
                 const button = document.createElement('button'); button.type = 'button'; button.className = 'history-item';
                 button.textContent = option.textContent; button.setAttribute('aria-current', String(option.value === selectedJobId));
-                button.addEventListener('click', () => { selectJob(option.value); historySidebar.classList.remove('open'); historyToggle.setAttribute('aria-expanded', 'false'); });
-                historyList.appendChild(button);
+                button.addEventListener('click', () => { selectJob(option.value); closeHistory(); });
+                row.appendChild(button);
+                if (terminalStatuses.includes(option.dataset.status)) {
+                    const menu = document.createElement('details'); menu.className = 'history-actions';
+                    const summary = document.createElement('summary'); summary.textContent = '⋯'; summary.setAttribute('aria-label', `Действия с записью ${option.dataset.filename || option.value}`);
+                    const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'history-delete'; remove.textContent = 'Удалить из истории';
+                    remove.addEventListener('click', () => deleteHistoryJob(option.value, option.dataset.filename || option.value, remove));
+                    menu.append(summary, remove); row.appendChild(menu);
+                }
+                historyList.appendChild(row);
             }
         }
-        historyToggle.addEventListener('click', () => { const open = historySidebar.classList.toggle('open'); historyToggle.setAttribute('aria-expanded', String(open)); });
-        document.getElementById('history-close').addEventListener('click', () => { historySidebar.classList.remove('open'); historyToggle.setAttribute('aria-expanded', 'false'); });
+        historyToggle.addEventListener('click', () => { const open = historySidebar.classList.toggle('open'); historyBackdrop.classList.toggle('open', open); historyToggle.setAttribute('aria-expanded', String(open)); });
+        document.getElementById('history-close').addEventListener('click', closeHistory);
+        historyBackdrop.addEventListener('click', closeHistory);
+        document.addEventListener('keydown', event => { if (event.key === 'Escape' && historySidebar.classList.contains('open')) { closeHistory(); historyToggle.focus(); } });
         new MutationObserver(renderHistory).observe(historySelect, { childList: true, subtree: true, characterData: true });
         fetch('/web/byok/presets').then(response => response.ok ? response.json() : []).then(presets => {
             byokPresets = presets; for (const preset of presets) summaryProvider.add(new Option(preset.label, preset.id));
@@ -968,7 +1006,6 @@
             if (preset) { document.getElementById('byok-format').value = preset.apiFormat; document.getElementById('byok-url').value = preset.baseUrl; document.getElementById('byok-model').value = preset.modelId; }
         });
         const cancelButton = document.getElementById('cancel-job');
-        const deleteButton = document.getElementById('delete-job');
         const diarizeInput = document.getElementById('diarize');
         const diarizeStatus = document.getElementById('diarize-status');
         const storageWarning = document.getElementById('storage-warning');
@@ -1121,7 +1158,9 @@
             for (const item of jobs) {
                 const job = unpackJob(item);
                 if (!job.id) continue;
-                historySelect.add(new Option(`${job.filename || job.id} — ${job.status || 'статус неизвестен'}`, job.id));
+                const option = new Option(`${job.filename || job.id} — ${job.status || 'статус неизвестен'}`, job.id);
+                option.dataset.status = job.status || ''; option.dataset.filename = job.filename || job.id;
+                historySelect.add(option);
             }
             if (selectedJobId && !Array.from(historySelect.options).some(option => option.value === selectedJobId)) {
                 historySelect.add(new Option(selectedJobId, selectedJobId));
@@ -1138,8 +1177,11 @@
             if (job.error) errorOutput.textContent = typeof job.error === 'string' ? job.error : JSON.stringify(job.error);
             const active = ['uploading', 'queued', 'processing', 'cancel_requested'].includes(status);
             isProcessing = active;
+            cancelButton.hidden = !active;
             cancelButton.disabled = !active || status === 'cancel_requested' || cancelling;
-            deleteButton.disabled = !['done', 'completed', 'error', 'failed', 'cancelled', 'canceled'].includes(status);
+            cancelButton.textContent = status === 'cancel_requested' || cancelling ? 'Отменяем…' : 'Отменить задание';
+            const historyOption = Array.from(historySelect.options).find(option => option.value === selectedJobId);
+            if (historyOption && historyOption.dataset.status !== status) { historyOption.dataset.status = status; renderHistory(); }
             if (status === 'uploading' && Number.isSafeInteger(offset)) {
                 const size = Number(job.size || currentFile?.size || 0);
                 if (size) updateUploadProgress(offset, size, offset === size);
@@ -1259,7 +1301,7 @@
             needsFile = false; cancelling = false; currentFile = null; isProcessing = false;
             volatileJobId = ''; storageWarning.textContent = '';
             errorOutput.textContent = ''; diarizeStatus.textContent = ''; clearResult(); hideUploadProgress();
-            cancelButton.disabled = true; deleteButton.disabled = true; historySelect.value = selectedJobId;
+            cancelButton.disabled = true; cancelButton.hidden = true; historySelect.value = selectedJobId;
             renderHistory();
             try { await storage('readwrite', 'selected', selectedJobId); } catch (_) {}
             if (!selectedJobId || !isCurrent(String(id), version)) return;
@@ -1330,6 +1372,7 @@
             const id = selectedJobId, version = generation;
             if (!id || cancelling) return;
             cancelling = true; cancelButton.disabled = true; clearTimeout(pollTimer);
+            cancelButton.textContent = 'Отменяем…';
             setStatus('Отправляем запрос на отмену…');
             try {
                 await api(`${jobUrl(id)}/cancel`, { method: 'POST', retryCsrf: true });
@@ -1341,10 +1384,9 @@
                 await refreshJob(id, version, true);
             }
         });
-        deleteButton.addEventListener('click', async () => {
-            const id = selectedJobId, version = generation;
-            if (!id || deleteButton.disabled) return;
-            deleteButton.disabled = true;
+        async function deleteHistoryJob(id, filename, button) {
+            if (!id || button.disabled || !window.confirm(`Удалить запись «${filename}» из истории?`)) return;
+            button.disabled = true;
             setStatus('Удаляем задание…');
             try {
                 await api(jobUrl(id), { method: 'DELETE', refreshToken: true });
@@ -1352,15 +1394,13 @@
                 if (option) option.remove();
                 let localError = false;
                 try { await deleteLocalJob(id); } catch (_) { localError = true; }
-                if (!isCurrent(id, version)) return;
-                await selectJob('');
+                if (selectedJobId === id) await selectJob('');
                 setStatus(localError ? 'Задание удалено; не удалось очистить локальные данные браузера' : 'Задание удалено');
             } catch (error) {
-                if (!isCurrent(id, version)) return;
                 setStatus('Не удалось удалить задание'); errorOutput.textContent = error.message;
-                deleteButton.disabled = false;
+                button.disabled = false;
             }
-        });
+        }
         diarizeInput.addEventListener('change', async () => {
             if (!selectedJobId) return;
             const id = selectedJobId, version = generation, value = diarizeInput.checked;
@@ -1459,7 +1499,7 @@
             event.preventDefault();
             transcribeFile(selectedFile);
         });
-        micIcon.addEventListener('click', () => {
+        recordButton.addEventListener('click', () => {
             if (mediaRecorder && mediaRecorder.state === 'recording') {
                 stopRecording();
             } else {
