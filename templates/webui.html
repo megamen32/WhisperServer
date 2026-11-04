@@ -449,11 +449,16 @@
             <div class="controls">
                 <label class="control"><span>Модель распознавания</span><select id="model-select"></select></label>
                 <label class="control switch-control">
-                    <span class="switch-line"><input type="checkbox" id="diarize"> Размечать говорящих</span>
+                    <span class="switch-line"><input type="checkbox" id="diarize" checked> Размечать говорящих</span>
                     <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
+                <button type="button" id="cancel-job" class="action" disabled>Отменить задание</button>
+                <button type="button" id="delete-job" class="action" disabled>Удалить задание</button>
                 <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
             </div>
+            <label class="control" style="margin-top:16px"><span>История заданий</span><select id="job-history"><option value="">Нет выбранного задания</option></select></label>
+            <div id="diarize-status" class="status-bar" aria-live="polite"></div>
+            <div id="storage-warning" class="error-output" role="status"></div>
             <div class="upload-track hidden"><div class="upload-bar" id="upload-bar"></div></div>
             <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
             <div class="progress-meta"><span id="speed-label">Скорость: —</span><span id="estimate-label">Ожидание: —</span></div>
@@ -466,7 +471,7 @@
                 <button type="button" class="tool-button" id="previous-match" aria-label="Предыдущее совпадение">↑</button>
                 <button type="button" class="tool-button" id="next-match" aria-label="Следующее совпадение">↓</button>
                 <button type="button" class="tool-button" id="copy-result-button" title="Скопировать расшифровку">Копировать</button>
-                <button type="button" class="tool-button accent" id="summarize-button" title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
+                <button type="button" class="tool-button accent" id="summarize-button" disabled title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
             </div>
             <article class="panel document">
                 <div class="document-heading"><h2>Расшифровка</h2><span class="document-meta" id="document-meta">Текст появится здесь после загрузки аудио</span></div>
@@ -897,177 +902,443 @@
             }
         }
 
-        async function transcribeFile(file) {
-            if (!file || isProcessing) {
-                if (isProcessing) {
-                    errorOutput.textContent = 'Подождите завершения текущей расшифровки';
-                }
-                return;
-            }
-            currentFile = file;
-            isProcessing = true;
-            segmentsProcessed = 0;
-            startTime = Date.now();
-            estimatedWait = 0;
-            transcriptContainer.innerHTML = '';
-            matchingSegments = [];
-            activeMatchIndex = -1;
-            transcriptSearch.value = '';
-            matchCount.textContent = '0 фрагментов';
-            documentMeta.textContent = file.name;
-            finalOutput.textContent = '';
-            transcriptId = '';
-            summarizeButton.disabled = true;
-            summaryPanel.hidden = true;
-            summaryText.textContent = '';
-            rawSummary = '';
-            summaryMeta.textContent = '';
-            summaryStatus.textContent = '';
-            hideCopyButton();
-            errorOutput.textContent = '';
-            progressBar.style.width = '0%';
-            showUploadProgress(file.size);
-            dropZone.classList.add('working');
-            setStatus('Загрузка файла на сервер...');
-            transcriptContainer.classList.remove('segments-hidden');
-            transcriptContainer.classList.remove('show-times');
-            showTimecodes = false;
-            toggleTimes.hidden = true;
-            const form = new FormData();
-            form.append('file', file);
-            const requestUrl = new URL('/web/transcribe', window.location.origin);
-            requestUrl.searchParams.set('stream', 'true');
-            requestUrl.searchParams.set('model', modelSelect.value || DEFAULT_MODEL);
-            requestUrl.searchParams.set('diarize', document.getElementById('diarize').checked);
+        const CHUNK_SIZE = 2 * 1024 * 1024;
+        const historySelect = document.getElementById('job-history');
+        const cancelButton = document.getElementById('cancel-job');
+        const deleteButton = document.getElementById('delete-job');
+        const diarizeInput = document.getElementById('diarize');
+        const diarizeStatus = document.getElementById('diarize-status');
+        const storageWarning = document.getElementById('storage-warning');
+        let selectedJobId = '';
+        let selectedJob = null;
+        let generation = 0;
+        let pollTimer = null;
+        let needsFile = false;
+        let cancelling = false;
+        let uploadingId = '';
+        let volatileJobId = '';
+        let apiQueue = Promise.resolve();
+        let initializationPromise;
 
-            try {
-                await refreshWebuiToken();
-            } catch (error) {
-                errorOutput.textContent = error.message;
-                cleanupProcessing({ finalMessage: 'Ошибка транскрипции', success: false });
-                return;
-            }
+        // Serialize requests so rotated one-use tokens are used in response order.
+        function api(path, options = {}) {
+            const run = async () => {
+                const refresh = async () => {
+                    const page = await fetch('/', { credentials: 'same-origin', cache: 'no-store' });
+                    if (!page.ok) throw new Error('Не удалось обновить токен текущей сессии');
+                    const html = await page.text();
+                    const match = html.match(/let webuiCsrfToken\s*=\s*("(?:[^"\\]|\\.)*")\s*;/);
+                    if (!match) throw new Error('Сервер не вернул токен текущей сессии');
+                    webuiCsrfToken = JSON.parse(match[1]);
+                };
+                if (options.refreshToken) await refresh();
+                const { refreshToken, retryCsrf, ...requestOptions } = options;
+                const send = async () => {
+                    const headers = new Headers(requestOptions.headers || {});
+                    if (requestOptions.method && requestOptions.method !== 'GET') headers.set('X-Whisper-CSRF', webuiCsrfToken);
+                    const response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...requestOptions, headers });
+                    const token = response.headers.get('X-Whisper-Next-CSRF');
+                    if (token) webuiCsrfToken = token;
+                    const payload = await response.json().catch(() => ({}));
+                    if (payload.csrf_token || payload.token) webuiCsrfToken = payload.csrf_token || payload.token;
+                    return { response, payload };
+                };
+                let { response, payload } = await send();
+                if (response.status === 403 && retryCsrf) {
+                    await refresh();
+                    ({ response, payload } = await send());
+                }
+                if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : `Ошибка сервера: ${response.status}`);
+                return payload;
+            };
+            const result = apiQueue.then(run);
+            apiQueue = result.catch(() => {});
+            return result;
+        }
+        const jobUrl = (id) => `/web/jobs/${encodeURIComponent(id)}`;
+        const unpackJob = (payload) => payload.job || payload;
+        const isCurrent = (id, version) => selectedJobId === id && generation === version;
 
-            let buffer = '';
-            let responseOffset = 0;
-            let hasFailed = false;
-
-            function fail(message) {
-                if (hasFailed) {
-                    return;
-                }
-                hasFailed = true;
-                errorOutput.textContent = message;
-                cleanupProcessing({ finalMessage: 'Ошибка транскрипции', success: false });
-                if (activeXhr && activeXhr.readyState !== 4) {
-                    activeXhr.abort();
-                }
-            }
-
-            function handlePayload(payload) {
-                if (!payload) {
-                    return;
-                }
-                if (payload.error) {
-                    fail(payload.error);
-                    return;
-                }
-                if (payload.segment) {
-                    appendSegment(payload.segment);
-                }
-                if (payload.result && payload.result.text) {
-                    finalOutput.textContent = payload.result.speaker_text || payload.result.text;
-                    showCopyButton();
-                }
-            }
-
-            function drainResponseText(text, flush = false) {
-                if (hasFailed) {
-                    return;
-                }
-                const chunk = text.slice(responseOffset);
-                responseOffset = text.length;
-                if (chunk) {
-                    buffer += chunk;
-                }
-                let newlineIndex;
-                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-                    const line = buffer.slice(0, newlineIndex).trim();
-                    buffer = buffer.slice(newlineIndex + 1);
-                    if (!line) {
-                        continue;
+        function database() {
+            return new Promise((resolve, reject) => {
+                if (!window.indexedDB) { reject(new Error('IndexedDB недоступна')); return; }
+                const request = indexedDB.open('whisper-web-jobs', 1);
+                request.onupgradeneeded = () => request.result.createObjectStore('data');
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error || new Error('IndexedDB недоступна'));
+                request.onblocked = () => reject(new Error('IndexedDB заблокирована'));
+            });
+        }
+        async function storage(mode, key, value) {
+            const db = await database();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('data', mode);
+                const store = tx.objectStore('data');
+                const request = mode === 'readonly' ? store.get(key) : value === undefined ? store.delete(key) : store.put(value, key);
+                let result;
+                request.onsuccess = () => { result = request.result; };
+                tx.oncomplete = () => { db.close(); resolve(result); };
+                tx.onerror = tx.onabort = () => { db.close(); reject(tx.error || new Error('Ошибка IndexedDB')); };
+            });
+        }
+        function tabPendingIds() {
+            try { const ids = JSON.parse(sessionStorage.getItem('whisper-pending-ids') || '[]'); return Array.isArray(ids) ? ids : []; }
+            catch (_) { return []; }
+        }
+        function rememberPending(id, add) {
+            const ids = tabPendingIds().filter(item => item !== id);
+            if (add) ids.push(id);
+            sessionStorage.setItem('whisper-pending-ids', JSON.stringify(ids));
+        }
+        async function deleteLocalJob(id) {
+            const db = await database();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('data', 'readwrite');
+                const store = tx.objectStore('data');
+                store.delete(`blob:${id}`);
+                store.delete(`summary:${id}`);
+                const cursor = store.openCursor(IDBKeyRange.bound(`summary:${id}:`, `summary:${id}:\uffff`));
+                cursor.onsuccess = () => { if (cursor.result) { cursor.result.delete(); cursor.result.continue(); } };
+                tx.oncomplete = () => { db.close(); resolve(); };
+                tx.onerror = tx.onabort = () => { db.close(); reject(tx.error || new Error('Ошибка очистки IndexedDB')); };
+            });
+        }
+        async function pendingTransaction(pending, jobId = null) {
+            const db = await database();
+            const requestId = pending.settings.client_request_id;
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('data', 'readwrite');
+                const store = tx.objectStore('data');
+                const index = store.get('pending-index');
+                index.onsuccess = () => {
+                    const ids = Array.isArray(index.result) ? index.result.filter(id => id !== requestId) : [];
+                    if (jobId === null) {
+                        ids.push(requestId);
+                        store.put(pending, `pending:${requestId}`);
+                    } else {
+                        store.put(pending.file, `blob:${jobId}`);
+                        store.put(jobId, 'selected');
+                        store.delete(`pending:${requestId}`);
                     }
-                    try {
-                        const payload = JSON.parse(line);
-                        handlePayload(payload);
-                    } catch (error) {
-                        fail('Ошибка разбора ответа сервера');
+                    store.put(ids, 'pending-index');
+                };
+                tx.oncomplete = () => { db.close(); resolve(); };
+                tx.onerror = tx.onabort = () => { db.close(); reject(tx.error || new Error('Не удалось сохранить задание')); };
+            });
+        }
+        async function createPendingJob(pending, durable = true) {
+            const job = unpackJob(await api('/web/jobs', { method: 'POST', refreshToken: true,
+                headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending.settings) }));
+            if (!job.id) throw new Error('Сервер не вернул ID задания');
+            const id = String(job.id);
+            if (durable) { await pendingTransaction(pending, id); try { rememberPending(pending.settings.client_request_id, false); } catch (_) {} }
+            volatileJobId = durable ? '' : id;
+            ++generation; const version = generation; clearTimeout(pollTimer);
+            selectedJobId = id; selectedJob = job; currentFile = pending.file; clearResult();
+            if (!Array.from(historySelect.options).some(option => option.value === id)) {
+                historySelect.add(new Option(pending.settings.filename, id));
+            }
+            historySelect.value = id;
+            errorOutput.textContent = '';
+            await refreshJob(id, version, true);
+        }
+        function clearResult() {
+            segmentsProcessed = 0; matchingSegments = []; activeMatchIndex = -1;
+            transcriptContainer.replaceChildren(); finalOutput.textContent = ''; documentMeta.textContent = 'Выберите задание или загрузите аудио';
+            transcriptId = ''; summarizeButton.disabled = true; hideCopyButton();
+            summaryPanel.hidden = true; summaryText.textContent = ''; rawSummary = '';
+            summaryMeta.textContent = ''; summaryStatus.textContent = '';
+            toggleTimes.hidden = true; progressBar.style.width = '0%'; updateMatchCount();
+        }
+        async function loadHistory() {
+            const data = await api('/web/jobs');
+            const jobs = Array.isArray(data) ? data : data.jobs;
+            if (!Array.isArray(jobs)) throw new Error('Сервер не вернул историю заданий');
+            historySelect.replaceChildren(new Option('Выберите задание', ''));
+            for (const item of jobs) {
+                const job = unpackJob(item);
+                if (!job.id) continue;
+                historySelect.add(new Option(`${job.filename || job.id} — ${job.status || 'статус неизвестен'}`, job.id));
+            }
+            if (selectedJobId && !Array.from(historySelect.options).some(option => option.value === selectedJobId)) {
+                historySelect.add(new Option(selectedJobId, selectedJobId));
+            }
+            historySelect.value = selectedJobId;
+        }
+        function renderJob(job, offset) {
+            selectedJob = job;
+            const status = job.status || 'unknown';
+            const labels = { uploading: 'Загрузка файла', queued: 'В очереди', processing: 'Обработка',
+                cancel_requested: 'Отмена запрошена', cancelled: 'Отменено', canceled: 'Отменено',
+                done: 'Готово', completed: 'Готово', error: 'Ошибка обработки', failed: 'Ошибка обработки' };
+            setStatus(`${labels[status] || `Статус сервера: ${status}`} · попытка ${job.attempt ?? '—'}`);
+            if (job.error) errorOutput.textContent = typeof job.error === 'string' ? job.error : JSON.stringify(job.error);
+            const active = ['uploading', 'queued', 'processing', 'cancel_requested'].includes(status);
+            isProcessing = active;
+            cancelButton.disabled = !active || status === 'cancel_requested' || cancelling;
+            deleteButton.disabled = !['done', 'completed', 'error', 'failed', 'cancelled', 'canceled'].includes(status);
+            if (status === 'uploading' && Number.isSafeInteger(offset)) {
+                const size = Number(job.size || currentFile?.size || 0);
+                if (size) updateUploadProgress(offset, size, offset === size);
+            } else hideUploadProgress();
+            if (status === 'done' || status === 'completed') {
+                const result = job.result || job;
+                clearResult();
+                for (const segment of (Array.isArray(result.segments) ? result.segments : [])) appendSegment(segment);
+                finalOutput.textContent = result.speaker_text || result.text || '';
+                transcriptId = result.transcript_id || job.transcript_id || '';
+                summarizeButton.disabled = !transcriptId;
+                if (segmentsProcessed || finalOutput.textContent) showCopyButton();
+                toggleTimes.hidden = !segmentsProcessed;
+                documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${job.filename || 'аудиофайл'}`;
+                progressBar.style.width = '100%';
+                if (!segmentsProcessed && !finalOutput.textContent) setStatus('Задание готово, но сервер не вернул текст');
+            }
+            const setting = typeof job.diarize === 'boolean' ? job.diarize :
+                typeof job.diarization === 'boolean' ? job.diarization : job.diarization?.diarize;
+            if (typeof setting === 'boolean' && !diarizeInput.disabled) diarizeInput.checked = setting;
+        }
+        function displaySummary(text, html) {
+            rawSummary = text || '';
+            if (typeof html === 'string') summaryText.innerHTML = html;
+            else summaryText.textContent = rawSummary;
+        }
+        async function restoreSummary(id, version, job) {
+            const attempt = job.attempt;
+            if (!Number.isSafeInteger(attempt)) return;
+            const current = () => isCurrent(id, version) && selectedJob?.attempt === attempt && ['done', 'completed'].includes(selectedJob.status);
+            const server = job.summaries?.latest;
+            // Server summaries belong to the current attempt: backend clears them on retry
+            // and saves them only with the matching attempt. Honor an explicit attempt if present.
+            if (server && typeof server.summary === 'string' && (server.attempt == null || server.attempt === attempt)) {
+                if (!current()) return;
+                displaySummary(server.summary, server.summary_html);
+                summaryMeta.textContent = server.model || 'Сохранено на сервере';
+                summaryStatus.textContent = 'Восстановлено с сервера'; summaryPanel.hidden = false;
+                return;
+            }
+            try {
+                const saved = await storage('readonly', `summary:${id}:${attempt}`);
+                if (!current() || !saved || saved.attempt !== attempt || saved.transcriptId !== transcriptId) return;
+                displaySummary(saved.text, saved.summary_html);
+                summaryMeta.textContent = 'Локальная копия'; summaryStatus.textContent = 'Восстановлено из браузера';
+                summaryPanel.hidden = false;
+            } catch (_) {}
+        }
+        async function refreshJob(id, version, resume = false) {
+            try {
+                const data = await api(jobUrl(id));
+                if (!isCurrent(id, version)) return;
+                const job = unpackJob(data);
+                if (String(job.id) !== id) throw new Error('Сервер вернул другое задание');
+                const offset = data.offset ?? job.offset;
+                renderJob(job, offset);
+                if (job.status === 'uploading' && resume && uploadingId !== id) {
+                    let file;
+                    if (volatileJobId === id) file = currentFile;
+                    else try { file = await storage('readonly', `blob:${id}`); } catch (_) {}
+                    if (!isCurrent(id, version)) return;
+                    if (!(file instanceof Blob)) {
+                        needsFile = true;
+                        setStatus('Копия файла недоступна. При повторном выборе прежнее задание будет отменено, а файл загружен заново в новом задании');
                         return;
                     }
+                    currentFile = file;
+                    await uploadJob(id, version, file, offset);
+                    return;
                 }
-                if (flush) {
-                    const tail = buffer.trim();
-                    if (tail) {
-                        try {
-                            const payload = JSON.parse(tail);
-                            handlePayload(payload);
-                        } catch (error) {
-                            fail('Ошибка разбора ответа сервера');
-                        }
+                if (['done', 'completed'].includes(job.status)) await restoreSummary(id, version, job);
+                if (['uploading', 'queued', 'processing', 'cancel_requested'].includes(job.status) && uploadingId !== id) {
+                    clearTimeout(pollTimer);
+                    pollTimer = setTimeout(() => refreshJob(id, version, job.status === 'uploading'), 1800);
+                }
+            } catch (error) {
+                if (!isCurrent(id, version)) return;
+                setStatus('Не удалось получить состояние задания; повторяем');
+                errorOutput.textContent = error.message;
+                pollTimer = setTimeout(() => refreshJob(id, version, true), 3000);
+            }
+        }
+        async function uploadJob(id, version, file, offset) {
+            if (uploadingId === id) return;
+            uploadingId = id;
+            showUploadProgress(file.size);
+            try {
+                if (!Number.isSafeInteger(offset) || offset < 0 || offset > file.size) throw new Error('Сервер вернул некорректное смещение загрузки');
+                while (offset < file.size && isCurrent(id, version) && !cancelling) {
+                    updateUploadProgress(offset, file.size);
+                    const end = Math.min(offset + CHUNK_SIZE, file.size);
+                    const response = await api(`${jobUrl(id)}/upload?offset=${offset}`, {
+                        method: 'PUT', retryCsrf: true, headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(offset, end)
+                    });
+                    if (!isCurrent(id, version) || cancelling) return;
+                    if (!Number.isSafeInteger(response.offset) || response.offset !== end) throw new Error('Сервер вернул неожиданное смещение загрузки');
+                    offset = response.offset;
+                }
+                if (!isCurrent(id, version) || cancelling) return;
+                updateUploadProgress(offset, file.size, true);
+                setStatus('Файл загружен. Запуск обработки…');
+                await api(`${jobUrl(id)}/start`, { method: 'POST', retryCsrf: true });
+                if (!isCurrent(id, version)) return;
+                try { await storage('readwrite', `blob:${id}`); } catch (_) {}
+                if (uploadingId === id) uploadingId = '';
+                await refreshJob(id, version);
+            } catch (error) {
+                if (!isCurrent(id, version) || cancelling) return;
+                errorOutput.textContent = `${error.message}. Проверяем состояние на сервере.`;
+                setStatus('Загрузка прервана; повторное подключение');
+                pollTimer = setTimeout(() => refreshJob(id, version, true), 3000);
+            } finally { if (uploadingId === id) uploadingId = ''; }
+        }
+        async function selectJob(id) {
+            ++generation; const version = generation;
+            clearTimeout(pollTimer); selectedJobId = String(id || ''); selectedJob = null;
+            needsFile = false; cancelling = false; currentFile = null; isProcessing = false;
+            volatileJobId = ''; storageWarning.textContent = '';
+            errorOutput.textContent = ''; diarizeStatus.textContent = ''; clearResult(); hideUploadProgress();
+            cancelButton.disabled = true; deleteButton.disabled = true; historySelect.value = selectedJobId;
+            try { await storage('readwrite', 'selected', selectedJobId); } catch (_) {}
+            if (!selectedJobId || !isCurrent(String(id), version)) return;
+            setStatus('Получаем состояние задания…');
+            await refreshJob(selectedJobId, version, true);
+        }
+        async function transcribeFile(file) {
+            if (!file) return;
+            if (initializationPromise) await initializationPromise;
+            if (needsFile && selectedJobId && selectedJob?.status === 'uploading') {
+                const oldId = selectedJobId, version = generation;
+                needsFile = false; cancelling = true; cancelButton.disabled = true;
+                setStatus('Исходная копия утрачена. Отменяем прежнее задание перед новой загрузкой…');
+                try {
+                    await api(`${jobUrl(oldId)}/cancel`, { method: 'POST', refreshToken: true, retryCsrf: true });
+                    const data = await api(jobUrl(oldId));
+                    if (!isCurrent(oldId, version)) return;
+                    const oldJob = unpackJob(data);
+                    if (!['cancelled', 'canceled'].includes(oldJob.status)) {
+                        throw new Error('Сервер ещё не подтвердил отмену прежнего задания');
                     }
-                    buffer = '';
+                    cancelling = false; isProcessing = false; selectedJob = oldJob;
+                    errorOutput.textContent = '';
+                    setStatus('Прежнее задание отменено. Создаём новое и загружаем файл с начала');
+                } catch (error) {
+                    if (!isCurrent(oldId, version)) return;
+                    cancelling = false; needsFile = true; cancelButton.disabled = false;
+                    setStatus('Новое задание не создано: отмена прежнего не подтверждена');
+                    errorOutput.textContent = error.message;
+                    return;
                 }
             }
-
-            const xhr = new XMLHttpRequest();
-            activeXhr = xhr;
-            xhr.open('POST', requestUrl.toString(), true);
-            xhr.responseType = 'text';
-            xhr.setRequestHeader('X-Whisper-CSRF', webuiCsrfToken);
-            xhr.upload.addEventListener('progress', (event) => {
-                if (event.lengthComputable) {
-                    updateUploadProgress(event.loaded, event.total);
+            if (isProcessing) { errorOutput.textContent = 'Сначала дождитесь завершения или отмените текущее задание'; return; }
+            isProcessing = true; errorOutput.textContent = ''; setStatus('Сохраняем файл перед созданием задания…');
+            const bytes = new Uint8Array(16);
+            crypto.getRandomValues(bytes);
+            const clientRequestId = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+            const pending = { file, settings: { filename: file.name, size: file.size,
+                model: modelSelect.value || DEFAULT_MODEL, diarize: diarizeInput.checked,
+                client_request_id: clientRequestId } };
+            let durable = true;
+            storageWarning.textContent = '';
+            try {
+                // One transaction commits the Blob, request id and all settings before POST.
+                rememberPending(clientRequestId, true);
+                await pendingTransaction(pending);
+            } catch (_) {
+                durable = false;
+                try { rememberPending(clientRequestId, false); } catch (_) {}
+                storageWarning.textContent = 'Файл не сохранён в браузере. После перезагрузки может потребоваться выбрать его снова и начать загрузку заново.';
+            }
+            setStatus('Создание задания…');
+            try {
+                await createPendingJob(pending, durable);
+            } catch (error) {
+                if (durable) {
+                    setStatus('Создание задания не подтверждено. Перезагрузите страницу для безопасного повтора');
+                    errorOutput.textContent = `${error.message}. Файл и идентификатор запроса сохранены.`;
                 } else {
-                    updateUploadProgress(event.loaded, file.size);
+                    isProcessing = false;
+                    setStatus('Создание задания не подтверждено. Проверьте историю перед повторной отправкой');
+                    errorOutput.textContent = `${error.message}. Файл и идентификатор запроса не сохранены; задание могло быть создано.`;
                 }
-            });
-            xhr.upload.addEventListener('load', () => {
-                updateUploadProgress(file.size, file.size, true);
-                hideUploadProgress(true);
-                setStatus('Файл загружен. Обработка на сервере...');
-                refreshStatus();
-                statusInterval = setInterval(refreshStatus, 1800);
-            });
-            xhr.addEventListener('progress', () => {
-                drainResponseText(xhr.responseText);
-            });
-            xhr.addEventListener('error', () => {
-                fail('Ошибка сети при загрузке');
-            });
-            xhr.addEventListener('load', () => {
-                if (hasFailed) {
+            }
+        }
+        historySelect.addEventListener('change', () => selectJob(historySelect.value));
+        cancelButton.addEventListener('click', async () => {
+            const id = selectedJobId, version = generation;
+            if (!id || cancelling) return;
+            cancelling = true; cancelButton.disabled = true; clearTimeout(pollTimer);
+            setStatus('Отправляем запрос на отмену…');
+            try {
+                await api(`${jobUrl(id)}/cancel`, { method: 'POST', retryCsrf: true });
+                if (!isCurrent(id, version)) return;
+                cancelling = false; await refreshJob(id, version);
+            } catch (error) {
+                if (!isCurrent(id, version)) return;
+                cancelling = false; errorOutput.textContent = `Не удалось запросить отмену: ${error.message}`;
+                await refreshJob(id, version, true);
+            }
+        });
+        deleteButton.addEventListener('click', async () => {
+            const id = selectedJobId, version = generation;
+            if (!id || deleteButton.disabled) return;
+            deleteButton.disabled = true;
+            setStatus('Удаляем задание…');
+            try {
+                await api(jobUrl(id), { method: 'DELETE', refreshToken: true });
+                const option = Array.from(historySelect.options).find(item => item.value === id);
+                if (option) option.remove();
+                let localError = false;
+                try { await deleteLocalJob(id); } catch (_) { localError = true; }
+                if (!isCurrent(id, version)) return;
+                await selectJob('');
+                setStatus(localError ? 'Задание удалено; не удалось очистить локальные данные браузера' : 'Задание удалено');
+            } catch (error) {
+                if (!isCurrent(id, version)) return;
+                setStatus('Не удалось удалить задание'); errorOutput.textContent = error.message;
+                deleteButton.disabled = false;
+            }
+        });
+        diarizeInput.addEventListener('change', async () => {
+            if (!selectedJobId) return;
+            const id = selectedJobId, version = generation, value = diarizeInput.checked;
+            diarizeInput.disabled = true; diarizeStatus.textContent = 'Ожидаем применения настройки…';
+            try {
+                await api(jobUrl(id), { method: 'PATCH', retryCsrf: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ diarize: value }) });
+                if (!isCurrent(id, version)) return;
+                diarizeStatus.textContent = 'Изменение принято сервером; применение зависит от состояния задания';
+                await refreshJob(id, version);
+            } catch (error) {
+                if (!isCurrent(id, version)) return;
+                diarizeInput.checked = !value; diarizeStatus.textContent = `Изменение не принято: ${error.message}`;
+            } finally { diarizeInput.disabled = false; }
+        });
+        async function initializeJobs() {
+            isProcessing = true;
+            let id = '', legacyPending;
+            try {
+                id = await storage('readonly', 'selected');
+                legacyPending = await storage('readonly', 'pending-create');
+            } catch (_) {}
+            try { await loadHistory(); } catch (error) { setStatus(`История недоступна: ${error.message}`); }
+            for (const requestId of tabPendingIds()) {
+                let pending;
+                try { pending = await storage('readonly', `pending:${requestId}`); }
+                catch (_) { setStatus('Не удалось прочитать сохранённое задание'); return; }
+                if (!pending) { try { rememberPending(requestId, false); } catch (_) {} continue; }
+                if (!(pending.file instanceof Blob) || pending.settings?.client_request_id !== requestId) {
+                    setStatus('Не удалось восстановить сохранённый запрос'); return;
+                }
+                setStatus('Восстанавливаем создание задания…');
+                try { await createPendingJob(pending); }
+                catch (error) {
+                    setStatus('Не удалось восстановить создание. Перезагрузите страницу для повтора');
+                    errorOutput.textContent = `${error.message}. Файл и идентификатор запроса сохранены.`;
                     return;
                 }
-                if (xhr.status < 200 || xhr.status >= 300) {
-                    fail(xhr.responseText || `Ошибка: ${xhr.status}`);
-                    return;
-                }
-                const nextToken = xhr.getResponseHeader('X-Whisper-Next-CSRF');
-                if (nextToken) {
-                    webuiCsrfToken = nextToken;
-                }
-                // The server keeps the transcript and hands out only an id:
-                // summarisation sends that id, never the text.
-                const newTranscriptId = xhr.getResponseHeader('X-Whisper-Transcript-Id');
-                if (newTranscriptId) {
-                    transcriptId = newTranscriptId;
-                    summarizeButton.disabled = false;
-                }
-                drainResponseText(xhr.responseText, true);
-                cleanupProcessing({ finalMessage: 'Готово', success: true });
-            });
-            updateUploadProgress(0, file.size);
-            xhr.send(form);
+            }
+            if (!selectedJobId) { isProcessing = false; if (id) await selectJob(id); }
+            if (legacyPending) {
+                storageWarning.textContent = 'Найден незавершённый запрос старой версии. Проверьте историю заданий; автоматический повтор недоступен.';
+            }
         }
 
         function getClipboardFile(clipboardData) {
@@ -1113,6 +1384,7 @@
         });
         fileInput.addEventListener('change', () => {
             const selectedFile = fileInput.files?.[0];
+            fileInput.value = '';
             transcribeFile(selectedFile);
         });
         document.addEventListener('paste', (event) => {
@@ -1185,43 +1457,31 @@
                 summaryStatus.textContent = 'Сначала дождитесь окончания расшифровки';
                 return;
             }
+            const summaryJobId = selectedJobId, summaryGeneration = generation, summaryTranscriptId = transcriptId, summaryAttempt = selectedJob?.attempt;
             isSummarizing = true;
             summarizeButton.disabled = true;
             summaryPanel.hidden = false;
             summaryStatus.textContent = 'Суммаризация…';
             summaryMeta.textContent = '';
             try {
-                // The one-use CSRF token from the transcription response is
-                // still valid: refreshing it would rotate the session and the
-                // transcript would no longer belong to it.
-                const response = await fetch('/web/summarize', {
-                    method: 'POST',
-                    credentials: 'same-origin',
-                    cache: 'no-store',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Whisper-CSRF': webuiCsrfToken,
-                    },
-                    // Only the id travels: the text and the model key stay on the server.
-                    body: JSON.stringify({ transcript_id: transcriptId }),
+                const payload = await api('/web/summarize', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ transcript_id: summaryTranscriptId }),
                 });
-                const nextToken = response.headers.get('X-Whisper-Next-CSRF');
-                if (nextToken) {
-                    webuiCsrfToken = nextToken;
-                }
-                const payload = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    throw new Error(payload.detail || `Ошибка: ${response.status}`);
-                }
+                if (!isCurrent(summaryJobId, summaryGeneration)) return;
+                const fresh = unpackJob(await api(jobUrl(summaryJobId)));
+                if (!isCurrent(summaryJobId, summaryGeneration) || fresh.attempt !== summaryAttempt || fresh.status !== 'done') return;
                 rawSummary = payload.summary || '';
-                summaryText.innerHTML = payload.summary_html || '';
+                try { await storage('readwrite', `summary:${summaryJobId}:${summaryAttempt}`, { text: rawSummary, summary_html: payload.summary_html, transcriptId: summaryTranscriptId, attempt: summaryAttempt }); } catch (_) {}
+                if (!isCurrent(summaryJobId, summaryGeneration) || selectedJob?.attempt !== summaryAttempt) return;
+                displaySummary(rawSummary, payload.summary_html);
                 summaryMeta.textContent = `${payload.model || 'модель неизвестна'} · ${(payload.source_chars || 0).toLocaleString('ru-RU')} симв.`;
                 summaryStatus.textContent = 'Готово';
             } catch (error) {
-                summaryStatus.textContent = error.message || 'Не удалось суммаризировать';
+                if (isCurrent(summaryJobId, summaryGeneration)) summaryStatus.textContent = error.message || 'Не удалось суммаризировать';
             } finally {
                 isSummarizing = false;
-                summarizeButton.disabled = !transcriptId;
+                if (isCurrent(summaryJobId, summaryGeneration)) summarizeButton.disabled = !transcriptId;
             }
         });
 
@@ -1230,18 +1490,11 @@
         });
 
         modelSelect.addEventListener('change', () => {
-            if (!currentFile) {
-                return;
-            }
-            if (isProcessing) {
-                pendingReprocess = true;
-                setStatus('Подождите завершения текущей расшифровки — новая модель будет применена автоматически');
-            } else {
-                transcribeFile(currentFile);
-            }
+            setStatus('Модель будет применена к следующему заданию');
         });
 
         loadModels();
+        initializationPromise = initializeJobs();
     </script>
 </body>
 </html>
