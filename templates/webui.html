@@ -336,6 +336,20 @@
         button, select, input { color: inherit; }
         button:focus-visible, input:focus-visible, select:focus-visible, #drop-zone:focus-visible { outline: 2px solid #7ec9ff; outline-offset: 2px; }
         .page { width: min(1100px, 100%); margin: 0 auto; padding: 38px 28px 100px; display: block; }
+        .history-sidebar { position: fixed; inset: 0 auto 0 0; width: 260px; padding: 22px 12px; background: #121923; border-right: 1px solid #293445; overflow-y: auto; z-index: 5; }
+        .history-sidebar h2 { margin: 0 8px 18px; font-size: 1rem; }
+        .history-list { display: grid; gap: 4px; }
+        .history-item { border: 0; border-radius: 9px; padding: 11px; background: transparent; color: #c8d2df; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+        .history-item:hover, .history-item[aria-current="true"] { background: #263343; color: white; }
+        .history-empty { padding: 10px; color: #8291a5; font-size: .85rem; }
+        .history-toggle { display: none; }
+        @media (min-width: 901px) { .page { width: min(1100px, calc(100% - 260px)); margin-left: calc(260px + max(0px, (100% - 260px - 1100px) / 2)); } }
+        @media (max-width: 900px) { .history-sidebar { transform: translateX(-100%); transition: transform .2s ease; box-shadow: 12px 0 30px #0008; } .history-sidebar.open { transform: translateX(0); } .history-toggle { display: inline-block; margin: 0 0 14px; } }
+        .byok-settings { margin-top: 14px; padding: 14px; border: 1px solid #344154; border-radius: 12px; }
+        .byok-settings summary { cursor: pointer; color: #c5d7e8; }
+        .byok-fields { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 10px; margin-top: 12px; }
+        .byok-fields input, .byok-fields select { width: 100%; min-height: 42px; padding: 8px; border: 1px solid #374559; border-radius: 8px; background: #101721; }
+        .byok-field[hidden] { display: none; }
         .brand { margin-bottom: 24px; }
         .eyebrow { color: #8fa2ba; font-size: .76rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
         h1 { margin: 7px 0 0; font-size: clamp(1.8rem, 4vw, 2.65rem); letter-spacing: -.04em; }
@@ -429,7 +443,13 @@
     </style>
 </head>
 <body>
+    <aside class="history-sidebar" id="history-sidebar" aria-label="История расшифровок">
+        <button type="button" class="tool-button history-toggle" id="history-close" aria-label="Закрыть историю">✕</button>
+        <h2>История расшифровок</h2>
+        <nav class="history-list" id="history-list" aria-label="Прошлые задания"></nav>
+    </aside>
     <main class="page">
+        <button type="button" class="tool-button history-toggle" id="history-toggle" aria-controls="history-sidebar" aria-expanded="false">☰ История</button>
         <header class="brand">
             <div class="eyebrow">Whisper Studio</div>
             <h1>Расшифровка аудио</h1>
@@ -456,7 +476,7 @@
                 <button type="button" id="delete-job" class="action" disabled>Удалить задание</button>
                 <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
             </div>
-            <label class="control" style="margin-top:16px"><span>История заданий</span><select id="job-history"><option value="">Нет выбранного задания</option></select></label>
+            <select id="job-history" hidden aria-label="История заданий"><option value="">Нет выбранного задания</option></select>
             <div id="diarize-status" class="status-bar" aria-live="polite"></div>
             <div id="storage-warning" class="error-output" role="status"></div>
             <div class="upload-track hidden"><div class="upload-bar" id="upload-bar"></div></div>
@@ -473,6 +493,17 @@
                 <button type="button" class="tool-button" id="copy-result-button" title="Скопировать расшифровку">Копировать</button>
                 <button type="button" class="tool-button accent" id="summarize-button" disabled title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
             </div>
+            <details class="byok-settings">
+                <summary>Настройки суммаризации</summary>
+                <div class="byok-fields">
+                    <label class="control">Провайдер<select id="summary-provider"><option value="">Стандартный</option></select></label>
+                    <label class="control byok-field" hidden>Формат API<select id="byok-format"><option value="chat-completions">OpenAI-compatible</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic</option></select></label>
+                    <label class="control byok-field" hidden>Адрес API<input id="byok-url" type="url" placeholder="https://…" autocomplete="off"></label>
+                    <label class="control byok-field" hidden>Модель<input id="byok-model" type="text" autocomplete="off"></label>
+                    <label class="control byok-field" hidden>API-ключ<input id="byok-key" type="password" autocomplete="off"></label>
+                </div>
+                <small>Свой ключ используется для выбранного провайдера и хранится только до закрытия страницы.</small>
+            </details>
             <article class="panel document">
                 <div class="document-heading"><h2>Расшифровка</h2><span class="document-meta" id="document-meta">Текст появится здесь после загрузки аудио</span></div>
                 <div id="transcript" class="transcript-container" aria-live="polite"><div class="empty-state">Загрузите аудиофайл, чтобы начать.<br>Расшифровка будет показана целиком в документе ниже.</div></div>
@@ -904,6 +935,37 @@
 
         const CHUNK_SIZE = 2 * 1024 * 1024;
         const historySelect = document.getElementById('job-history');
+        const historyList = document.getElementById('history-list');
+        const historySidebar = document.getElementById('history-sidebar');
+        const historyToggle = document.getElementById('history-toggle');
+        const summaryProvider = document.getElementById('summary-provider');
+        let byokPresets = [];
+        function renderHistory() {
+            historyList.replaceChildren();
+            const options = Array.from(historySelect.options).filter(option => option.value);
+            if (!options.length) {
+                const empty = document.createElement('div'); empty.className = 'history-empty'; empty.textContent = 'Здесь появятся ваши записи'; historyList.appendChild(empty);
+            }
+            for (const option of options.reverse()) {
+                const button = document.createElement('button'); button.type = 'button'; button.className = 'history-item';
+                button.textContent = option.textContent; button.setAttribute('aria-current', String(option.value === selectedJobId));
+                button.addEventListener('click', () => { selectJob(option.value); historySidebar.classList.remove('open'); historyToggle.setAttribute('aria-expanded', 'false'); });
+                historyList.appendChild(button);
+            }
+        }
+        historyToggle.addEventListener('click', () => { const open = historySidebar.classList.toggle('open'); historyToggle.setAttribute('aria-expanded', String(open)); });
+        document.getElementById('history-close').addEventListener('click', () => { historySidebar.classList.remove('open'); historyToggle.setAttribute('aria-expanded', 'false'); });
+        new MutationObserver(renderHistory).observe(historySelect, { childList: true, subtree: true, characterData: true });
+        fetch('/web/byok/presets').then(response => response.ok ? response.json() : []).then(presets => {
+            byokPresets = presets; for (const preset of presets) summaryProvider.add(new Option(preset.label, preset.id));
+        }).catch(() => {});
+        summaryProvider.addEventListener('change', () => {
+            const preset = byokPresets.find(item => item.id === summaryProvider.value);
+            // A key belongs to the previous provider; never carry it to another.
+            document.getElementById('byok-key').value = '';
+            for (const field of document.querySelectorAll('.byok-field')) field.hidden = !preset;
+            if (preset) { document.getElementById('byok-format').value = preset.apiFormat; document.getElementById('byok-url').value = preset.baseUrl; document.getElementById('byok-model').value = preset.modelId; }
+        });
         const cancelButton = document.getElementById('cancel-job');
         const deleteButton = document.getElementById('delete-job');
         const diarizeInput = document.getElementById('diarize');
@@ -1197,6 +1259,7 @@
             volatileJobId = ''; storageWarning.textContent = '';
             errorOutput.textContent = ''; diarizeStatus.textContent = ''; clearResult(); hideUploadProgress();
             cancelButton.disabled = true; deleteButton.disabled = true; historySelect.value = selectedJobId;
+            renderHistory();
             try { await storage('readwrite', 'selected', selectedJobId); } catch (_) {}
             if (!selectedJobId || !isCurrent(String(id), version)) return;
             setStatus('Получаем состояние задания…');
@@ -1464,9 +1527,16 @@
             summaryStatus.textContent = 'Суммаризация…';
             summaryMeta.textContent = '';
             try {
+                const request = { transcript_id: summaryTranscriptId };
+                if (summaryProvider.value) request.byok = {
+                    apiFormat: document.getElementById('byok-format').value,
+                    baseUrl: document.getElementById('byok-url').value,
+                    modelId: document.getElementById('byok-model').value,
+                    apiKey: document.getElementById('byok-key').value,
+                };
                 const payload = await api('/web/summarize', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ transcript_id: summaryTranscriptId }),
+                    body: JSON.stringify(request),
                 });
                 if (!isCurrent(summaryJobId, summaryGeneration)) return;
                 const fresh = unpackJob(await api(jobUrl(summaryJobId)));

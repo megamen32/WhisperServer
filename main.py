@@ -62,6 +62,12 @@ _summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="web-su
 _summary_slots = threading.BoundedSemaphore(2)
 
 
+def _web_asset(name, *, template=False):
+    """Locate web assets in a checkout/release or an installed wheel."""
+    local = Path(__file__).parent / ("templates" if template else "") / name
+    return local if local.is_file() else Path(sys.prefix) / "share" / "whisperserver" / name
+
+
 async def _summary_open(opener, upstream):
     """Limit blocking gateway calls without occupying the event loop or a queue."""
     if not _summary_slots.acquire(blocking=False):
@@ -78,6 +84,33 @@ async def _summary_open(opener, upstream):
         raise
     future.add_done_callback(lambda _: _summary_slots.release())
     return await asyncio.wrap_future(future)
+
+
+async def _run_byok(config, system, prompt):
+    """Run the BYOK adapter with credentials in a private stdin pipe."""
+    if not _summary_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Суммаризация занята, попробуйте позже")
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "node", str(_web_asset("byok_bridge.mjs")),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "NODE_OPTIONS": "--max-old-space-size=192"},
+        )
+        data = json.dumps({"config": config, "system": system, "prompt": prompt}).encode()
+        stdout, _ = await asyncio.wait_for(process.communicate(data), timeout=250)
+        result = json.loads(stdout)
+        if process.returncode or not isinstance(result.get("text"), str) or not result["text"].strip():
+            raise HTTPException(status_code=502, detail="Не удалось получить ответ провайдера. Проверьте ключ, адрес и модель.")
+        return result["text"].strip()
+    except (OSError, ValueError, asyncio.TimeoutError):
+        raise HTTPException(status_code=502, detail="Не удалось подключиться к провайдеру")
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        _summary_slots.release()
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -815,7 +848,7 @@ pending_results = {}
 pending_streams = {}
 model_usage = None
 
-TEMPLATE_PATH = Path(__file__).parent / "templates" / "webui.html"
+TEMPLATE_PATH = _web_asset("webui.html", template=True)
 BOT_SCRIPT_PATH = Path(__file__).parent / "telegram_bot.py"
 
 app = FastAPI()
@@ -2055,6 +2088,11 @@ async def web_transcribe(
             _fill_webui_transcript(transcript_id, text)
     return response
 
+@app.get("/web/byok/presets")
+async def web_byok_presets():
+    return JSONResponse(json.loads(_web_asset("byok-presets.json", template=True).read_text()))
+
+
 @app.post("/web/summarize")
 async def web_summarize(request: Request):
     """Summarise a stored transcript through OmniRoute.
@@ -2081,8 +2119,11 @@ async def web_summarize(request: Request):
         raise HTTPException(status_code=404, detail="Unknown transcript id")
     _summary_rate_limit(session_id)
 
-    api_key = _omniroute_api_key()
-    if not api_key:
+    byok = payload.get("byok")
+    if byok is not None and not isinstance(byok, dict):
+        raise HTTPException(status_code=400, detail="Некорректные настройки провайдера")
+    api_key = _omniroute_api_key() if byok is None else None
+    if byok is None and not api_key:
         raise HTTPException(status_code=503, detail="Summariser is not configured")
 
     instruction = str(payload.get("instruction") or "").strip()
@@ -2101,6 +2142,18 @@ async def web_summarize(request: Request):
     summary = ""
     actual_model = ""
     served_model = ""
+    if byok is not None:
+        formats = {"anthropic", "chat-completions", "responses"}
+        if (byok.get("apiFormat") not in formats or
+            not all(isinstance(byok.get(k), str) and byok[k].strip() for k in ("baseUrl", "modelId", "apiKey")) or
+            len(byok["apiKey"]) > 4096 or len(byok["modelId"]) > 256 or len(byok["baseUrl"]) > 2048):
+            raise HTTPException(status_code=400, detail="Укажите адрес, модель и ключ провайдера")
+        config = {"apiFormat": byok["apiFormat"], "baseUrl": byok["baseUrl"],
+                  "modelId": byok["modelId"], "apiKey": byok["apiKey"],
+                  "maxOutputTokens": OMNIROUTE_SUMMARY_MAX_TOKENS}
+        summary = await _run_byok(config, system_prompt, text[:OMNIROUTE_SUMMARY_MAX_CHARS])
+        actual_model = served_model = config["modelId"]
+        candidates = []
     last_error = ""
     for model in candidates:
         body = {
@@ -2170,7 +2223,7 @@ async def web_summarize(request: Request):
             "summary": summary,
             "summary_html": summary_html,
             "model": actual_model or served_model,
-            "requested_model": OMNIROUTE_SUMMARY_MODEL,
+            "requested_model": byok["modelId"] if byok is not None else OMNIROUTE_SUMMARY_MODEL,
             "served_model": served_model,
             "transcript_id": transcript_id,
             "source_chars": len(text),
