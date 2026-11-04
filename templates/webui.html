@@ -516,13 +516,14 @@
                 </div>
                 <div class="summary-text" id="summary-text"></div>
                 <div class="summary-status" id="summary-status" aria-live="polite"></div>
-                <div style="margin-top: 14px;"><button type="button" class="tool-button" id="copy-summary-button">Скопировать выжимку</button></div>
+                <div style="margin-top: 14px;"><button type="button" class="tool-button" id="copy-summary-button">Скопировать выжимку</button> <button type="button" class="tool-button" id="refresh-summary-button">Обновить выжимку</button></div>
             </section>
             <div id="error-output" class="error-output" aria-live="assertive"></div>
         </section>
     </main>
     <script>
         const DEFAULT_MODEL = __DEFAULT_MODEL__;
+        const SUMMARY_CACHE_VERSION = __SUMMARY_CACHE_VERSION__;
         let webuiCsrfToken = __WEBUI_CSRF_TOKEN__;
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
@@ -1512,7 +1513,7 @@
             }
         }
 
-        summarizeButton.addEventListener('click', async () => {
+        async function summarize(forceRefresh = false) {
             if (isSummarizing) {
                 return;
             }
@@ -1534,6 +1535,21 @@
                     modelId: document.getElementById('byok-model').value,
                     apiKey: document.getElementById('byok-key').value,
                 };
+                let localCacheKey = '';
+                try {
+                    const source = JSON.stringify({ version: SUMMARY_CACHE_VERSION, byok: request.byok || null });
+                    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(source));
+                    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+                    localCacheKey = `summary:${summaryJobId}:${summaryAttempt}:cache:${hash}`;
+                    const saved = forceRefresh ? null : await storage('readonly', localCacheKey);
+                    if (saved && Date.now() - saved.created < 30 * 24 * 60 * 60 * 1000 && isCurrent(summaryJobId, summaryGeneration) && selectedJob?.attempt === summaryAttempt) {
+                        displaySummary(saved.text, saved.summary_html);
+                        summaryMeta.textContent = saved.model || '';
+                        summaryStatus.textContent = 'Из кэша на этом устройстве';
+                        return;
+                    }
+                } catch (_) { /* The server cache remains available without IndexedDB. */ }
+                if (forceRefresh) request.force_refresh = true;
                 const payload = await api('/web/summarize', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(request),
@@ -1543,17 +1559,20 @@
                 if (!isCurrent(summaryJobId, summaryGeneration) || fresh.attempt !== summaryAttempt || fresh.status !== 'done') return;
                 rawSummary = payload.summary || '';
                 try { await storage('readwrite', `summary:${summaryJobId}:${summaryAttempt}`, { text: rawSummary, summary_html: payload.summary_html, transcriptId: summaryTranscriptId, attempt: summaryAttempt }); } catch (_) {}
+                if (localCacheKey) try { await storage('readwrite', localCacheKey, { text: rawSummary, summary_html: payload.summary_html, model: payload.model, created: Date.now() }); } catch (_) {}
                 if (!isCurrent(summaryJobId, summaryGeneration) || selectedJob?.attempt !== summaryAttempt) return;
                 displaySummary(rawSummary, payload.summary_html);
                 summaryMeta.textContent = `${payload.model || 'модель неизвестна'} · ${(payload.source_chars || 0).toLocaleString('ru-RU')} симв.`;
-                summaryStatus.textContent = 'Готово';
+                summaryStatus.textContent = payload.cached ? 'Из серверного кэша' : 'Готово';
             } catch (error) {
                 if (isCurrent(summaryJobId, summaryGeneration)) summaryStatus.textContent = error.message || 'Не удалось суммаризировать';
             } finally {
                 isSummarizing = false;
                 if (isCurrent(summaryJobId, summaryGeneration)) summarizeButton.disabled = !transcriptId;
             }
-        });
+        }
+        summarizeButton.addEventListener('click', () => summarize(false));
+        document.getElementById('refresh-summary-button').addEventListener('click', () => summarize(true));
 
         copySummaryButton.addEventListener('click', async () => {
             await copyTextToClipboard(rawSummary.trim(), 'Выжимка скопирована');

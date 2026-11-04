@@ -26,6 +26,8 @@ import time
 import os
 import gc
 import hashlib
+import hmac
+import weakref
 from contextlib import asynccontextmanager, contextmanager, ExitStack
 from faster_whisper import WhisperModel
 from gigaam_backend import GigaAMModel
@@ -60,6 +62,7 @@ load_dotenv()
 SUMMARY_MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable("table")
 _summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="web-summary")
 _summary_slots = threading.BoundedSemaphore(2)
+_summary_cache_locks = weakref.WeakValueDictionary()
 
 
 def _web_asset(name, *, template=False):
@@ -2095,12 +2098,76 @@ async def web_byok_presets():
 
 @app.post("/web/summarize")
 async def web_summarize(request: Request):
+    """Reuse a session-scoped summary before spending a model request."""
+    next_token = _consume_webui_token(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    transcript_id = str(payload.get("transcript_id") or "")
+    store = _job_store()
+    try:
+        job = store.get(sid, transcript_id)
+    except JobNotFound:
+        job = None
+    text = (_transcript_text_from_payload(job['result']) if job['status'] == 'done' else None) if job is not None else _get_webui_transcript(sid, transcript_id)
+    if not text:
+        raise HTTPException(status_code=404, detail="Unknown transcript id")
+    byok = payload.get("byok")
+    if byok is not None and (not isinstance(byok, dict) or
+        byok.get("apiFormat") not in {"anthropic", "chat-completions", "responses"} or
+        not all(isinstance(byok.get(k), str) and byok[k].strip() for k in ("baseUrl", "modelId", "apiKey")) or
+        len(byok["apiKey"]) > 4096 or len(byok["modelId"]) > 256 or len(byok["baseUrl"]) > 2048):
+        raise HTTPException(status_code=400, detail="Укажите адрес, модель и ключ провайдера")
+    instruction = str(payload.get("instruction") or "").strip()[:500]
+    identity = {"text": text[:OMNIROUTE_SUMMARY_MAX_CHARS], "instruction": instruction,
+                "prompt": SUMMARY_SYSTEM_PROMPT, "max_tokens": OMNIROUTE_SUMMARY_MAX_TOKENS,
+                "provider": byok if byok is not None else {"baseUrl": OMNIROUTE_BASE_URL,
+                    "model": OMNIROUTE_SUMMARY_MODEL, "fallback": OMNIROUTE_SUMMARY_FALLBACK_MODELS}}
+    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+    cache_key = 'web-summary:v1:' + hmac.new(sid.encode(), encoded, hashlib.sha256).hexdigest()
+    lock = _summary_cache_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached = None if payload.get('force_refresh') is True else transcription_cache.get(cache_key)
+        if isinstance(cached, dict) and isinstance(cached.get('summary'), str):
+            if job is not None:
+                try:
+                    store.put_summary(sid, transcript_id, job['attempt'], 'latest', {
+                        'summary': cached['summary'], 'summary_html': cached['summary_html'],
+                        'model': cached['model'], 'instruction': instruction,
+                    })
+                except (JobNotFound, InvalidTransition):
+                    raise HTTPException(status_code=409, detail='Transcript changed during summarization')
+                except CapacityExceeded:
+                    raise HTTPException(status_code=503, detail='Could not save summary')
+            result = {**cached, 'transcript_id': transcript_id, 'source_chars': len(text), 'cached': True}
+            return JSONResponse(result, headers={'X-Whisper-Next-CSRF': next_token})
+        response = await _web_summarize_uncached(request, next_token)
+        if response.status_code == 200:
+            result = json.loads(response.body)
+            # Do not associate a result with an attempt which changed while
+            # the provider was running.
+            try:
+                unchanged = job is None or store.get(sid, transcript_id)['attempt'] == job['attempt']
+            except JobNotFound:
+                unchanged = False
+            if unchanged:
+                transcription_cache.set(cache_key, {k: result[k] for k in
+                    ('summary', 'summary_html', 'model', 'requested_model', 'served_model')}, expire=CACHE_TTL)
+            result['cached'] = False
+            return JSONResponse(result, headers={'X-Whisper-Next-CSRF': next_token})
+        return response
+
+
+async def _web_summarize_uncached(request: Request, next_token):
     """Summarise a stored transcript through OmniRoute.
 
     The browser sends only the transcript id: the text stays on the server and
     the OmniRoute key never leaves it.
     """
-    next_token = _consume_webui_token(request)
     try:
         payload = await request.json()
     except Exception:
@@ -2463,9 +2530,14 @@ async def webui(request: Request):
         token = _rotate_webui_token(sid)
     else:
         sid, token = _create_webui_session()
+    summary_config = json.dumps([SUMMARY_SYSTEM_PROMPT, OMNIROUTE_BASE_URL, OMNIROUTE_SUMMARY_MODEL,
+                                 OMNIROUTE_SUMMARY_FALLBACK_MODELS, OMNIROUTE_SUMMARY_MAX_CHARS,
+                                 OMNIROUTE_SUMMARY_MAX_TOKENS], ensure_ascii=False)
+    summary_cache_version = hashlib.sha256(summary_config.encode()).hexdigest()
     html = (TEMPLATE_PATH.read_text()
             .replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
-            .replace("__DEFAULT_MODEL__", json.dumps(DEFAULT_MODEL)))
+            .replace("__DEFAULT_MODEL__", json.dumps(DEFAULT_MODEL))
+            .replace("__SUMMARY_CACHE_VERSION__", json.dumps(summary_cache_version)))
     response = HTMLResponse(html)
     _set_webui_session_cookie(response, request, sid)
     return response
