@@ -1,11 +1,12 @@
 [project]
 name = "whisper-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenAI-compatible Whisper API server"
 requires-python = ">=3.10"
 dependencies = [
     "uvicorn~=0.34.2",
     "fastapi~=0.115.12",
+    "markdown-it-py>=4,<5",
     "diskcache~=5.6.3",
     "faster-whisper",
     "nvidia-cublas-cu12",

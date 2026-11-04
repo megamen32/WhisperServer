@@ -383,7 +383,16 @@
         .summary-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding-bottom: 14px; border-bottom: 1px solid #25303e; }
         .summary-heading h2 { margin: 0; font-size: 1.1rem; font-weight: 650; }
         .summary-meta { color: #8190a3; font-size: .82rem; }
-        .summary-text { margin-top: 14px; white-space: pre-wrap; color: #dfe8f3; line-height: 1.7; }
+        .summary-text { margin-top: 14px; color: #dfe8f3; line-height: 1.7; text-align: left; overflow-wrap: anywhere; }
+        .summary-text > :first-child { margin-top: 0; }
+        .summary-text > :last-child { margin-bottom: 0; }
+        .summary-text li + li { margin-top: .4em; }
+        .summary-text a { color: #8ecbff; }
+        .summary-text pre { overflow-x: auto; padding: 12px; background: #0b111b; border-radius: 8px; }
+        .summary-text code { font-family: monospace; }
+        .summary-text table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+        .summary-text th, .summary-text td { padding: 6px 10px; border: 1px solid #354458; }
+        .summary-text blockquote { margin-left: 0; padding-left: 1em; border-left: 3px solid #526781; color: #b9c9dc; }
         .summary-status { margin-top: 12px; color: #a8bad0; font-size: .86rem; }
         .document { padding: 0 clamp(2px, 3vw, 32px) 30px; max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
         .document-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 30px 0 17px; background: #121924; border-bottom: 1px solid #25303e; }
@@ -507,6 +516,7 @@
         const summaryMeta = document.getElementById('summary-meta');
         const summaryStatus = document.getElementById('summary-status');
         const copySummaryButton = document.getElementById('copy-summary-button');
+        let rawSummary = '';
 
         const UPLOAD_SPEED_PREFIX = 'Скорость загрузки:';
         const UPLOAD_ESTIMATE_PREFIX = 'Осталось:';
@@ -910,6 +920,7 @@
             summarizeButton.disabled = true;
             summaryPanel.hidden = true;
             summaryText.textContent = '';
+            rawSummary = '';
             summaryMeta.textContent = '';
             summaryStatus.textContent = '';
             hideCopyButton();
@@ -1202,7 +1213,8 @@
                 if (!response.ok) {
                     throw new Error(payload.detail || `Ошибка: ${response.status}`);
                 }
-                summaryText.textContent = payload.summary || '';
+                rawSummary = payload.summary || '';
+                summaryText.innerHTML = payload.summary_html || '';
                 summaryMeta.textContent = `${payload.model || 'модель неизвестна'} · ${(payload.source_chars || 0).toLocaleString('ru-RU')} симв.`;
                 summaryStatus.textContent = 'Готово';
             } catch (error) {
@@ -1214,7 +1226,7 @@
         });
 
         copySummaryButton.addEventListener('click', async () => {
-            await copyTextToClipboard(summaryText.textContent.trim(), 'Выжимка скопирована');
+            await copyTextToClipboard(rawSummary.trim(), 'Выжимка скопирована');
         });
 
         modelSelect.addEventListener('change', () => {

@@ -87,7 +87,7 @@ def test_summarize_sends_only_the_id_upstream(client, monkeypatch):
             return json.dumps(
                 {
                     "model": "MiniMax-M3.1-Flash",
-                    "choices": [{"message": {"content": "Готовая выжимка"}}],
+                    "choices": [{"message": {"content": "## Итог\n\n1. **Контекст:** текст\n2. [ссылка](https://example.com)\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n<script>alert(1)</script>"}}],
                 }
             ).encode("utf-8")
 
@@ -120,7 +120,13 @@ def test_summarize_sends_only_the_id_upstream(client, monkeypatch):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["summary"] == "Готовая выжимка"
+    assert payload["summary"].startswith("## Итог")
+    assert "<h2>Итог</h2>" in payload["summary_html"]
+    assert "<strong>Контекст:</strong>" in payload["summary_html"]
+    assert "<ol>" in payload["summary_html"]
+    assert '<a href="https://example.com">ссылка</a>' in payload["summary_html"]
+    assert "<table>" in payload["summary_html"]
+    assert "<script>" not in payload["summary_html"]
 
     # The upstream request carries the text and the key, the browser body does not.
     assert payload["source_chars"] == len("Текст расшифровки")

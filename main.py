@@ -10,6 +10,7 @@ from uuid import uuid4
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
+from markdown_it import MarkdownIt
 import json
 import urllib.error
 import urllib.request
@@ -49,6 +50,8 @@ from model_registry import select_compatible_loaded_model as _select_compatible_
 from attribution import AttributionStore, normalize_comment
 
 load_dotenv()
+
+SUMMARY_MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable("table")
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -1500,6 +1503,7 @@ async def web_summarize(request: Request):
     return JSONResponse(
         {
             "summary": summary,
+            "summary_html": SUMMARY_MARKDOWN.render(summary),
             "model": actual_model or served_model,
             "requested_model": OMNIROUTE_SUMMARY_MODEL,
             "served_model": served_model,
