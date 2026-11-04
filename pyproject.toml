@@ -53,6 +53,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend", "webui_jobs", "webui_uploads"]
 
+[tool.setuptools.data-files]
+"share/whisperserver" = ["byok_bridge.mjs", "package.json", "package-lock.json", "templates/byok-presets.json", "templates/webui.html"]
+
 [tool.setuptools.packages.find]
 include = ["whisperclient*"]
 

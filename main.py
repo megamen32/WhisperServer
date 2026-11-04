@@ -62,6 +62,12 @@ _summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="web-su
 _summary_slots = threading.BoundedSemaphore(2)
 
 
+def _web_asset(name, *, template=False):
+    """Locate web assets in a checkout/release or an installed wheel."""
+    local = Path(__file__).parent / ("templates" if template else "") / name
+    return local if local.is_file() else Path(sys.prefix) / "share" / "whisperserver" / name
+
+
 async def _summary_open(opener, upstream):
     """Limit blocking gateway calls without occupying the event loop or a queue."""
     if not _summary_slots.acquire(blocking=False):
@@ -87,7 +93,7 @@ async def _run_byok(config, system, prompt):
     process = None
     try:
         process = await asyncio.create_subprocess_exec(
-            "node", str(Path(__file__).parent / "byok_bridge.mjs"),
+            "node", str(_web_asset("byok_bridge.mjs")),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "NODE_OPTIONS": "--max-old-space-size=192"},
@@ -842,7 +848,7 @@ pending_results = {}
 pending_streams = {}
 model_usage = None
 
-TEMPLATE_PATH = Path(__file__).parent / "templates" / "webui.html"
+TEMPLATE_PATH = _web_asset("webui.html", template=True)
 BOT_SCRIPT_PATH = Path(__file__).parent / "telegram_bot.py"
 
 app = FastAPI()
@@ -2084,7 +2090,7 @@ async def web_transcribe(
 
 @app.get("/web/byok/presets")
 async def web_byok_presets():
-    return JSONResponse(json.loads((Path(__file__).parent / "templates" / "byok-presets.json").read_text()))
+    return JSONResponse(json.loads(_web_asset("byok-presets.json", template=True).read_text()))
 
 
 @app.post("/web/summarize")

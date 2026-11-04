@@ -165,6 +165,7 @@ python -m py_compile main.py telegram_bot.py whisperclient/*.py tests/*.py
 В настройках суммаризации можно выбрать провайдера, изменить адрес и модель и
 ввести собственный API-ключ. Ключ не сохраняется в истории и хранится в памяти
 страницы до её закрытия или обновления. Стандартный режим работает без Node.js.
+После установки из wheel выполните `npm ci --omit=dev --ignore-scripts --prefix "$VIRTUAL_ENV/share/whisperserver"`.
 
 ## License
 

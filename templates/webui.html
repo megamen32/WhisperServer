@@ -961,6 +961,8 @@
         }).catch(() => {});
         summaryProvider.addEventListener('change', () => {
             const preset = byokPresets.find(item => item.id === summaryProvider.value);
+            // A key belongs to the previous provider; never carry it to another.
+            document.getElementById('byok-key').value = '';
             for (const field of document.querySelectorAll('.byok-field')) field.hidden = !preset;
             if (preset) { document.getElementById('byok-format').value = preset.apiFormat; document.getElementById('byok-url').value = preset.baseUrl; document.getElementById('byok-model').value = preset.modelId; }
         });
