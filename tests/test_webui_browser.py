@@ -56,7 +56,11 @@ def _run_playwright_cli(session: str, *arguments: str, timeout: int = 30, check:
 
 
 def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
-    """Exercise model selection, file upload, streaming response, and final text."""
+    """Slow nightly: detect broken default-model job uploads or missing final text.
+
+    Purpose: exercise the real-browser GPU transcription flow. Expected: 120 s;
+    maximum: 300 s, including browser setup and cleanup.
+    """
     if not _enabled(os.getenv("BROWSER_TESTS")):
         pytest.skip("set BROWSER_TESTS=1 to run the real-browser Web UI test")
     if shutil.which("npx") is None:
@@ -76,7 +80,7 @@ def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
 
     audio_path = tmp_path / "browser-upload.wav"
     subprocess.run(
-        [espeak, "-v", "en", "-w", str(audio_path), "This is a browser upload test."],
+        [espeak, "-v", "ru", "-w", str(audio_path), "Это проверка загрузки файла в браузере."],
         check=True,
         capture_output=True,
         text=True,
@@ -91,7 +95,7 @@ def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
         _run_playwright_cli(
             session,
             "run-code",
-            "await page.waitForFunction(() => document.querySelector('#model-select')?.value === 'large-v3', null, {timeout: 15000})",
+            "await page.waitForFunction(() => document.querySelector('#model-select')?.value === DEFAULT_MODEL, null, {timeout: 15000})",
             timeout=30,
         )
         snapshot = _run_playwright_cli(session, "snapshot", timeout=30)
@@ -101,15 +105,15 @@ def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
         selected_model = _run_playwright_cli(
             session,
             "eval",
-            "document.querySelector('#model-select').value",
+            "document.querySelector('#model-select').value === DEFAULT_MODEL",
             timeout=30,
         )
-        assert "large-v3" in selected_model.stdout, selected_model.stdout
+        assert "true" in selected_model.stdout.lower(), selected_model.stdout
 
         _run_playwright_cli(
             session,
             "eval",
-            "(() => { window.__whisperTranscribeRequested = false; const originalOpen = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(method, url, ...rest) { if (String(url).includes('/web/transcribe')) window.__whisperTranscribeRequested = true; return originalOpen.call(this, method, url, ...rest); }; })()",
+            "(() => { window.__whisperJobRequested = false; const originalFetch = window.fetch; window.fetch = function(input, init) { const url = new URL(input instanceof Request ? input.url : input, location.href); const method = (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase(); if (url.origin === location.origin && url.pathname === '/web/jobs' && method === 'POST') window.__whisperJobRequested = true; return originalFetch.call(this, input, init); }; })()",
             timeout=30,
         )
         _run_playwright_cli(session, "click", drop_zone_match.group(1), timeout=30)
@@ -118,7 +122,7 @@ def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
         wait_result = _run_playwright_cli(
             session,
             "run-code",
-            "await page.waitForFunction(() => document.querySelector('#status-bar')?.textContent === 'Готово' || Boolean(document.querySelector('#error-output')?.textContent), null, {timeout: 180000})",
+            "await page.waitForFunction(() => (window.__whisperJobRequested && document.querySelector('#status-bar')?.textContent.startsWith('Готово ·') && Boolean(document.querySelector('#final-output')?.textContent.trim())) || Boolean(document.querySelector('#error-output')?.textContent), null, {timeout: 180000})",
             timeout=190,
             check=False,
         )
@@ -146,13 +150,13 @@ def test_webui_uploads_and_transcribes_in_real_browser(tmp_path: Path) -> None:
         request_seen = _run_playwright_cli(
             session,
             "eval",
-            "window.__whisperTranscribeRequested === true",
+            "window.__whisperJobRequested === true",
             timeout=30,
         )
 
-        assert "true" in request_seen.stdout.lower(), "browser did not issue /web/transcribe request"
+        assert "true" in request_seen.stdout.lower(), "browser did not issue POST /web/jobs request"
         assert "Готово" in status.stdout, f"Web UI error: {error.stdout}"
         normalized = transcript.stdout.casefold()
-        assert "browser" in normalized and "upload" in normalized, transcript.stdout
+        assert "проверка" in normalized and "файл" in normalized, transcript.stdout
     finally:
         _run_playwright_cli(session, "close", timeout=30, check=False)

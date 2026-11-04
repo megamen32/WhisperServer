@@ -6,7 +6,11 @@ import subprocess
 import sys
 import tempfile
 import secrets
+import threading
+import sqlite3
+import queue as thread_queue
 from uuid import uuid4
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Query, Form, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
@@ -48,10 +52,32 @@ from metrics import (
 from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES, WHISPER_MODEL_IDS
 from model_registry import select_compatible_loaded_model as _select_compatible_loaded_model
 from attribution import AttributionStore, normalize_comment
+from webui_jobs import JobStore, JobNotFound, InvalidTransition, CapacityExceeded
+from webui_uploads import UploadSpool, UploadConflict
 
 load_dotenv()
 
 SUMMARY_MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable("table")
+_summary_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="web-summary")
+_summary_slots = threading.BoundedSemaphore(2)
+
+
+async def _summary_open(opener, upstream):
+    """Limit blocking gateway calls without occupying the event loop or a queue."""
+    if not _summary_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Summariser is busy, try later")
+
+    def fetch():
+        with opener.open(upstream, timeout=OMNIROUTE_SUMMARY_TIMEOUT) as response:
+            return response.read().decode("utf-8")
+
+    try:
+        future = _summary_executor.submit(fetch)
+    except BaseException:
+        _summary_slots.release()
+        raise
+    future.add_done_callback(lambda _: _summary_slots.release())
+    return await asyncio.wrap_future(future)
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -193,8 +219,60 @@ def ensure_vram_for_model(model_name: str, model_cache: dict) -> None:
 ALLOWED_API_KEYS = {os.getenv("API_KEY", "bad-key")}
 WEBUI_SESSION_COOKIE = "whisper_web_session"
 WEBUI_CSRF_HEADER = "x-whisper-csrf"
-WEBUI_SESSION_TTL_SECONDS = int(os.getenv("WEBUI_SESSION_TTL_SECONDS", "7200"))
+WEBUI_SESSION_TTL_SECONDS = int(os.getenv("WEBUI_SESSION_TTL_SECONDS", "2592000"))
 _webui_sessions = {}
+
+# Job state is file-backed; configure this path on persistent storage.
+WEBUI_JOB_DIR = Path(os.getenv("WEBUI_JOB_DIR", "whisper_cache/webui_jobs"))
+WEBUI_MAX_FILE_BYTES = int(os.getenv("WEBUI_MAX_FILE_BYTES", str(256 * 1024 * 1024)))
+WEBUI_MAX_CHUNK_BYTES = 2 * 1024 * 1024
+WEBUI_MAX_SPOOL_BYTES = int(os.getenv("WEBUI_MAX_SPOOL_BYTES", str(2 * 1024 ** 3)))
+_job_tasks = set()
+_job_lock = asyncio.Lock()
+_job_worker_slot = asyncio.Semaphore(1)
+
+
+def _job_store():
+    WEBUI_JOB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return JobStore(WEBUI_JOB_DIR / "jobs.sqlite", max_payload_bytes=8_000_000)
+
+
+def _job_spool():
+    return UploadSpool(WEBUI_JOB_DIR / "uploads", WEBUI_MAX_FILE_BYTES,
+                       WEBUI_MAX_CHUNK_BYTES, WEBUI_MAX_SPOOL_BYTES)
+
+
+def _session_db():
+    WEBUI_JOB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(WEBUI_JOB_DIR / "sessions.sqlite", timeout=5)
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, token TEXT NOT NULL, expires REAL NOT NULL)")
+    existed = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='csrf_tokens'").fetchone()
+    db.execute("CREATE TABLE IF NOT EXISTS csrf_tokens (session_id TEXT NOT NULL, token TEXT NOT NULL, expires REAL NOT NULL, PRIMARY KEY(session_id, token))")
+    if not existed:
+        db.execute("INSERT OR IGNORE INTO csrf_tokens SELECT id, token, expires FROM sessions WHERE expires > ?", (time.time(),))
+    db.commit()
+    return db
+
+
+def _save_webui_session(sid):
+    session = _webui_sessions[sid]
+    with _session_db() as db:
+        db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", (sid, session['token'], session['expires']))
+        db.execute("DELETE FROM csrf_tokens WHERE expires <= ?", (time.time(),))
+        db.execute("INSERT INTO csrf_tokens VALUES (?, ?, ?)", (sid, session['token'], session['expires']))
+
+
+def _load_webui_session(sid):
+    if not sid:
+        return None
+    with _session_db() as db:
+        row = db.execute("SELECT token, expires FROM sessions WHERE id=? AND expires>?", (sid, time.time())).fetchone()
+    if row:
+        session = {'token': row[0], 'expires': row[1]}
+        _webui_sessions[sid] = session
+        return session
+    return None
 
 # --- Web UI transcript store -------------------------------------------------
 # The browser never receives the summariser credential and never sends the
@@ -304,7 +382,11 @@ def _get_webui_transcript(session_id, transcript_id):
     _prune_webui_transcripts()
     entry = _webui_transcripts.get(transcript_id or "")
     if not entry:
-        return None
+        try:
+            job = _job_store().get(session_id, transcript_id)
+            return _transcript_text_from_payload(job['result']) if job['status'] == 'done' else None
+        except JobNotFound:
+            return None
     # The transcript belongs to the session that produced it.
     if entry.get("session_id") != session_id:
         return None
@@ -404,12 +486,14 @@ def _create_webui_session():
     sid = secrets.token_urlsafe(32)
     token = _new_webui_token()
     _webui_sessions[sid] = {"token": token, "expires": now + WEBUI_SESSION_TTL_SECONDS}
+    _save_webui_session(sid)
     return sid, token
 
 
 def _rotate_webui_token(sid):
     token = _new_webui_token()
     _webui_sessions[sid] = {"token": token, "expires": time.time() + WEBUI_SESSION_TTL_SECONDS}
+    _save_webui_session(sid)
     return token
 
 
@@ -439,13 +523,23 @@ def _consume_webui_token(request: Request):
     _prune_webui_sessions()
     sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
     supplied = request.headers.get(WEBUI_CSRF_HEADER, "")
-    session = _webui_sessions.get(sid)
-    if not sid or not supplied or not session or supplied != session.get("token"):
+    session = _load_webui_session(sid)
+    if not sid or not supplied or not session:
         raise HTTPException(status_code=403, detail="Invalid or expired web UI token")
     if not _same_origin_request(request):
         _webui_sessions.pop(sid, None)
+        with _session_db() as db:
+            db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+            db.execute("DELETE FROM csrf_tokens WHERE session_id=?", (sid,))
         raise HTTPException(status_code=403, detail="Invalid request origin")
-    return _rotate_webui_token(sid)
+    with _session_db() as db:
+        consumed = db.execute("DELETE FROM csrf_tokens WHERE session_id=? AND token=? AND expires>?",
+                              (sid, supplied, time.time())).rowcount
+    if not consumed:
+        raise HTTPException(status_code=403, detail="Invalid or expired web UI token")
+    token = _rotate_webui_token(sid)
+    request.state.webui_next_csrf = token
+    return token
 
 
 # Map OpenAI model names to local speech-to-text models.
@@ -726,6 +820,17 @@ BOT_SCRIPT_PATH = Path(__file__).parent / "telegram_bot.py"
 
 app = FastAPI()
 
+
+@app.middleware("http")
+async def _return_consumed_webui_token(request: Request, call_next):
+    """Return the replacement even when a handler raises an HTTP error."""
+    response = await call_next(request)
+    token = getattr(request.state, "webui_next_csrf", None)
+    if token:
+        response.headers["X-Whisper-Next-CSRF"] = token
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await startup_event()
@@ -819,7 +924,15 @@ async def monitor_bot_subprocess():
             app.state.bot_process = start_bot_subprocess()
         await asyncio.sleep(5)
 
-def model_worker(request_queue, response_queue, stop_event, usage_dict):
+class WebJobCancelled(Exception):
+    """Worker acknowledged a cooperative cancellation at a safe checkpoint."""
+
+
+class WorkerStopped(Exception):
+    """The worker owning a request exited before responding."""
+
+
+def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_flags=None):
     model_cache = {}
 
     while not stop_event.is_set():
@@ -863,14 +976,25 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                 model = None
                 segments = None
                 model_session = ExitStack()
+                cancelled = False
+                terminal_payload = None
+                job_key = request.get('web_job_key')
+
+                def check_cancel():
+                    if job_key is not None and cancel_flags is not None and cancel_flags.get(job_key, False):
+                        raise WebJobCancelled('Web job cancelled')
+
                 try:
+                    check_cancel()
                     with tempfile.NamedTemporaryFile(delete=False) as temp:
                         temp.write(audio_bytes)
                         temp.flush()
                         temp_path = temp.name
                     audio_seconds = audio_duration_seconds(temp_path)
                     diarize = request.get("diarize", False)
+                    check_cancel()
                     speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter, model_provider=_diarization_model_session) if diarize else []
+                    check_cancel()
 
                     if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                         model_name = _select_openai_whisper_model(model_cache)
@@ -900,6 +1024,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if model_name not in model_cache:
                         ensure_vram_for_model(model_name, model_cache)
                         model_cache[model_name] = _create_model_entry(model_name)
+                    check_cancel()
 
                     model_entry = model_cache[model_name]
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
@@ -920,6 +1045,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
 
                     def _decode(current_beam: int):
                         """Decode the whole recording; faster-whisper decodes lazily."""
+                        check_cancel()
                         segments, info = model.transcribe(
                             temp_path,
                             beam_size=current_beam,
@@ -936,6 +1062,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                         decoded_segments = []
                         decoded_words = []
                         for seg in segments:
+                            check_cancel()
                             if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                                 model_entry.touch(active=True)
                             seg_text = (seg.text or "").strip()
@@ -1001,6 +1128,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                             ) from retry_exc
                     inference_ms = (time.perf_counter() - inference_started) * 1000
 
+                    check_cancel()
                     result = {
                         "text": " ".join([s["text"] for s in all_segments]),
                         "segments": all_segments,
@@ -1026,13 +1154,16 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if cache_key:
                         transcription_cache.set(cache_key, result, expire=CACHE_TTL)
 
-                    response_queue.put({
+                    terminal_payload = {
                         "request_id": request_id,
                         "result": result,
                         "final": True,
-                    })
+                    }
                     success = True
 
+                except WebJobCancelled:
+                    cancelled = True
+                    error_text = 'Web job cancelled'
                 except Exception as e:
                     error_text = str(e)
                     logger.exception("Ошибка в worker:")
@@ -1043,7 +1174,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if isinstance(e, GpuOutOfMemoryError):
                         error_payload["error_code"] = e.code
                         error_payload["retryable"] = e.retryable
-                    response_queue.put(error_payload)
+                    terminal_payload = error_payload
                 finally:
                     # Drop worker-local references before marking the cached
                     # model idle so broker eviction can actually free VRAM.
@@ -1076,6 +1207,11 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
                     if error_text:
                         metric["error"] = error_text
                     append_metric(metric)
+                if cancelled:
+                    terminal_payload = {'request_id': request_id, 'error': 'Web job cancelled',
+                                        'error_code': 'web_job_cancelled', 'final': True}
+                if terminal_payload is not None:
+                    response_queue.put(terminal_payload)
 
         except Exception as e:
             logger.exception("Фатальная ошибка в loop:")
@@ -1087,49 +1223,182 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict):
             entry.release()
 
 
-async def response_listener(stop_event, response_queue):
+async def response_listener(stop_event, response_queue, retire_event=None):
     loop = asyncio.get_running_loop()
-    while True:
+    inbox = asyncio.Queue(maxsize=1)
+    reader_stop = threading.Event()
+    consumed = threading.Event()
+    reader_finished = object()
+
+    def read_responses():
+        # One daemon reader per generation: if a killed writer leaves a partial
+        # IPC frame, the reader cannot hold up interpreter shutdown. The single
+        # handoff slot bounds buffering and preserves ordering.
         try:
-            result = await loop.run_in_executor(app.state.executor, response_queue.get)
-            if result is None or result.get("__shutdown__"):
-                break
-            logger.info(f'response_listener get from queue result {result}')
-            request_id = result["request_id"]
-            if request_id in pending_results:
-                # A late segment is not a terminal response for a non-stream
-                # request. In particular it must not kill the shared listener.
-                if "result" not in result and "error" not in result:
+            while not reader_stop.is_set():
+                try:
+                    item = response_queue.get(True, .2)
+                except thread_queue.Empty:
+                    if retire_event is not None and retire_event.is_set():
+                        break
                     continue
-                future = pending_results.pop(request_id)
-                if future.done():
-                    continue
-                if "error" in result:
-                    if result.get("error_code") == "gpu_out_of_memory":
-                        future.set_exception(GpuOutOfMemoryError(result["error"]))
-                    else:
-                        future.set_exception(Exception(result["error"]))
-                else:
-                    future.set_result(result["result"])
-            elif request_id in pending_streams:
-                queue = pending_streams[request_id]
-                if "error" in result:
-                    await queue.put({"error": result["error"]})
-                    await queue.put(None)
-                    pending_streams.pop(request_id, None)
-                elif "segment" in result:
-                    payload = {"segment": result["segment"]}
-                    if "words" in result:
-                        payload["words"] = result["words"]
-                    await queue.put(payload)
-                elif result.get("final"):
-                    await queue.put({"result": result["result"]})
-                    await queue.put(None)
-                    pending_streams.pop(request_id, None)
-        except asyncio.CancelledError:
-            break
+                consumed.clear()
+                loop.call_soon_threadsafe(inbox.put_nowait, item)
+                while not consumed.wait(.2):
+                    if reader_stop.is_set():
+                        return
+                if item is None or item.get('__shutdown__'):
+                    break
         except Exception:
-            logger.exception("Failed to dispatch worker response; continuing")
+            logger.exception('Worker response reader failed')
+        finally:
+            if not reader_stop.is_set():
+                try:
+                    loop.call_soon_threadsafe(inbox.put_nowait, reader_finished)
+                except RuntimeError:
+                    pass  # The application loop already stopped.
+
+    reader = threading.Thread(target=read_responses, name='worker-response-reader', daemon=True)
+    reader.start()
+    try:
+        while True:
+            try:
+                result = await inbox.get()
+                if result is reader_finished:
+                    break
+                if result is None or result.get("__shutdown__"):
+                    break
+                logger.info(f'response_listener get from queue result {result}')
+                request_id = result["request_id"]
+                if request_id in pending_results:
+                    # A segment is not a terminal response for a non-stream request.
+                    if "result" not in result and "error" not in result:
+                        continue
+                    future = pending_results.pop(request_id)
+                    if future.done():
+                        continue
+                    if "error" in result:
+                        if result.get("error_code") == "gpu_out_of_memory":
+                            future.set_exception(GpuOutOfMemoryError(result["error"]))
+                        else:
+                            future.set_exception(Exception(result["error"]))
+                    else:
+                        future.set_result(result["result"])
+                elif request_id in pending_streams:
+                    queue = pending_streams[request_id]
+                    if "error" in result:
+                        await queue.put({"error": result["error"]})
+                        await queue.put(None)
+                        pending_streams.pop(request_id, None)
+                    elif "segment" in result:
+                        payload = {"segment": result["segment"]}
+                        if "words" in result:
+                            payload["words"] = result["words"]
+                        await queue.put(payload)
+                    elif result.get("final"):
+                        await queue.put({"result": result["result"]})
+                        await queue.put(None)
+                        pending_streams.pop(request_id, None)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Failed to dispatch worker response; continuing")
+            finally:
+                consumed.set()
+    finally:
+        reader_stop.set()
+        consumed.set()
+
+
+def _worker_accepts_requests():
+    # Legacy tests and embedders may provide their own request queue.
+    if not hasattr(app.state, 'worker_accepting'):
+        return getattr(app.state, 'request_queue', None) is not None
+    process = getattr(app.state, 'model_process', None)
+    return bool(app.state.worker_accepting and process is not None and process.is_alive())
+
+
+async def _worker_supervisor(ctx):
+    """Replace one dead generation without replaying its queued requests."""
+    while not app.state.lifecycle_stop.is_set():
+        await asyncio.sleep(.2)
+        process = app.state.model_process
+        if process is None or process.is_alive():
+            continue
+        app.state.worker_accepting = False
+        app.state.worker_generation += 1
+        logger.error('Model worker exited; closing admission')
+        # Let the old listener dispatch replies already sent before the crash.
+        await asyncio.sleep(1)
+        if app.state.lifecycle_stop.is_set():
+            return
+        listener = app.state.response_listener_task
+        app.state.response_listener_retire.set()
+        done, _ = await asyncio.wait({listener}, timeout=2)
+        if not done:
+            # Never close a queue or discard pending requests while its reader
+            # can still consume an answer. Keep admission closed on this fault.
+            logger.error('Worker response reader did not retire; recovery halted')
+            return
+        if app.state.lifecycle_stop.is_set():
+            return
+        for request_id, future in list(pending_results.items()):
+            pending_results.pop(request_id, None)
+            if not future.done():
+                future.set_exception(WorkerStopped('Model worker stopped before responding'))
+        for request_id, stream in list(pending_streams.items()):
+            pending_streams.pop(request_id, None)
+            await stream.put({'error': 'Model worker stopped before responding'})
+            await stream.put(None)
+        for old_queue in (app.state.request_queue, app.state.response_queue):
+            try:
+                old_queue.cancel_join_thread()
+                old_queue.close()
+            except (OSError, ValueError, AttributeError):
+                pass
+        process.join(timeout=0)
+        if app.state.worker_restarts >= 1 or app.state.lifecycle_stop.is_set():
+            logger.error('Model worker restart limit reached; admission remains closed')
+            return
+        app.state.worker_restarts += 1
+        request_queue, response_queue = ctx.Queue(), ctx.Queue()
+        replacement = ctx.Process(target=model_worker, args=(request_queue, response_queue,
+                                  app.state.stop_event, app.state.model_usage, app.state.job_cancel_flags))
+        try:
+            replacement.start()
+        except Exception:
+            logger.exception('Could not restart model worker')
+            for new_queue in (request_queue, response_queue):
+                new_queue.cancel_join_thread()
+                new_queue.close()
+            return
+        app.state.request_queue = request_queue
+        app.state.response_queue = response_queue
+        app.state.model_process = replacement
+        app.state.response_listener_retire = asyncio.Event()
+        app.state.response_listener_task = asyncio.create_task(response_listener(
+            app.state.stop_event, response_queue, app.state.response_listener_retire))
+        app.state.worker_accepting = True
+        logger.info('Model worker restarted with new queues')
+
+
+def _recover_web_jobs(store):
+    """Recover queued/in-flight work and retries interrupted after failure."""
+    recovered = store.recover_interrupted()
+    with sqlite3.connect(store.path, timeout=store.timeout) as db:
+        terminal = db.execute("SELECT owner, id, attempt FROM jobs WHERE status IN ('done', 'error')").fetchall()
+        cancelled = db.execute("SELECT id FROM jobs WHERE status='cancelled'").fetchall()
+    for (job_id,) in cancelled:
+        _job_spool().remove(job_id)
+    for owner, job_id, attempt in terminal:
+        try:
+            retry = store.retry_if_diarization_changed(owner, job_id, attempt)
+            if retry:
+                recovered.append(retry)
+        except (JobNotFound, InvalidTransition):
+            continue
+    return recovered
+
 
 async def startup_event():
     global model_usage
@@ -1140,11 +1409,12 @@ async def startup_event():
     stop_event = ctx.Event()
     manager = ctx.Manager()
     model_usage = manager.dict()
+    job_cancel_flags = manager.dict()
     request_queue = ctx.Queue()
     response_queue = ctx.Queue()
     process = ctx.Process(
         target=model_worker,
-        args=(request_queue, response_queue, stop_event, model_usage),
+        args=(request_queue, response_queue, stop_event, model_usage, job_cancel_flags),
     )
     process.start()
     executor = ThreadPoolExecutor()
@@ -1154,18 +1424,36 @@ async def startup_event():
     app.state.request_queue = request_queue
     app.state.response_queue = response_queue
     app.state.manager = manager
+    app.state.job_cancel_flags = job_cancel_flags
+    app.state.worker_generation = 0
+    app.state.worker_restarts = 0
+    app.state.worker_accepting = True
+    app.state.response_listener_retire = asyncio.Event()
     app.state.response_listener_task = asyncio.create_task(
-        response_listener(stop_event, response_queue)
+        response_listener(stop_event, response_queue, app.state.response_listener_retire)
     )
+    store = _job_store()
+    if hasattr(store, 'recover_interrupted') and hasattr(store, 'retry_if_diarization_changed'):
+        for job in _recover_web_jobs(store):
+            _launch_job(job['owner'], job)
+    else:
+        logger.warning('Web job restart recovery is unavailable: JobStore.recover_interrupted is missing')
     app.state.model_usage = model_usage
     app.state.lifecycle_stop = asyncio.Event()
+    app.state.worker_supervisor_task = asyncio.create_task(_worker_supervisor(ctx))
     app.state.bot_process = start_bot_subprocess()
     app.state.bot_monitor_task = asyncio.create_task(monitor_bot_subprocess())
 
 async def shutdown_event():
+    global model_usage
     logger.info("Остановка процесса...")
+    app.state.worker_accepting = False
     if hasattr(app.state, "lifecycle_stop"):
         app.state.lifecycle_stop.set()
+    if hasattr(app.state, 'worker_supervisor_task'):
+        app.state.worker_supervisor_task.cancel()
+        await asyncio.gather(app.state.worker_supervisor_task, return_exceptions=True)
+        del app.state.worker_supervisor_task
     if hasattr(app.state, "bot_monitor_task"):
         app.state.bot_monitor_task.cancel()
         try:
@@ -1174,18 +1462,6 @@ async def shutdown_event():
             pass
     await stop_bot_subprocess()
     app.state.stop_event.set()
-    try:
-        app.state.response_queue.put({"__shutdown__": True})
-    except Exception:
-        pass
-
-    if hasattr(app.state, "response_listener_task"):
-        app.state.response_listener_task.cancel()
-        try:
-            await app.state.response_listener_task
-        except asyncio.CancelledError:
-            pass
-
     process = app.state.model_process
     process.join(timeout=10)
     if process.is_alive():
@@ -1195,20 +1471,54 @@ async def shutdown_event():
     else:
         logger.info("Модель завершена.")
 
+    reader_stopped = True
+    if hasattr(app.state, 'response_listener_task'):
+        retirement = getattr(app.state, 'response_listener_retire', None)
+        if retirement is not None:
+            retirement.set()
+            done, _ = await asyncio.wait({app.state.response_listener_task}, timeout=2)
+            reader_stopped = bool(done)
+            if not reader_stopped:
+                logger.error('Response reader did not retire during shutdown; leaving its queue open')
+        else:
+            app.state.response_listener_task.cancel()
+            await asyncio.gather(app.state.response_listener_task, return_exceptions=True)
+
+    # Job coroutines may still be awaiting a response from the stopped worker.
+    # Finish their cleanup while the Manager-backed cancellation channel lives.
+    loop = asyncio.get_running_loop()
+    owned_tasks = [task for task in _job_tasks if task.get_loop() is loop and not task.done()]
+    for task in owned_tasks:
+        task.cancel()
+    if owned_tasks:
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
+
     app.state.executor.shutdown(wait=False)
 
-    for q in (app.state.request_queue, app.state.response_queue):
+    queues = [app.state.request_queue]
+    if reader_stopped:
+        queues.append(app.state.response_queue)
+    for q in queues:
         try:
+            q.cancel_join_thread()
             q.close()
-            q.join_thread()
-        except Exception:
+        except (AttributeError, OSError, ValueError):
             pass
 
+    app.state.job_cancel_flags = None
+    app.state.model_process = None
+    app.state.request_queue = None
+    app.state.response_queue = None
+    del app.state.worker_accepting
     if hasattr(app.state, "manager"):
         try:
             app.state.manager.shutdown()
         except Exception:
             pass
+        del app.state.manager
+    if hasattr(app.state, 'model_usage'):
+        del app.state.model_usage
+    model_usage = None
 
 async def _transcribe_impl(
     file: UploadFile,
@@ -1221,6 +1531,8 @@ async def _transcribe_impl(
     vad_filter: bool,
     diarize: bool = False,
     comment: Optional[str] = None,
+    *, wait_for_terminal: bool = False,
+    web_job_key=None,
 ):
     diarize = diarize is True
     client_comment = normalize_comment(comment)
@@ -1272,6 +1584,8 @@ async def _transcribe_impl(
         }
         return StreamingResponse(cached(), media_type="application/x-ndjson", headers=headers)
 
+    if not _worker_accepts_requests():
+        return JSONResponse({'error': 'Model worker unavailable', 'code': 'worker_stopped'}, status_code=503)
     request_id = uuid4().hex
     loop = asyncio.get_event_loop()
     if stream:
@@ -1280,6 +1594,15 @@ async def _transcribe_impl(
     else:
         future = loop.create_future()
         pending_results[request_id] = future
+
+    job_process = getattr(app.state, 'model_process', None)
+    if wait_for_terminal and not stream:
+        process = job_process
+        if process is None or not process.is_alive():
+            pending_results.pop(request_id, None)
+            future.cancel()
+            return JSONResponse({'error': 'Model worker stopped before responding',
+                                 'code': 'worker_stopped'}, status_code=503)
 
     app.state.request_queue.put({
         "request_id": request_id,
@@ -1296,6 +1619,7 @@ async def _transcribe_impl(
         "diarize": diarize,
         "client_comment": client_comment,
         "queued_at": time.perf_counter(),
+        "web_job_key": web_job_key,
     })
 
     if stream:
@@ -1325,7 +1649,44 @@ async def _transcribe_impl(
         return StreamingResponse(generator(), media_type="application/x-ndjson", headers=headers)
     else:
         try:
-            result = await asyncio.wait_for(future, timeout=(int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600))
+            if wait_for_terminal:
+                while not future.done():
+                    process = job_process
+                    if process is None or not process.is_alive():
+                        supervisor = getattr(app.state, 'worker_supervisor_task', None)
+                        if supervisor is not None:
+                            # The supervisor owns the old listener and must
+                            # finish its in-flight read before failing requests.
+                            if not supervisor.done():
+                                await asyncio.wait({future, supervisor}, timeout=4)
+                            if future.done():
+                                break
+                            listener = getattr(app.state, 'response_listener_task', None)
+                            if listener is not None and not listener.done():
+                                # Keep the pending future registered: a blocked
+                                # reader may still return an already-taken reply.
+                                return JSONResponse({'error': 'Worker response channel did not drain; completion unknown'}, status_code=504)
+                        # The worker can exit after publishing its final reply;
+                        # allow the existing listener to dispatch it first.
+                        await asyncio.wait({future}, timeout=1.0)
+                        if future.done():
+                            break
+                        pending_results.pop(request_id, None)
+                        future.cancel()
+                        cached_result = _get_cached_result(cache_key)
+                        if cached_result is not None:
+                            result = dict(cached_result)
+                            result.pop('client_comment', None)
+                            if client_comment:
+                                result['client_comment'] = client_comment
+                            return result
+                        return JSONResponse({'error': 'Model worker stopped before responding',
+                                             'code': 'worker_stopped'}, status_code=503)
+                    await asyncio.wait({future}, timeout=0.2)
+                result = future.result()
+            else:
+                timeout = int(os.getenv("WHISPER_DIARIZATION_TIMEOUT_SECONDS", "86400")) if diarize else 600
+                result = await asyncio.wait_for(future, timeout=timeout)
             if client_comment and isinstance(result, dict):
                 result = dict(result)
                 result["client_comment"] = client_comment
@@ -1333,6 +1694,20 @@ async def _transcribe_impl(
         except asyncio.TimeoutError:
             pending_results.pop(request_id, None)
             return JSONResponse({"error": "Timeout"}, status_code=504)
+        except asyncio.CancelledError:
+            pending_results.pop(request_id, None)
+            future.cancel()
+            raise
+        except WorkerStopped as error:
+            pending_results.pop(request_id, None)
+            cached_result = _get_cached_result(cache_key)
+            if cached_result is not None:
+                result = dict(cached_result)
+                result.pop('client_comment', None)
+                if client_comment:
+                    result['client_comment'] = client_comment
+                return result
+            return JSONResponse({'error': str(error), 'code': 'worker_stopped'}, status_code=503)
         except Exception as e:
             pending_results.pop(request_id, None)
             if isinstance(e, GpuOutOfMemoryError):
@@ -1367,10 +1742,283 @@ async def transcribe(
 async def refresh_webui_session(request: Request):
     if not _same_origin_request(request):
         raise HTTPException(status_code=403, detail="Invalid request origin")
-    sid, token = _create_webui_session()
+    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    if _load_webui_session(sid):
+        token = _rotate_webui_token(sid)
+    else:
+        sid, token = _create_webui_session()
     response = JSONResponse({"token": token}, headers={"Cache-Control": "no-store"})
     _set_webui_session_cookie(response, request, sid)
     return response
+
+
+def _job_owner(request):
+    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    if not _load_webui_session(sid):
+        raise HTTPException(status_code=403, detail="Invalid or expired web UI session")
+    return sid
+
+
+def _job_get(owner, job_id):
+    try:
+        return _job_store().get(owner, job_id)
+    except JobNotFound:
+        raise HTTPException(status_code=404, detail="Unknown job")
+
+
+def _job_view(job):
+    settings = job['diarization']
+    return {**job, **{k: settings[k] for k in ('filename', 'size', 'model')},
+            'diarize': settings.get('desired_diarize', settings['diarize']),
+            'offset': _job_spool().offset(job['id']), 'transcript_id': job['id'] if job['status'] == 'done' else None}
+
+
+def _create_idempotent_job(store, owner, request_id, settings):
+    """Bind a request to its job in the same SQLite transaction as creation."""
+    store._identity(owner, 'owner')
+    encoded = store._json(settings)
+    with store._transaction() as db:
+        db.execute('''CREATE TABLE IF NOT EXISTS webui_create_requests (
+            owner TEXT NOT NULL, request_id TEXT NOT NULL, settings TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            PRIMARY KEY (owner, request_id))''')
+        previous = db.execute('SELECT job_id, settings FROM webui_create_requests WHERE owner=? AND request_id=?',
+                              (owner, request_id)).fetchone()
+        if previous:
+            if previous['settings'] != encoded:
+                raise HTTPException(status_code=409, detail='client_request_id already used with different job settings')
+            try:
+                return store._record(db, store._owned(db, owner, previous['job_id']))
+            except JobNotFound:
+                raise HTTPException(status_code=410, detail='Job for client_request_id was deleted')
+        if db.execute('SELECT count(*) FROM jobs').fetchone()[0] >= store.max_jobs:
+            raise CapacityExceeded('max_jobs reached')
+        job_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute('INSERT INTO jobs VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)',
+                   (job_id, owner, 'uploading', 1, encoded, now, now))
+        db.execute('INSERT INTO webui_create_requests VALUES (?, ?, ?, ?)', (owner, request_id, encoded, job_id))
+        return store._record(db, store._owned(db, owner, job_id))
+
+
+def _launch_job(owner, job):
+    generation = getattr(app.state, 'worker_generation', None)
+    task = asyncio.create_task(_run_web_job(owner, job['id'], job['attempt'], generation))
+    _job_tasks.add(task)
+    task.add_done_callback(_job_tasks.discard)
+
+
+async def _run_web_job(owner, job_id, attempt, generation=None):
+    async with _job_worker_slot:
+        if generation is not None and generation != getattr(app.state, 'worker_generation', None):
+            try:
+                _job_store().fail(owner, job_id, attempt, 'Model worker stopped before processing queued job')
+            except (InvalidTransition, JobNotFound):
+                pass
+            return
+        await _execute_web_job(owner, job_id, attempt)
+
+
+async def _execute_web_job(owner, job_id, attempt):
+    store = _job_store()
+    terminal_signal = False
+    unknown_completion = False
+    interrupted = False
+    try:
+        job = store.start(owner, job_id, attempt)
+        settings = job['diarization']
+        with (_job_spool().root / job_id).open('rb') as source:
+            result = await _transcribe_impl(UploadFile(file=source, filename=settings['filename']),
+                                            settings['model'], None, 5, 0.0, False, False, True,
+                                            settings['diarize'], wait_for_terminal=True,
+                                            web_job_key=(job_id, attempt))
+        if isinstance(result, JSONResponse):
+            if result.status_code == 504:
+                unknown_completion = True
+                logger.error('Web job %s timed out with worker completion unknown', job_id)
+                return
+            terminal_signal = True
+            payload = json.loads(result.body)
+            raise RuntimeError(payload.get('error', 'Transcription failed'))
+        terminal_signal = True
+        result = dict(result)
+        result['transcript_id'] = job_id
+        store.complete(owner, job_id, attempt, result)
+    except asyncio.CancelledError:
+        interrupted = True
+        raise
+    except InvalidTransition:
+        try:
+            job = store.get(owner, job_id)
+            if terminal_signal and job['attempt'] == attempt and job['status'] == 'cancel_requested':
+                store.finish_cancel(owner, job_id, attempt)
+                _job_spool().remove(job_id)
+        except (InvalidTransition, JobNotFound):
+            pass
+    except Exception as error:
+        logger.exception('Web job %s failed', job_id)
+        try:
+            job = store.get(owner, job_id)
+            if job['status'] == 'cancel_requested' and terminal_signal:
+                store.finish_cancel(owner, job_id, attempt)
+                _job_spool().remove(job_id)
+            elif job['status'] != 'cancel_requested':
+                store.fail(owner, job_id, attempt, str(error)[:4000])
+        except (InvalidTransition, JobNotFound):
+            pass
+    finally:
+        flags = getattr(app.state, 'job_cancel_flags', None)
+        if flags is not None and not unknown_completion:
+            flags.pop((job_id, attempt), None)
+        if not unknown_completion and not interrupted and hasattr(store, 'retry_if_diarization_changed'):
+            try:
+                retry = store.retry_if_diarization_changed(owner, job_id, attempt)
+                if retry:
+                    _launch_job(owner, retry)
+            except (InvalidTransition, JobNotFound):
+                pass
+
+
+@app.get('/web/jobs')
+async def web_jobs_list(request: Request):
+    owner = _job_owner(request)
+    return {'jobs': [_job_view(job) for job in _job_store().list(owner)]}
+
+
+@app.post('/web/jobs')
+async def web_jobs_create(request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    try:
+        data = await request.json()
+        filename, size, model, diarize = (data.get(k) for k in ('filename', 'size', 'model', 'diarize'))
+        request_id = data.get('client_request_id')
+        if (not isinstance(filename, str) or not filename or len(filename) > 255 or
+            type(size) is not int or not 0 < size <= WEBUI_MAX_FILE_BYTES or
+            not isinstance(model, str) or model not in MODEL_PRIORITY or type(diarize) is not bool):
+            raise ValueError('Invalid job settings')
+        if 'client_request_id' in data and (not isinstance(request_id, str) or not request_id.strip() or len(request_id.encode('utf-8')) > 128):
+            raise ValueError('client_request_id must be a nonempty string of at most 128 bytes')
+        settings = dict(filename=filename, size=size, model=model, diarize=diarize, desired_diarize=diarize)
+        store = _job_store()
+        job = store.create(owner, settings) if request_id is None else _create_idempotent_job(store, owner, request_id, settings)
+        return _job_view(job)
+    except (ValueError, AttributeError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.get('/web/jobs/{job_id}')
+async def web_jobs_get(job_id: str, request: Request):
+    return _job_view(_job_get(_job_owner(request), job_id))
+
+
+@app.put('/web/jobs/{job_id}/upload')
+async def web_jobs_upload(job_id: str, request: Request, offset: int = Query(..., ge=0)):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > WEBUI_MAX_CHUNK_BYTES:
+            raise HTTPException(status_code=413, detail='Upload chunk too large')
+    async with _job_lock:
+        job = _job_get(owner, job_id)
+        if job['status'] != 'uploading':
+            raise HTTPException(status_code=409, detail='Job is not uploading')
+        try:
+            new_offset = _job_spool().append(job_id, offset, bytes(data), job['diarization']['size'])
+        except UploadConflict as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+    return {'offset': new_offset}
+
+
+@app.post('/web/jobs/{job_id}/start')
+async def web_jobs_start(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    async with _job_lock:
+        job = _job_get(owner, job_id)
+        if job['status'] != 'uploading':
+            return _job_view(job)
+        if not _worker_accepts_requests():
+            raise HTTPException(status_code=503, detail='Model worker unavailable')
+        if _job_spool().offset(job_id) != job['diarization']['size']:
+            raise HTTPException(status_code=409, detail='Upload is incomplete')
+        try:
+            job = _job_store().enqueue(owner, job_id, job['attempt'])
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        _launch_job(owner, job)
+    return _job_view(job)
+
+
+@app.post('/web/jobs/{job_id}/cancel')
+async def web_jobs_cancel(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    async with _job_lock:
+        job = _job_get(owner, job_id)
+        try:
+            flags = getattr(app.state, 'job_cancel_flags', None)
+            if job['status'] in ('processing', 'cancel_requested') and flags is None:
+                raise HTTPException(status_code=503, detail='Worker cancellation channel unavailable')
+            job = _job_store().request_cancel(owner, job_id, job['attempt'])
+            if job['status'] == 'cancelled':
+                _job_spool().remove(job_id)
+            elif job['status'] == 'cancel_requested':
+                try:
+                    flags[(job_id, job['attempt'])] = True
+                except (OSError, EOFError, BrokenPipeError):
+                    raise HTTPException(status_code=503, detail='Worker cancellation channel unavailable')
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+    return _job_view(job)
+
+
+@app.delete('/web/jobs/{job_id}')
+async def web_jobs_delete(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    async with _job_lock:
+        job = _job_get(owner, job_id)
+        if job['status'] not in ('done', 'error', 'cancelled'):
+            raise HTTPException(status_code=409, detail='Only terminal jobs can be deleted')
+        _job_spool().remove(job_id)
+        try:
+            _job_store().delete(owner, job_id)
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+    return {'deleted': True}
+
+
+@app.patch('/web/jobs/{job_id}')
+async def web_jobs_patch(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    try:
+        data = await request.json()
+        if not isinstance(data, dict) or set(data) != {'diarize'} or type(data['diarize']) is not bool:
+            raise ValueError('Expected boolean diarize')
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    async with _job_lock:
+        job = _job_get(owner, job_id)
+        settings = {**job['diarization'], 'desired_diarize': data['diarize']}
+        if job['status'] == 'uploading':
+            settings['diarize'] = data['diarize']
+        store = _job_store()
+        if not hasattr(store, 'set_diarization'):
+            raise HTTPException(status_code=503, detail='Changing diarization is temporarily unavailable')
+        previous_attempt = job['attempt']
+        try:
+            job = store.set_diarization(owner, job_id, job['attempt'], settings)
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        if job['status'] == 'queued' and job['attempt'] != previous_attempt:
+            _launch_job(owner, job)
+    return _job_view(job)
 
 
 @app.post("/web/transcribe")
@@ -1386,7 +2034,7 @@ async def web_transcribe(
     vad_filter: bool = Query(True),
     diarize: bool = Query(False),
 ):
-    """First-party Web UI tunnel: API_KEY stays server-side; CSRF token is one-use."""
+    """First-party Web UI tunnel: API_KEY stays server-side; CSRF is session-scoped."""
     next_token = _consume_webui_token(request)
     session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
     transcript_id = _new_webui_transcript(session_id)
@@ -1422,7 +2070,13 @@ async def web_summarize(request: Request):
 
     session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
     transcript_id = str(payload.get("transcript_id") or "")
-    text = _get_webui_transcript(session_id, transcript_id)
+    store = _job_store()
+    try:
+        job = store.get(session_id, transcript_id)
+    except JobNotFound:
+        job = None
+    attempt = job['attempt'] if job is not None else None
+    text = (_transcript_text_from_payload(job['result']) if job['status'] == 'done' else None) if job is not None else _get_webui_transcript(session_id, transcript_id)
     if not text:
         raise HTTPException(status_code=404, detail="Unknown transcript id")
     _summary_rate_limit(session_id)
@@ -1468,8 +2122,7 @@ async def web_summarize(request: Request):
             method="POST",
         )
         try:
-            with opener.open(upstream, timeout=OMNIROUTE_SUMMARY_TIMEOUT) as response:
-                raw = response.read().decode("utf-8")
+            raw = await _summary_open(opener, upstream)
         except urllib.error.HTTPError as error:
             last_error = f"{model}: HTTP {error.code}"
             logger.warning("Summariser %s", last_error)
@@ -1499,11 +2152,23 @@ async def web_summarize(request: Request):
     if not summary:
         raise HTTPException(status_code=502, detail=f"Summariser failed ({last_error})")
 
+    summary_html = SUMMARY_MARKDOWN.render(summary)
+    if attempt is not None:
+        try:
+            store.put_summary(session_id, transcript_id, attempt, 'latest', {
+                'summary': summary, 'summary_html': summary_html, 'model': actual_model or served_model,
+                'instruction': instruction,
+            })
+        except (JobNotFound, InvalidTransition):
+            raise HTTPException(status_code=409, detail='Transcript changed during summarization')
+        except CapacityExceeded:
+            raise HTTPException(status_code=503, detail='Could not save summary')
+
     # Report the model that actually did the work, not the one we asked for.
     return JSONResponse(
         {
             "summary": summary,
-            "summary_html": SUMMARY_MARKDOWN.render(summary),
+            "summary_html": summary_html,
             "model": actual_model or served_model,
             "requested_model": OMNIROUTE_SUMMARY_MODEL,
             "served_model": served_model,
@@ -1593,6 +2258,8 @@ async def openai_transcribe(
         return JSONResponse(transcription_response_payload(cached_result, response_format, client_comment))
 
     # Queue the request
+    if not _worker_accepts_requests():
+        return JSONResponse({'error': 'Model worker unavailable', 'code': 'worker_stopped'}, status_code=503)
     request_id = uuid4().hex
     loop = asyncio.get_event_loop()
     if stream:
@@ -1675,6 +2342,8 @@ async def openai_transcribe(
     except Exception as e:
         pending_results.pop(request_id, None)
         logger.exception("OpenAI transcribe error:")
+        if isinstance(e, WorkerStopped):
+            return JSONResponse({'error': str(e), 'code': 'worker_stopped'}, status_code=503)
         if isinstance(e, GpuOutOfMemoryError):
             return JSONResponse(
                 {"error": str(e), "code": e.code, "retryable": True},
@@ -1718,7 +2387,10 @@ async def models():
 
 @app.get("/status")
 async def status():
-    queue_size = app.state.request_queue.qsize()
+    try:
+        queue_size = app.state.request_queue.qsize()
+    except (OSError, ValueError, AttributeError, NotImplementedError):
+        queue_size = None
     usage = dict(app.state.model_usage) if hasattr(app.state, "model_usage") else {}
     bot_process = getattr(app.state, "bot_process", None)
     bot_status = {
@@ -1733,7 +2405,11 @@ async def status():
 @app.get("/", response_class=HTMLResponse)
 async def webui(request: Request):
     _prune_webui_sessions()
-    sid, token = _create_webui_session()
+    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    if _load_webui_session(sid):
+        token = _rotate_webui_token(sid)
+    else:
+        sid, token = _create_webui_session()
     html = (TEMPLATE_PATH.read_text()
             .replace("__WEBUI_CSRF_TOKEN__", json.dumps(token))
             .replace("__DEFAULT_MODEL__", json.dumps(DEFAULT_MODEL)))
