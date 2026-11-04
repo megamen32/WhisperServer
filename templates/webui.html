@@ -390,7 +390,7 @@
         .progress-meta { display: none; justify-content: space-between; gap: 12px; margin-top: 8px; color: #879ab2; font-size: .78rem; }
         .progress-meta.visible { display: flex; }
         .output { width: 100%; max-height: none; overflow: visible; margin-top: 28px; padding: 0; border: 0; border-radius: 0; background: transparent; }
-        .transcript-toolbar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px; border: 1px solid #293445; border-radius: 14px; background: #111923ed; backdrop-filter: blur(14px); }
+        .transcript-toolbar, .summary-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 0; }
         .search-box { flex: 1 1 250px; display: flex; align-items: center; gap: 9px; min-width: 0; padding: 0 11px; border: 1px solid #344154; border-radius: 10px; background: #0d131c; }
         .search-box span { color: #7e91a9; }
         .search-box input { width: 100%; min-width: 0; height: 40px; border: 0; outline: 0; background: transparent; }
@@ -432,17 +432,18 @@
         .speaker { display: inline; color: #8ccfff; font-size: .86em; font-weight: 700; }
         .segment-text { min-width: 0; color: #e1e7ef; font-size: 1rem; }
         mark { border-radius: 3px; background: #a87d2b; color: #fff7dc; }
+        mark.summary-current { outline: 2px solid #8ccfff; }
         .final-output-wrapper { display: none; }
         .final-output { white-space: pre-wrap; color: #c8d5e4; }
         .copy-result-button { border: 1px solid #38485c; border-radius: 9px; margin: 0; padding: 9px 13px; color: #d9e6f5; background: #182230; cursor: pointer; }
         .copy-result-button.hidden { display: none; }
         .error-output { margin-top: 12px; color: #ff9ea4; }
-        .record-button { margin-top: 12px; min-height: 44px; }
+        .record-button { display: block; margin: 12px auto 0; min-height: 44px; }
         .record-button.recording { border-color: #e58c93; color: #ffd9dc; }
         @media (max-width: 820px) { .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 560px) {
             .page { padding: 25px 14px 72px; } .setup { padding: 14px; } .drop-zone { min-height: 118px; padding: 14px; }
-            .controls { grid-template-columns: 1fr; gap: 13px; } .switch-control { align-items: flex-start; } .action { width: 100%; }
+            .controls { grid-template-columns: 1fr; gap: 13px; } .switch-control { align-items: flex-start; } .action { width: 100%; } .record-button { width: auto; max-width: 100%; }
             .transcript-toolbar { top: 0; gap: 7px; padding: 8px; } .search-box { flex-basis: 100%; }
             .match-count { flex: 1; text-align: left; } .document { padding: 0 4px 20px; }
             .document-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
@@ -483,7 +484,6 @@
                     <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
                 <button type="button" id="cancel-job" class="action" hidden disabled>Отменить задание</button>
-                <button type="button" id="toggle-times" class="action">Показать таймкоды</button>
             </div>
             <select id="job-history" hidden aria-label="История заданий"><option value="">Нет выбранного задания</option></select>
             <div id="diarize-status" class="status-bar" aria-live="polite"></div>
@@ -494,14 +494,6 @@
             <div class="status-bar" id="status-bar">Готово</div>
         </section>
         <section class="output" aria-label="Текст расшифровки">
-            <div class="transcript-toolbar" role="search">
-                <label class="search-box"><span aria-hidden="true">⌕</span><input id="transcript-search" type="search" placeholder="Найти в расшифровке…" autocomplete="off" aria-label="Найти в расшифровке"></label>
-                <span class="match-count" id="match-count" aria-live="polite">0 фрагментов</span>
-                <button type="button" class="tool-button" id="previous-match" aria-label="Предыдущее совпадение">↑</button>
-                <button type="button" class="tool-button" id="next-match" aria-label="Следующее совпадение">↓</button>
-                <button type="button" class="tool-button" id="copy-result-button" title="Скопировать расшифровку">Копировать</button>
-                <button type="button" class="tool-button accent" id="summarize-button" disabled title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
-            </div>
             <details class="byok-settings">
                 <summary>Настройки суммаризации</summary>
                 <div class="byok-fields">
@@ -515,6 +507,15 @@
             </details>
             <article class="panel document">
                 <div class="document-heading"><h2>Расшифровка</h2><span class="document-meta" id="document-meta">Текст появится здесь после загрузки аудио</span></div>
+                <div class="transcript-toolbar" role="search" aria-label="Действия с расшифровкой">
+                    <label class="search-box"><span aria-hidden="true">⌕</span><input id="transcript-search" type="search" placeholder="Найти в расшифровке…" autocomplete="off" aria-label="Найти в расшифровке"></label>
+                    <span class="match-count" id="match-count" aria-live="polite">0 фрагментов</span>
+                    <button type="button" class="tool-button" id="previous-match" aria-label="Предыдущее совпадение в расшифровке">↑</button>
+                    <button type="button" class="tool-button" id="next-match" aria-label="Следующее совпадение в расшифровке">↓</button>
+                    <button type="button" class="tool-button" id="copy-result-button" title="Скопировать расшифровку">Копировать</button>
+                    <button type="button" class="tool-button" id="toggle-times">Показать таймкоды</button>
+                    <button type="button" class="tool-button accent" id="summarize-button" disabled title="Сделать краткую выжимку расшифровки">Суммаризировать</button>
+                </div>
                 <div id="transcript" class="transcript-container" aria-live="polite"><div class="empty-state">Загрузите аудиофайл, чтобы начать.<br>Расшифровка будет показана целиком в документе ниже.</div></div>
                 <div class="final-output-wrapper"><div id="final-output" class="final-output"></div></div>
             </article>
@@ -523,9 +524,16 @@
                     <h2>Краткая выжимка</h2>
                     <span class="summary-meta" id="summary-meta"></span>
                 </div>
+                <div class="summary-toolbar" role="search" aria-label="Действия с выжимкой">
+                    <label class="search-box"><span aria-hidden="true">⌕</span><input id="summary-search" type="search" placeholder="Найти в выжимке…" autocomplete="off" aria-label="Найти в выжимке"></label>
+                    <span class="match-count" id="summary-match-count" aria-live="polite"></span>
+                    <button type="button" class="tool-button" id="summary-previous-match" aria-label="Предыдущее совпадение в выжимке">↑</button>
+                    <button type="button" class="tool-button" id="summary-next-match" aria-label="Следующее совпадение в выжимке">↓</button>
+                    <button type="button" class="tool-button" id="copy-summary-button">Копировать</button>
+                    <button type="button" class="tool-button" id="refresh-summary-button">Обновить выжимку</button>
+                </div>
                 <div class="summary-text" id="summary-text"></div>
                 <div class="summary-status" id="summary-status" aria-live="polite"></div>
-                <div style="margin-top: 14px;"><button type="button" class="tool-button" id="copy-summary-button">Скопировать выжимку</button> <button type="button" class="tool-button" id="refresh-summary-button">Обновить выжимку</button></div>
             </section>
             <div id="error-output" class="error-output" aria-live="assertive"></div>
         </section>
@@ -558,10 +566,55 @@
         const summarizeButton = document.getElementById('summarize-button');
         const summaryPanel = document.getElementById('summary-panel');
         const summaryText = document.getElementById('summary-text');
+        const summarySearch = document.getElementById('summary-search');
+        const summaryMatchCount = document.getElementById('summary-match-count');
+        const summaryPrevious = document.getElementById('summary-previous-match');
+        const summaryNext = document.getElementById('summary-next-match');
         const summaryMeta = document.getElementById('summary-meta');
         const summaryStatus = document.getElementById('summary-status');
         const copySummaryButton = document.getElementById('copy-summary-button');
         let rawSummary = '';
+        let summaryMatches = [];
+        let summaryMatchIndex = -1;
+
+        function refreshSummarySearch() {
+            for (const mark of summaryText.querySelectorAll('mark[data-summary-match]')) mark.replaceWith(document.createTextNode(mark.textContent));
+            summaryText.normalize();
+            summaryMatches = []; summaryMatchIndex = -1;
+            const query = summarySearch.value.trim().toLocaleLowerCase();
+            if (query) {
+                const walker = document.createTreeWalker(summaryText, NodeFilter.SHOW_TEXT);
+                const nodes = [];
+                while (walker.nextNode()) nodes.push(walker.currentNode);
+                for (const node of nodes) {
+                    const value = node.nodeValue, lower = value.toLocaleLowerCase();
+                    let start = 0, index = lower.indexOf(query);
+                    if (index < 0) continue;
+                    const fragment = document.createDocumentFragment();
+                    while (index >= 0) {
+                        fragment.append(document.createTextNode(value.slice(start, index)));
+                        const mark = document.createElement('mark'); mark.dataset.summaryMatch = ''; mark.textContent = value.slice(index, index + query.length);
+                        fragment.append(mark); summaryMatches.push(mark);
+                        start = index + query.length; index = lower.indexOf(query, start);
+                    }
+                    fragment.append(document.createTextNode(value.slice(start))); node.replaceWith(fragment);
+                }
+            }
+            summaryPrevious.disabled = summaryNext.disabled = !summaryMatches.length;
+            summaryMatchCount.textContent = query ? `Найдено: ${summaryMatches.length}` : '';
+        }
+        function moveSummaryMatch(direction) {
+            if (!summaryMatches.length) return;
+            if (summaryMatchIndex >= 0) summaryMatches[summaryMatchIndex].classList.remove('summary-current');
+            summaryMatchIndex = summaryMatchIndex < 0 ? (direction < 0 ? summaryMatches.length - 1 : 0) : (summaryMatchIndex + direction + summaryMatches.length) % summaryMatches.length;
+            const match = summaryMatches[summaryMatchIndex]; match.classList.add('summary-current');
+            match.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            summaryMatchCount.textContent = `${summaryMatchIndex + 1} / ${summaryMatches.length}`;
+        }
+        summarySearch.addEventListener('input', refreshSummarySearch);
+        summaryPrevious.addEventListener('click', () => moveSummaryMatch(-1));
+        summaryNext.addEventListener('click', () => moveSummaryMatch(1));
+        refreshSummarySearch();
 
         const UPLOAD_SPEED_PREFIX = 'Скорость загрузки:';
         const UPLOAD_ESTIMATE_PREFIX = 'Осталось:';
@@ -1146,7 +1199,7 @@
             segmentsProcessed = 0; matchingSegments = []; activeMatchIndex = -1;
             transcriptContainer.replaceChildren(); finalOutput.textContent = ''; documentMeta.textContent = 'Выберите задание или загрузите аудио';
             transcriptId = ''; summarizeButton.disabled = true; hideCopyButton();
-            summaryPanel.hidden = true; summaryText.textContent = ''; rawSummary = '';
+            summaryPanel.hidden = true; summaryText.textContent = ''; rawSummary = ''; summarySearch.value = ''; refreshSummarySearch();
             summaryMeta.textContent = ''; summaryStatus.textContent = '';
             toggleTimes.hidden = true; progressBar.style.width = '0%'; updateMatchCount();
         }
@@ -1207,6 +1260,7 @@
             rawSummary = text || '';
             if (typeof html === 'string') summaryText.innerHTML = html;
             else summaryText.textContent = rawSummary;
+            refreshSummarySearch();
         }
         async function restoreSummary(id, version, job) {
             const attempt = job.attempt;
