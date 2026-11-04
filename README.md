@@ -156,9 +156,15 @@ sudo systemctl status whisperserver --no-pager
 
 ```bash
 pip install -e ".[dev]"
+npm ci --omit=dev --ignore-scripts
 pytest -q
 python -m py_compile main.py telegram_bot.py whisperclient/*.py tests/*.py
 ```
+
+Для суммаризации со своим ключом нужен Node.js 22 и зависимости из `package-lock.json`.
+В настройках суммаризации можно выбрать провайдера, изменить адрес и модель и
+ввести собственный API-ключ. Ключ не сохраняется в истории и хранится в памяти
+страницы до её закрытия или обновления. Стандартный режим работает без Node.js.
 
 ## License
 

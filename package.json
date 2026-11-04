@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@bezrabotnyi/byok": "github:megamen32/byok#v1.8.5"
+  }
+}
