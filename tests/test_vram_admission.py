@@ -127,11 +127,13 @@ def test_diarization_cpu_is_an_explicit_opt_in(monkeypatch):
 def test_diarization_gpu_keeps_the_broker_path(monkeypatch):
     monkeypatch.setattr(main, "DIARIZATION_DEVICE", "cuda")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(main, "ManagedModel", lambda **kwargs: kwargs)
+    monkeypatch.setattr(main, "_load_diarization_model", lambda device: SimpleNamespace(
+        unload=lambda: None, to_device=lambda target: SimpleNamespace(device=target)))
+    monkeypatch.setattr(main, "ManagedModel", lambda **kwargs: SimpleNamespace(**kwargs))
     entry = main._create_diarization_entry()
-    assert entry["model_id"] == "whisper-community-1"
-    assert entry["vram_mb"] == 1536
-    assert entry["client_id"] == main.BROKER_CLIENT_ID
+    assert entry.model_id == "whisper-community-1"
+    assert entry.vram_mb == 1536
+    assert entry.client_id == main.BROKER_CLIENT_ID
 
 
 def test_diarization_auto_downgrades_only_when_the_card_is_full(monkeypatch):
@@ -147,6 +149,8 @@ def test_diarization_auto_uses_the_gpu_when_there_is_room(monkeypatch):
     monkeypatch.setattr(main, "DIARIZATION_DEVICE", "auto")
     monkeypatch.setattr(main, "physical_free_vram_mb", lambda: 12000.0)
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(main, "ManagedModel", lambda **kwargs: kwargs)
+    monkeypatch.setattr(main, "_load_diarization_model", lambda device: SimpleNamespace(
+        unload=lambda: None, to_device=lambda target: SimpleNamespace(device=target)))
+    monkeypatch.setattr(main, "ManagedModel", lambda **kwargs: SimpleNamespace(**kwargs))
     entry = main._create_diarization_entry()
-    assert entry["model_id"] == "whisper-community-1"
+    assert entry.model_id == "whisper-community-1"

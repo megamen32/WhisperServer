@@ -772,15 +772,35 @@ def _create_diarization_entry():
         return _load_diarization_model("cpu")
     if ManagedModel is None:
         raise RuntimeError("Community-1 GPU requires cudabroker_client")
-    return ManagedModel(
-        model_id="whisper-community-1",
-        loader=lambda: _load_diarization_model("cuda"),
-        vram_mb=DIARIZATION_VRAM_MB,
-        gpu_priority=MODEL_PRIORITY.get("gigaam-v3", 10) + 1,
-        cpu_capable=False,
-        ttl_seconds=900,
-        client_id=BROKER_CLIENT_ID,
-    )
+    # Cold imports and CPU weight preparation can exceed the broker heartbeat
+    # deadline. Reserve GPU only for the short transfer and actual inference.
+    prepared = [_load_diarization_model("cpu")]
+    def promote_prepared():
+        if not prepared:
+            raise RuntimeError("Prepared diarizer was already consumed")
+        model = prepared.pop()
+        try:
+            return model.to_device("cuda")
+        except BaseException:
+            model.unload()
+            raise
+    try:
+        entry = ManagedModel(
+            model_id="whisper-community-1",
+            loader=promote_prepared,
+            vram_mb=DIARIZATION_VRAM_MB,
+            gpu_priority=MODEL_PRIORITY.get("gigaam-v3", 10) + 1,
+            cpu_capable=False,
+            ttl_seconds=900,
+            client_id=BROKER_CLIENT_ID,
+        )
+        entry._whisper_prepared_diarizer = prepared
+        return entry
+    except BaseException:
+        if prepared:
+            prepared.pop().unload()
+        raise
+
 
 
 @contextmanager
@@ -802,6 +822,9 @@ def _diarization_model_session():
         succeeded = True
     finally:
         try:
+            prepared = getattr(entry, "_whisper_prepared_diarizer", None)
+            if prepared:
+                prepared.pop().unload()
             if model is not None:
                 if succeeded and hasattr(model, "park_cpu") and hasattr(model, "cpu_size_bytes"):
                     model.park_cpu()
