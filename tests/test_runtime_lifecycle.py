@@ -44,6 +44,7 @@ async def test_health_follows_worker_admission_and_handshake(monkeypatch):
         response = await client.get("/health")
         assert response.status_code == 503
         assert response.json()["worker"]["ready"] is False
+        assert response.json()["worker"]["pid"] is None
         state.worker_ready = True
         state.worker_accepting = True
         response = await client.get("/health")
@@ -226,13 +227,16 @@ def test_diarizer_parks_before_lease_release_and_discards_failed_inference(monke
 async def test_recovered_jobs_wait_for_current_worker_handshake_once(monkeypatch):
     import queue
     state, seen = main.app.state, []
-    recovered = {"id": "recovered-job", "owner": "owner", "attempt": 2}
+    recovered = {"id": "recovered-job", "owner": "owner", "attempt": 2, "status": "queued"}
     for key, value in {
         "worker_generation": 3, "worker_ready": False, "worker_accepting": False,
-        "startup_recovered_jobs": [recovered],
+        "deferred_web_jobs": {}, "lifecycle_stop": asyncio.Event(),
+        "model_process": SimpleNamespace(is_alive=lambda: True),
     }.items():
         monkeypatch.setattr(state, key, value, raising=False)
     monkeypatch.setattr(main, "_launch_job", lambda owner, job: seen.append((owner, job)))
+    monkeypatch.setattr(main, "_job_store", lambda: SimpleNamespace(get=lambda owner, job_id: recovered))
+    main._defer_or_launch_web_job("owner", recovered)
     old = queue.Queue()
     old.put({"__worker_ready__": True})
     old.put(None)
@@ -245,4 +249,73 @@ async def test_recovered_jobs_wait_for_current_worker_handshake_once(monkeypatch
     await asyncio.wait_for(main.response_listener(None, current, generation=3), 2)
     assert state.worker_ready and state.worker_accepting
     assert seen == [("owner", recovered)]
-    assert state.startup_recovered_jobs == []
+    assert state.deferred_web_jobs == {}
+    state.worker_ready = state.worker_accepting = False
+    state.lifecycle_stop.set()
+    shutdown = queue.Queue()
+    shutdown.put({"__worker_ready__": True})
+    shutdown.put(None)
+    await asyncio.wait_for(main.response_listener(None, shutdown, generation=3), 2)
+    assert not state.worker_ready and not state.worker_accepting
+
+
+@pytest.mark.asyncio
+async def test_worker_retry_waits_for_ready_and_skips_cancelled_jobs(monkeypatch, tmp_path):
+    import queue
+    state, decoded = main.app.state, []
+    monkeypatch.setattr(main, "WEBUI_JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(main, "_job_tasks", set())
+    monkeypatch.setattr(main, "_job_tasks_by_attempt", {}, raising=False)
+    for key, value in {
+        "worker_generation": 3, "worker_ready": False, "worker_accepting": False,
+        "model_process": SimpleNamespace(is_alive=lambda: True),
+        "deferred_web_jobs": {}, "job_cancel_flags": {}, "lifecycle_stop": asyncio.Event(),
+    }.items():
+        monkeypatch.setattr(state, key, value, raising=False)
+    store = main._job_store()
+
+    def queued_job():
+        job = store.create("owner", {"filename": "recording.wav", "model": "small", "diarize": False})
+        (main._job_spool().root / job["id"]).write_bytes(b"audio")
+        return store.enqueue("owner", job["id"], job["attempt"])
+
+    async def transcribe(*args, **kwargs):
+        if not main._worker_accepts_requests():
+            return main.JSONResponse({"error": "Model worker unavailable", "code": "worker_stopped"}, status_code=503)
+        decoded.append(kwargs["web_job_key"])
+        return {"text": "recovered", "segments": []}
+
+    monkeypatch.setattr(main, "_transcribe_impl", transcribe)
+    defer = getattr(main, "_defer_or_launch_web_job", main._launch_job)
+    recovered = queued_job()
+    defer("owner", recovered)
+    defer("owner", recovered)
+    await asyncio.sleep(.01)
+    assert store.get("owner", recovered["id"])["status"] == "queued"
+    assert not decoded
+
+    cancelled = queued_job()
+    defer("owner", cancelled)
+    store.request_cancel("owner", cancelled["id"], cancelled["attempt"])
+    old = queue.Queue()
+    old.put({"__worker_ready__": True})
+    old.put(None)
+    await asyncio.wait_for(main.response_listener(None, old, generation=2), 2)
+    assert not state.worker_ready and not decoded
+    current = queue.Queue()
+    current.put({"__worker_ready__": True})
+    current.put({"__worker_ready__": True})
+    current.put(None)
+    await asyncio.wait_for(main.response_listener(None, current, generation=3), 2)
+    await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 2)
+    assert decoded == [(recovered["id"], recovered["attempt"])]
+    assert store.get("owner", recovered["id"])["status"] == "done"
+    assert store.get("owner", cancelled["id"])["status"] == "cancelled"
+    assert state.deferred_web_jobs == {}
+
+    immediate = queued_job()
+    defer("owner", immediate)
+    defer("owner", immediate)
+    await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 2)
+    assert decoded.count((immediate["id"], immediate["attempt"])) == 1
+    assert store.get("owner", immediate["id"])["status"] == "done"

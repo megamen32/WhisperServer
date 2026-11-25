@@ -265,6 +265,7 @@ WEBUI_MAX_FILE_BYTES = int(os.getenv("WEBUI_MAX_FILE_BYTES", str(256 * 1024 * 10
 WEBUI_MAX_CHUNK_BYTES = 2 * 1024 * 1024
 WEBUI_MAX_SPOOL_BYTES = int(os.getenv("WEBUI_MAX_SPOOL_BYTES", str(2 * 1024 ** 3)))
 _job_tasks = set()
+_job_tasks_by_attempt = {}
 _job_lock = asyncio.Lock()
 _job_worker_slot = asyncio.Semaphore(1)
 
@@ -1364,15 +1365,14 @@ async def response_listener(stop_event, response_queue, retire_event=None, *, ge
                 if result is None or result.get("__shutdown__"):
                     break
                 if result.get('__worker_ready__'):
-                    if generation is None or generation == getattr(app.state, 'worker_generation', None):
+                    lifecycle_stop = getattr(app.state, 'lifecycle_stop', None)
+                    if ((generation is None or generation == getattr(app.state, 'worker_generation', None))
+                            and not (lifecycle_stop is not None and lifecycle_stop.is_set())):
                         app.state.worker_ready = True
                         app.state.worker_accepting = True
                         app.state.worker_failure_reason = None
                         app.state.worker_start_deadline = None
-                        recovered = getattr(app.state, 'startup_recovered_jobs', [])
-                        app.state.startup_recovered_jobs = []
-                        for job in recovered:
-                            _launch_job(job['owner'], job)
+                        _drain_deferred_web_jobs()
                     continue
                 request_id = result["request_id"]
                 logger.debug("Worker response request=%s kind=%s", request_id,
@@ -1449,6 +1449,7 @@ def _worker_health():
     restart_at = getattr(app.state, 'worker_restart_at', None)
     return {
         'running': running,
+        'pid': getattr(process, 'pid', None),
         'ready': running and bool(getattr(app.state, 'worker_ready', False)),
         'accepting': _worker_accepts_requests(),
         'generation': getattr(app.state, 'worker_generation', 0),
@@ -1624,11 +1625,11 @@ async def startup_event():
         response_listener(stop_event, response_queue, app.state.response_listener_retire, generation=0)
     )
     store = _job_store()
-    app.state.startup_recovered_jobs = []
+    app.state.deferred_web_jobs = {}
     if hasattr(store, 'recover_interrupted') and hasattr(store, 'retry_if_diarization_changed'):
-        # A spawned worker is alive before its imports and queue loop are ready.
-        # Hand recovered jobs to the first valid readiness signal, not to a 503.
-        app.state.startup_recovered_jobs = _recover_web_jobs(store)
+        # Process restarts and worker-only restarts share the same readiness gate.
+        for job in _recover_web_jobs(store):
+            _defer_or_launch_web_job(job['owner'], job)
     else:
         logger.warning('Web job restart recovery is unavailable: JobStore.recover_interrupted is missing')
     app.state.model_usage = model_usage
@@ -2025,10 +2026,54 @@ def _create_idempotent_job(store, owner, request_id, settings):
 
 
 def _launch_job(owner, job):
+    key = (owner, job['id'], job['attempt'])
+    registry = _job_tasks_by_attempt
+    active = registry.get(key)
+    if active is not None and not active.done():
+        return active
     generation = getattr(app.state, 'worker_generation', None)
     task = asyncio.create_task(_run_web_job(owner, job['id'], job['attempt'], generation))
+    registry[key] = task
     _job_tasks.add(task)
     task.add_done_callback(_job_tasks.discard)
+
+    def forget(finished):
+        if registry.get(key) is finished:
+            registry.pop(key, None)
+
+    task.add_done_callback(forget)
+    return task
+
+
+def _defer_or_launch_web_job(owner, job):
+    """Keep durable retries queued until the current worker can accept them."""
+    deferred = getattr(app.state, 'deferred_web_jobs', None)
+    if deferred is None:
+        deferred = app.state.deferred_web_jobs = {}
+    key = (owner, job['id'], job['attempt'])
+    if job.get('status') != 'queued':
+        deferred.pop(key, None)
+        return None
+    deferred[key] = job
+    if not _worker_accepts_requests():
+        return None
+    try:
+        current = _job_store().get(owner, job['id'])
+    except JobNotFound:
+        deferred.pop(key, None)
+        return None
+    if current['attempt'] != job['attempt'] or current['status'] != 'queued':
+        deferred.pop(key, None)
+        return None
+    task = _launch_job(owner, current)
+    deferred.pop(key, None)
+    return task
+
+
+def _drain_deferred_web_jobs():
+    for (owner, _job_id, _attempt), job in tuple(
+            getattr(app.state, 'deferred_web_jobs', {}).items()):
+        _defer_or_launch_web_job(owner, job)
 
 
 async def _run_web_job(owner, job_id, attempt, generation=None):
