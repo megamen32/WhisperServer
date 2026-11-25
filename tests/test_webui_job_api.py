@@ -430,6 +430,7 @@ async def test_idempotent_create_http_retry_and_owner_isolation():
 
 
 def test_idempotent_create_concurrent_transactions():
+    main._job_store().session_owner('owner')
     # Focused integration: SQLite serializes separate writers and commits the
     # request key with the job. Expected <1s, maximum 5s.
     barrier = threading.Barrier(2)

@@ -326,6 +326,8 @@ def _session_db():
     db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, token TEXT NOT NULL, expires REAL NOT NULL)")
     existed = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='csrf_tokens'").fetchone()
     db.execute("CREATE TABLE IF NOT EXISTS csrf_tokens (session_id TEXT NOT NULL, token TEXT NOT NULL, expires REAL NOT NULL, PRIMARY KEY(session_id, token))")
+    db.execute("CREATE INDEX IF NOT EXISTS sessions_expires ON sessions(expires)")
+    db.execute("CREATE INDEX IF NOT EXISTS csrf_tokens_expires ON csrf_tokens(expires)")
     if not existed:
         db.execute("INSERT OR IGNORE INTO csrf_tokens SELECT id, token, expires FROM sessions WHERE expires > ?", (time.time(),))
     db.commit()
@@ -336,7 +338,7 @@ def _save_webui_session(sid):
     session = _webui_sessions[sid]
     with _session_db() as db:
         db.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", (sid, session['token'], session['expires']))
-        db.execute("DELETE FROM csrf_tokens WHERE expires <= ?", (time.time(),))
+        db.execute("DELETE FROM csrf_tokens WHERE rowid IN (SELECT rowid FROM csrf_tokens WHERE expires<=? ORDER BY expires LIMIT 500)", (time.time(),))
         db.execute("INSERT INTO csrf_tokens VALUES (?, ?, ?)", (sid, session['token'], session['expires']))
 
 
@@ -565,6 +567,28 @@ def _prune_webui_sessions(now=None):
         _webui_sessions.pop(sid, None)
 
 
+_identity_cleanup_next = 0.0
+_identity_cleanup_lock = threading.Lock()
+
+
+def _maybe_cleanup_identities():
+    global _identity_cleanup_next
+    if time.monotonic() < _identity_cleanup_next or not _identity_cleanup_lock.acquire(blocking=False):
+        return
+    try:
+        if time.monotonic() < _identity_cleanup_next:
+            return
+        _identity_cleanup_next = time.monotonic() + 60
+        # _save_webui_session and bind_session have both committed. Cleanup
+        # uses one connection for its short, bounded cross-database transaction.
+        _job_store().prune_expired_sessions(WEBUI_JOB_DIR / 'sessions.sqlite', time.time())
+        _prune_webui_sessions()
+    except sqlite3.OperationalError:
+        logger.warning('Identity expiry cleanup deferred while storage is busy')
+    finally:
+        _identity_cleanup_lock.release()
+
+
 def _create_webui_session(*, bind_owner=True):
     now = time.time()
     sid = secrets.token_urlsafe(32)
@@ -573,6 +597,7 @@ def _create_webui_session(*, bind_owner=True):
     _save_webui_session(sid)
     if bind_owner:
         _job_store().bind_session(sid)
+        _maybe_cleanup_identities()
     return sid, token
 
 
@@ -2531,11 +2556,12 @@ def _job_owner(request):
     return session['owner_id']
 
 
-def _forget_webui_session(sid):
+def _forget_webui_session(sid, *, retain_expiry=False):
     _webui_sessions.pop(sid, None)
     with _session_db() as db:
         db.execute("DELETE FROM csrf_tokens WHERE session_id=?", (sid,))
-        db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        if not retain_expiry:
+            db.execute("DELETE FROM sessions WHERE id=?", (sid,))
 
 
 async def _identity_payload(request):
@@ -2597,7 +2623,7 @@ async def web_identity_recover(request: Request):
     except BaseException:
         _forget_webui_session(new_sid)
         raise
-    _forget_webui_session(current_sid)
+    _forget_webui_session(current_sid, retain_expiry=True)
     # The legacy transcript tunnel uses the same stable owner as durable jobs.
     for entry in _webui_transcripts.values():
         if entry.get('session_id') == current_owner:
@@ -2686,7 +2712,7 @@ def _create_idempotent_job(store, owner, request_id, settings):
     store._identity(owner, 'owner')
     encoded = store._json(settings)
     with store._transaction() as db:
-        store._assert_owner_active(db, owner)
+        store._assert_owner_active(db, owner, require_known=True)
         db.execute('''CREATE TABLE IF NOT EXISTS webui_create_requests (
             owner TEXT NOT NULL, request_id TEXT NOT NULL, settings TEXT NOT NULL,
             job_id TEXT NOT NULL,
@@ -2936,8 +2962,10 @@ async def web_jobs_create(request: Request):
             raise ValueError('client_request_id must be a nonempty string of at most 128 bytes')
         settings = dict(filename=filename, size=size, model=model, diarize=diarize, desired_diarize=diarize)
         store = _job_store()
-        job = store.create(owner, settings) if request_id is None else _create_idempotent_job(store, owner, request_id, settings)
+        job = store.create(owner, settings, require_known_owner=True) if request_id is None else _create_idempotent_job(store, owner, request_id, settings)
         return _job_view(job)
+    except OwnerRevoked as error:
+        raise HTTPException(status_code=403, detail=str(error))
     except (ValueError, AttributeError, TypeError) as error:
         raise HTTPException(status_code=400, detail=str(error))
 

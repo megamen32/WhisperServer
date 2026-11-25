@@ -316,6 +316,44 @@ class JobStore:
             snapshots = [self._raw_record(db, row, include_result=False, include_summaries=False) for row in rows]
         return [self._decode_record(snapshot) for snapshot in snapshots]
 
+    def prune_expired_sessions(self, session_path, now, *, limit=500):
+        """Bounded cleanup using the authentication database's existing expiry.
+
+        One connection acquires both write reservations before reading expiry.
+        Callers must close session transactions first, so there is no nested
+        session->job write lock and renewal cannot race the expiry decision.
+        """
+        limit = max(1, min(500, int(limit)))
+        db = sqlite3.connect(self.path, timeout=min(self.timeout, .25), isolation_level=None)
+        try:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute('ATTACH DATABASE ? AS auth', (str(session_path),))
+            db.execute('BEGIN IMMEDIATE')
+            mappings = db.execute("""DELETE FROM webui_session_owners WHERE session_id IN (
+                SELECT m.session_id FROM webui_session_owners m
+                LEFT JOIN auth.sessions s ON s.id=m.session_id
+                WHERE s.id IS NULL OR s.expires<=? LIMIT ?)""", (now, limit)).rowcount
+            # A revoked mapping with an unexpired auth row keeps its owner
+            # tombstone until expiry, even if no history remains.
+            owners = db.execute("""DELETE FROM webui_owners WHERE id IN (
+                SELECT o.id FROM webui_owners o WHERE o.recovery_hash IS NULL
+                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.owner=o.id)
+                AND NOT EXISTS (SELECT 1 FROM webui_session_owners s WHERE s.owner_id=o.id)
+                LIMIT ?)""", (limit,)).rowcount
+            tokens = db.execute("""DELETE FROM auth.csrf_tokens WHERE rowid IN (
+                SELECT rowid FROM auth.csrf_tokens WHERE expires<=? ORDER BY expires LIMIT ?)""",
+                (now, limit)).rowcount
+            sessions = db.execute("""DELETE FROM auth.sessions WHERE id IN (
+                SELECT id FROM auth.sessions WHERE expires<=? ORDER BY expires LIMIT ?)""",
+                (now, limit)).rowcount
+            db.commit()
+            return {'mappings': mappings, 'owners': owners, 'tokens': tokens, 'sessions': sessions}
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def bind_session(self, session_id, owner=None):
         """Bind a new browser session to a durable owner; never reuse session IDs."""
         self._identity(session_id, 'session_id')
@@ -328,9 +366,9 @@ class JobStore:
             return owner
 
     @staticmethod
-    def _assert_owner_active(db, owner):
+    def _assert_owner_active(db, owner, *, require_known=False):
         row = db.execute('SELECT retired FROM webui_owners WHERE id=?', (owner,)).fetchone()
-        if row and row['retired']:
+        if (require_known and row is None) or (row and row['retired']):
             raise OwnerRevoked('History ownership changed; reload the page')
 
     def session_owner(self, session_id):
@@ -423,13 +461,13 @@ class JobStore:
                        (self._json(settings), _now(), job_id))
             return self._record(db, self._owned(db, owner, job_id))
 
-    def create(self, owner, diarization):
+    def create(self, owner, diarization, *, require_known_owner=False):
         self._identity(owner, 'owner')
         job_id = uuid.uuid4().hex
         settings = self._json(diarization)
         now = _now()
         with self._transaction() as db:
-            self._assert_owner_active(db, owner)
+            self._assert_owner_active(db, owner, require_known=require_known_owner)
             if db.execute('SELECT count(*) FROM jobs').fetchone()[0] >= self.max_jobs:
                 raise CapacityExceeded('max_jobs reached')
             db.execute('INSERT INTO jobs VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)',
