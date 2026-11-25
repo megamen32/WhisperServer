@@ -29,9 +29,10 @@ import hashlib
 import hmac
 import weakref
 from contextlib import asynccontextmanager, contextmanager, ExitStack
-from faster_whisper import WhisperModel
-from gigaam_backend import GigaAMModel
-from parakeet_backend import ParakeetModel
+from runtime_support import LazyImport, RestartBudget, IdleModelCache, cuda_device_visible
+WhisperModel = LazyImport("faster_whisper", "WhisperModel")
+GigaAMModel = LazyImport("gigaam_backend", "GigaAMModel")
+ParakeetModel = LazyImport("parakeet_backend", "ParakeetModel")
 from metrics import diarized_segment
 from diarization_backend import diarize_audio, attribute_segment, speaker_text, Community1Model
 try:
@@ -40,7 +41,7 @@ except Exception:
     ManagedModel = None  # type: ignore
 from diskcache import Cache
 from dotenv import load_dotenv
-import torch
+torch = LazyImport("torch")
 from metrics import (
     append_cache_metric,
     append_metric,
@@ -124,7 +125,7 @@ if CPU_FALLBACK_MODEL not in WHISPER_MODEL_IDS:
     logger.warning("Unknown CPU_FALLBACK_MODEL=%s; falling back to small", CPU_FALLBACK_MODEL)
     CPU_FALLBACK_MODEL = "small"
 DEFAULT_MODEL = os.getenv("MODEL") or (
-    "gigaam-v3" if torch.cuda.is_available() else CPU_FALLBACK_MODEL
+    "gigaam-v3" if cuda_device_visible() else CPU_FALLBACK_MODEL
 )
 METRICS_JSONL_PATH = os.getenv("WHISPER_METRICS_JSONL", "whisper_metrics.jsonl")
 configure_metrics(METRICS_JSONL_PATH)
@@ -690,6 +691,30 @@ def _create_model_entry(model_name: str):
 
 
 DIARIZATION_VRAM_MB = 1536
+_diarization_cpu_cache = IdleModelCache(
+    ttl=float(os.getenv("WHISPER_DIARIZATION_CACHE_TTL_SECONDS", "300")),
+    max_bytes=int(os.getenv("WHISPER_DIARIZATION_CACHE_MAX_BYTES", str(1024 ** 3))),
+)
+
+
+def _prune_idle_diarizer():
+    _diarization_cpu_cache.prune()
+
+
+def _clear_idle_diarizer():
+    _diarization_cpu_cache.clear()
+
+
+def _load_diarization_model(device):
+    model = _diarization_cpu_cache.take()
+    if model is not None:
+        try:
+            return model.to_device(device)
+        except BaseException:
+            model.unload()
+            raise
+    return Community1Model.from_pretrained(device)
+
 
 
 def _create_diarization_entry():
@@ -700,14 +725,14 @@ def _create_diarization_entry():
         free = physical_free_vram_mb()
         device = "cuda" if (free is None or free >= DIARIZATION_VRAM_MB + VRAM_HEADROOM_MB) else "cpu"
     if device == "cpu":
-        return Community1Model.from_pretrained("cpu")
+        return _load_diarization_model("cpu")
     if not torch.cuda.is_available():
-        return Community1Model.from_pretrained("cpu")
+        return _load_diarization_model("cpu")
     if ManagedModel is None:
         raise RuntimeError("Community-1 GPU requires cudabroker_client")
     return ManagedModel(
         model_id="whisper-community-1",
-        loader=lambda: Community1Model.from_pretrained("cuda"),
+        loader=lambda: _load_diarization_model("cuda"),
         vram_mb=DIARIZATION_VRAM_MB,
         gpu_priority=MODEL_PRIORITY.get("gigaam-v3", 10) + 1,
         cpu_capable=False,
@@ -718,10 +743,12 @@ def _create_diarization_entry():
 
 @contextmanager
 def _diarization_model_session():
-    """Keep the lease active for inference; free it before the ASR stage."""
+    """Cache only successful CPU weights; always release the GPU lease."""
     entry = _create_diarization_entry()
     model = None
+    parked = None
     scope = ExitStack()
+    succeeded = False
     try:
         if ManagedModel is not None and isinstance(entry, ManagedModel):
             entry.acquire()
@@ -730,22 +757,40 @@ def _diarization_model_session():
             model = entry
         logger.info("Community-1 inference on %s", model.device)
         yield model
+        succeeded = True
     finally:
         try:
             if model is not None:
-                model.unload()
+                if succeeded and hasattr(model, "park_cpu") and hasattr(model, "cpu_size_bytes"):
+                    model.park_cpu()
+                    parked = model
+                else:
+                    model.unload()
         except Exception as exc:
-            # Inactive exception frames otherwise retain the CUDA model itself.
+            succeeded = False
             traceback.clear_frames(exc.__traceback__)
             raise
         finally:
             model = None
             try:
                 scope.close()
+            except BaseException:
+                succeeded = False
+                raise
             finally:
-                if ManagedModel is not None and isinstance(entry, ManagedModel):
-                    entry.release()
-                entry = None
+                try:
+                    if ManagedModel is not None and isinstance(entry, ManagedModel):
+                        entry.release()
+                except BaseException:
+                    succeeded = False
+                    raise
+                finally:
+                    entry = None
+                    if parked is not None:
+                        if succeeded:
+                            _diarization_cpu_cache.put(parked)
+                        else:
+                            parked.unload()
 
 
 def _is_truthy(value):
@@ -1273,7 +1318,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
             entry.release()
 
 
-async def response_listener(stop_event, response_queue, retire_event=None):
+async def response_listener(stop_event, response_queue, retire_event=None, *, generation=None):
     loop = asyncio.get_running_loop()
     inbox = asyncio.Queue(maxsize=1)
     reader_stop = threading.Event()
@@ -1318,8 +1363,20 @@ async def response_listener(stop_event, response_queue, retire_event=None):
                     break
                 if result is None or result.get("__shutdown__"):
                     break
-                logger.info(f'response_listener get from queue result {result}')
+                if result.get('__worker_ready__'):
+                    if generation is None or generation == getattr(app.state, 'worker_generation', None):
+                        app.state.worker_ready = True
+                        app.state.worker_accepting = True
+                        app.state.worker_failure_reason = None
+                        app.state.worker_start_deadline = None
+                        recovered = getattr(app.state, 'startup_recovered_jobs', [])
+                        app.state.startup_recovered_jobs = []
+                        for job in recovered:
+                            _launch_job(job['owner'], job)
+                    continue
                 request_id = result["request_id"]
+                logger.debug("Worker response request=%s kind=%s", request_id,
+                             "terminal" if ("result" in result or "error" in result) else "progress")
                 progress_callback = pending_progress.get(request_id)
                 if progress_callback is not None and ("progress" in result or "segment" in result):
                     try:
@@ -1369,24 +1426,78 @@ async def response_listener(stop_event, response_queue, retire_event=None):
 
 
 def _worker_accepts_requests():
-    # Legacy tests and embedders may provide their own request queue.
+    # Legacy embedders may provide their own request queue without a worker.
     if not hasattr(app.state, 'worker_accepting'):
         return getattr(app.state, 'request_queue', None) is not None
     process = getattr(app.state, 'model_process', None)
-    return bool(app.state.worker_accepting and process is not None and process.is_alive())
+    return bool(app.state.worker_accepting and getattr(app.state, 'worker_ready', True)
+                and process is not None and process.is_alive())
+
+
+def _runtime_version():
+    return {
+        'revision': os.getenv('WHISPER_BUILD_REVISION') or None,
+        'runtime': os.getenv('WHISPER_RUNTIME_ID') or None,
+        'lock': os.getenv('WHISPER_LOCK_SHA256') or None,
+    }
+
+
+def _worker_health():
+    process = getattr(app.state, 'model_process', None)
+    running = bool(process is not None and process.is_alive())
+    policy = getattr(app.state, 'worker_restart_policy', None)
+    restart_at = getattr(app.state, 'worker_restart_at', None)
+    return {
+        'running': running,
+        'ready': running and bool(getattr(app.state, 'worker_ready', False)),
+        'accepting': _worker_accepts_requests(),
+        'generation': getattr(app.state, 'worker_generation', 0),
+        'restarts': getattr(app.state, 'worker_restarts', 0),
+        'restarts_in_window': policy.count() if policy is not None else 0,
+        'restart_in_seconds': max(0.0, round(restart_at - time.monotonic(), 2)) if restart_at else None,
+        'reason': getattr(app.state, 'worker_failure_reason', None),
+    }
+
+
+def _new_restart_budget():
+    return RestartBudget(
+        limit=int(os.getenv('WHISPER_WORKER_RESTART_LIMIT', '3')),
+        window=float(os.getenv('WHISPER_WORKER_RESTART_WINDOW_SECONDS', '300')),
+        base_delay=float(os.getenv('WHISPER_WORKER_RESTART_BASE_SECONDS', '1')),
+        max_delay=float(os.getenv('WHISPER_WORKER_RESTART_MAX_SECONDS', '30')),
+    )
+
+
+def _worker_start_deadline():
+    return time.monotonic() + max(1.0, float(os.getenv('WHISPER_WORKER_START_TIMEOUT_SECONDS', '90')))
 
 
 async def _worker_supervisor(ctx):
-    """Replace one dead generation without replaying its queued requests."""
+    """Recover generations under a rolling restart budget, never replay IPC work."""
+    policy = getattr(app.state, 'worker_restart_policy', None)
+    if policy is None:
+        policy = app.state.worker_restart_policy = _new_restart_budget()
     while not app.state.lifecycle_stop.is_set():
         await asyncio.sleep(.2)
         process = app.state.model_process
-        if process is None or process.is_alive():
+        if process is not None and process.is_alive():
+            deadline = getattr(app.state, 'worker_start_deadline', None)
+            if not getattr(app.state, 'worker_ready', True) and deadline and time.monotonic() >= deadline:
+                app.state.worker_failure_reason = 'worker_start_timeout'
+                app.state.worker_accepting = False
+                process.terminate()
+                process.join(timeout=.1)
+                if process.is_alive() and hasattr(process, 'kill'):
+                    process.kill()
+                continue
             continue
         app.state.worker_accepting = False
+        app.state.worker_ready = False
         app.state.worker_generation += 1
+        app.state.worker_failure_reason = 'worker_exited'
         logger.error('Model worker exited; closing admission')
-        # Let the old listener dispatch replies already sent before the crash.
+        # Drain the retired channel before replacing it, so terminal replies
+        # already in flight remain authoritative.
         await asyncio.sleep(1)
         if app.state.lifecycle_stop.is_set():
             return
@@ -1394,18 +1505,19 @@ async def _worker_supervisor(ctx):
         app.state.response_listener_retire.set()
         done, _ = await asyncio.wait({listener}, timeout=2)
         if not done:
-            # Never close a queue or discard pending requests while its reader
-            # can still consume an answer. Keep admission closed on this fault.
+            app.state.worker_failure_reason = 'response_reader_stuck'
             logger.error('Worker response reader did not retire; recovery halted')
             return
         if app.state.lifecycle_stop.is_set():
             return
         for request_id, future in list(pending_results.items()):
             pending_results.pop(request_id, None)
+            pending_progress.pop(request_id, None)
             if not future.done():
                 future.set_exception(WorkerStopped('Model worker stopped before responding'))
         for request_id, stream in list(pending_streams.items()):
             pending_streams.pop(request_id, None)
+            pending_progress.pop(request_id, None)
             await stream.put({'error': 'Model worker stopped before responding'})
             await stream.put(None)
         for old_queue in (app.state.request_queue, app.state.response_queue):
@@ -1414,10 +1526,19 @@ async def _worker_supervisor(ctx):
                 old_queue.close()
             except (OSError, ValueError, AttributeError):
                 pass
-        process.join(timeout=0)
-        if app.state.worker_restarts >= 1 or app.state.lifecycle_stop.is_set():
-            logger.error('Model worker restart limit reached; admission remains closed')
+        if process is not None:
+            process.join(timeout=0)
+        delay = policy.delay()
+        app.state.worker_restart_at = time.monotonic() + delay
+        app.state.worker_failure_reason = 'restart_backoff'
+        try:
+            await asyncio.wait_for(app.state.lifecycle_stop.wait(), timeout=delay)
             return
+        except asyncio.TimeoutError:
+            pass
+        if app.state.lifecycle_stop.is_set():
+            return
+        policy.record()
         app.state.worker_restarts += 1
         request_queue, response_queue = ctx.Queue(), ctx.Queue()
         replacement = ctx.Process(target=model_worker, args=(request_queue, response_queue,
@@ -1425,19 +1546,26 @@ async def _worker_supervisor(ctx):
         try:
             replacement.start()
         except Exception:
+            app.state.worker_failure_reason = 'worker_start_failed'
             logger.exception('Could not restart model worker')
             for new_queue in (request_queue, response_queue):
                 new_queue.cancel_join_thread()
                 new_queue.close()
-            return
+            continue
         app.state.request_queue = request_queue
         app.state.response_queue = response_queue
         app.state.model_process = replacement
+        app.state.worker_ready = False
+        app.state.worker_accepting = False
+        app.state.worker_restart_at = None
+        app.state.worker_start_deadline = _worker_start_deadline()
+        app.state.worker_failure_reason = 'worker_starting'
         app.state.response_listener_retire = asyncio.Event()
         app.state.response_listener_task = asyncio.create_task(response_listener(
-            app.state.stop_event, response_queue, app.state.response_listener_retire))
-        app.state.worker_accepting = True
-        logger.info('Model worker restarted with new queues')
+            app.state.stop_event, response_queue, app.state.response_listener_retire,
+            generation=app.state.worker_generation))
+        logger.info('Model worker started with new queues; awaiting readiness')
+
 
 
 def _recover_web_jobs(store):
@@ -1485,15 +1613,22 @@ async def startup_event():
     app.state.job_cancel_flags = job_cancel_flags
     app.state.worker_generation = 0
     app.state.worker_restarts = 0
-    app.state.worker_accepting = True
+    app.state.worker_restart_policy = _new_restart_budget()
+    app.state.worker_ready = False
+    app.state.worker_accepting = False
+    app.state.worker_restart_at = None
+    app.state.worker_start_deadline = _worker_start_deadline()
+    app.state.worker_failure_reason = 'worker_starting'
     app.state.response_listener_retire = asyncio.Event()
     app.state.response_listener_task = asyncio.create_task(
-        response_listener(stop_event, response_queue, app.state.response_listener_retire)
+        response_listener(stop_event, response_queue, app.state.response_listener_retire, generation=0)
     )
     store = _job_store()
+    app.state.startup_recovered_jobs = []
     if hasattr(store, 'recover_interrupted') and hasattr(store, 'retry_if_diarization_changed'):
-        for job in _recover_web_jobs(store):
-            _launch_job(job['owner'], job)
+        # A spawned worker is alive before its imports and queue loop are ready.
+        # Hand recovered jobs to the first valid readiness signal, not to a 503.
+        app.state.startup_recovered_jobs = _recover_web_jobs(store)
     else:
         logger.warning('Web job restart recovery is unavailable: JobStore.recover_interrupted is missing')
     app.state.model_usage = model_usage
@@ -1506,6 +1641,8 @@ async def shutdown_event():
     global model_usage
     logger.info("Остановка процесса...")
     app.state.worker_accepting = False
+    app.state.worker_ready = False
+    app.state.worker_failure_reason = "shutting_down"
     if hasattr(app.state, "lifecycle_stop"):
         app.state.lifecycle_stop.set()
     if hasattr(app.state, 'worker_supervisor_task'):
@@ -2627,7 +2764,18 @@ async def status():
         "pid": bot_process.pid if bot_process else None,
         "returncode": bot_process.poll() if bot_process else None,
     }
-    return {"queue_size": queue_size, "model_usage": usage, "telegram_bot": bot_status}
+    return {"queue_size": queue_size, "model_usage": usage, "telegram_bot": bot_status,
+            "worker": _worker_health(), "version": _runtime_version()}
+
+
+@app.get("/health")
+async def health():
+    worker = _worker_health()
+    ready = worker['ready'] and worker['accepting']
+    return JSONResponse({"status": "ready" if ready else "unavailable",
+                         "worker": worker, "version": _runtime_version()},
+                        status_code=200 if ready else 503,
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -12,6 +12,8 @@ import shutil
 from pathlib import Path
 
 MODEL_ID = "pyannote/speaker-diarization-community-1"
+DIARIZATION_MODEL_REVISION = "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee"
+DIARIZATION_ADAPTER_VERSION = "community1-v1"
 MAX_PCM_BYTES = 2 * 1024 ** 3
 SAMPLE_RATE = 16000
 ACCESS_ERROR = 'Community-1 недоступна: примите условия модели в Hugging Face и настройте HF_TOKEN на сервере'
@@ -22,7 +24,8 @@ def _load_pipeline(pipeline_type):
     from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
     try:
         pipeline = pipeline_type.from_pretrained(
-            MODEL_ID, token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
+            MODEL_ID, revision=DIARIZATION_MODEL_REVISION,
+            token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN"),
         )
     except HfHubHTTPError as exc:
         if isinstance(exc, GatedRepoError) or getattr(exc.response, 'status_code', None) in {401, 403}:
@@ -53,21 +56,54 @@ class Community1Model:
         pipeline.to(torch.device(device))
         return cls(pipeline, device)
 
-    def unload(self):
-        """Free CUDA tensors, including WeSpeaker's class-level frame caches."""
-        import torch
-        pipeline = self.pipeline
-        if pipeline is None:
-            return
-        pipeline.to(torch.device("cpu"))
-        embedding = getattr(getattr(pipeline, "_embedding", None), "model_", None)
-        models = list(getattr(pipeline, "_models", {}).values())
+    def _clear_frame_caches(self):
+        embedding = getattr(getattr(self.pipeline, "_embedding", None), "model_", None)
+        models = list(getattr(self.pipeline, "_models", {}).values())
         if embedding is not None:
             models.extend([embedding, getattr(embedding, "resnet", None)])
         for model in models:
             cached = getattr(model, "num_frames", None)
             if hasattr(cached, "cache_clear"):
                 cached.cache_clear()
+
+    def to_device(self, device):
+        import torch
+        if self.pipeline is None:
+            raise RuntimeError("Diarization pipeline is unloaded")
+        self.pipeline.to(torch.device(device))
+        self.device = str(device)
+        return self
+
+    def park_cpu(self):
+        """Keep reusable weights on CPU before releasing the GPU lease."""
+        if self.pipeline is not None:
+            self.to_device("cpu")
+            self._clear_frame_caches()
+
+    def cpu_size_bytes(self):
+        """Count unique parameter/buffer storages without copying model data."""
+        if self.pipeline is None or self.device != "cpu":
+            return 0
+        embedding = getattr(getattr(self.pipeline, "_embedding", None), "model_", None)
+        models = list(getattr(self.pipeline, "_models", {}).values())
+        if embedding is not None:
+            models.append(embedding)
+        storages = {}
+        for model in models:
+            for method in ("parameters", "buffers"):
+                iterator = getattr(model, method, None)
+                if iterator is None:
+                    continue
+                for tensor in iterator():
+                    if str(tensor.device) != "cpu":
+                        return 0  # Unknown GPU retention must not enter the CPU cache.
+                    storage = tensor.untyped_storage()
+                    storages[storage.data_ptr()] = storage.nbytes()
+        return sum(storages.values())
+
+    def unload(self):
+        """Drop reusable CPU weights and any frame caches."""
+        self.park_cpu()
         self.pipeline = None
         self.device = "unloaded"
 

@@ -9,7 +9,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
+from runtime_support import LazyImport
+torch = LazyImport("torch")
 
 
 logger = logging.getLogger(__name__)

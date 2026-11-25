@@ -790,21 +790,26 @@ async def test_active_cancellation_requires_channel(monkeypatch):
 @pytest.mark.asyncio
 async def test_supervisor_replaces_dead_worker_without_replaying_queue(monkeypatch):
     # Focused integration: close admission, fail old pending/queued work, run a
-    # fresh job on fresh queues and enforce one restart. Max 8s, no GPU.
+    # fresh job on fresh queues and enforce a rolling restart budget. Max 8s, no GPU.
+    from runtime_support import RestartBudget
+    monkeypatch.setattr(main.app.state, 'worker_ready', False, raising=False)
+    monkeypatch.setattr(main.app.state, 'worker_restart_policy', RestartBudget(limit=1, window=10, base_delay=0, max_delay=0), raising=False)
     class FakeQueue(queue.Queue):
         closed = False
         def cancel_join_thread(self): pass
         def close(self): self.closed = True
     class FakeProcess:
-        def __init__(self, alive=False): self.alive = alive
+        def __init__(self, alive=False, response=None): self.alive = alive; self.response = response
         def is_alive(self): return self.alive
-        def start(self): self.alive = True
+        def start(self):
+            self.alive = True
+            self.response.put({'__worker_ready__': True})
         def join(self, timeout): pass
     class FakeContext:
         def __init__(self): self.processes = []
         def Queue(self): return FakeQueue()
         def Process(self, **kwargs):
-            process = FakeProcess()
+            process = FakeProcess(response=kwargs['args'][1])
             self.processes.append(process)
             return process
     ctx, old = FakeContext(), FakeProcess()
@@ -877,8 +882,12 @@ async def test_supervisor_replaces_dead_worker_without_replaying_queue(monkeypat
             await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 3)
             assert (await client.get(f'/web/jobs/{job_id}')).json()['result']['text'] == 'fresh'
         ctx.processes[0].alive = False
-        await asyncio.wait_for(supervisor, 3)
+        for _ in range(300):
+            if getattr(main.app.state, 'worker_failure_reason', None) == 'restart_backoff': break
+            await asyncio.sleep(.01)
         assert len(ctx.processes) == 1 and not main.app.state.worker_accepting
+        assert not supervisor.done()
+        assert main._worker_health()['restart_in_seconds'] > 0
     finally:
         main.app.state.lifecycle_stop.set()
         if supervisor is not None:
@@ -895,6 +904,9 @@ async def test_supervisor_replaces_dead_worker_without_replaying_queue(monkeypat
 async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, past_deadline):
     # Focused integration: a read started before retirement holds a final reply;
     # both normal and streaming responses must be delivered. Max 6s; no GPU.
+    from runtime_support import RestartBudget
+    monkeypatch.setattr(main.app.state, 'worker_ready', False, raising=False)
+    monkeypatch.setattr(main.app.state, 'worker_restart_policy', RestartBudget(base_delay=0, max_delay=0), raising=False)
     entered, release = threading.Event(), threading.Event()
     class FakeQueue(queue.Queue):
         def cancel_join_thread(self): pass
@@ -909,13 +921,15 @@ async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, p
                 assert release.wait(6)
             return item
     class Process:
-        def __init__(self, alive=False): self.alive = alive
+        def __init__(self, alive=False, response=None): self.alive = alive; self.response = response
         def is_alive(self): return self.alive
-        def start(self): self.alive = True
+        def start(self):
+            self.alive = True
+            self.response.put({'__worker_ready__': True})
         def join(self, timeout): pass
     class Context:
         def Queue(self): return FakeQueue()
-        def Process(self, **kwargs): return Process()
+        def Process(self, **kwargs): return Process(response=kwargs['args'][1])
     responses, requests = HeldQueue(), FakeQueue()
     responses.put({'request_id': 'normal', 'result': {'text': 'late'}, 'final': True})
     responses.put({'request_id': 'stream', 'segment': {'text': 'segment'}})

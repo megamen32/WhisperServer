@@ -2,50 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Iterable, Mapping
 
-try:
-    import nemo.collections.asr as nemo_asr
-except ImportError as exc:  # Keep Whisper-only deployments startable.
-    nemo_asr = None
-    _NEMO_IMPORT_ERROR = exc
-else:
-    _NEMO_IMPORT_ERROR = None
+from runtime_support import LazyImport
+from transcription_types import ParakeetWord, ParakeetSegment, ParakeetInfo
 
+nemo_asr = LazyImport("nemo.collections.asr")
+_NEMO_IMPORT_ERROR = None
+
+# VAD is needed only when the Parakeet adapter is actually selected.
 from vad_backend import SileroVAD, save_speech_chunk
 
-
 PARAKEET_V3_HF_ID = "nvidia/parakeet-tdt-0.6b-v3"
-
-
-@dataclass(frozen=True)
-class ParakeetWord:
-    """A word timestamp in the format expected by the server worker."""
-
-    start: float
-    end: float
-    word: str
-
-
-@dataclass(frozen=True)
-class ParakeetSegment:
-    """A Parakeet segment normalized to the faster-whisper segment contract."""
-
-    start: float
-    end: float
-    text: str
-    words: tuple[ParakeetWord, ...] = ()
-
-
-@dataclass(frozen=True)
-class ParakeetInfo:
-    """Minimal transcription metadata consumed by the server worker."""
-
-    language: str
-    language_probability: float
 
 
 DEFAULT_VAD_PARAMETERS = {
