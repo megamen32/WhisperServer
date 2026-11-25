@@ -245,17 +245,41 @@ def test_vad_blocks_are_bounded_and_overlap_is_merged(monkeypatch, tmp_path):
 
 
 def test_community_gpu_load_uses_broker_and_no_unmanaged_fallback(monkeypatch):
-    monkeypatch.setattr(main.torch.cuda, 'is_available', lambda: True)
-    calls=[]
-    monkeypatch.setattr(main, 'ManagedModel', lambda **kwargs: calls.append(kwargs) or kwargs)
-    entry=main._create_diarization_entry()
-    assert entry['model_id']=='whisper-community-1'
-    assert entry['vram_mb']==1536
-    assert entry['cpu_capable'] is False
-    assert entry['client_id']==main.BROKER_CLIENT_ID
+    monkeypatch.setattr(main, 'torch', SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)))
+    monkeypatch.setattr(main, 'DIARIZATION_DEVICE', 'cuda')
+    loads, promotions, calls = [], [], []
+    prepared = SimpleNamespace(device='cpu', unload=lambda: None)
+
+    def promote(device):
+        promotions.append(device)
+        prepared.device = device
+        return prepared
+
+    def load(device):
+        loads.append(device)
+        assert device == 'cpu'
+        return prepared
+
+    def managed(**kwargs):
+        assert loads == ['cpu'] and not promotions
+        calls.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    prepared.to_device = promote
+    monkeypatch.setattr(main, '_load_diarization_model', load)
+    monkeypatch.setattr(main, 'ManagedModel', managed)
+    entry = main._create_diarization_entry()
+    assert entry.model_id == 'whisper-community-1'
+    assert entry.vram_mb == 1536
+    assert entry.cpu_capable is False
+    assert entry.client_id == main.BROKER_CLIENT_ID
+    assert prepared.device == 'cpu'
+    assert entry.loader() is prepared
+    assert promotions == ['cuda']
     monkeypatch.setattr(main, 'ManagedModel', None)
-    with pytest.raises(RuntimeError,match='cudabroker_client'):
+    with pytest.raises(RuntimeError, match='cudabroker_client'):
         main._create_diarization_entry()
+    assert loads == ['cpu'] and len(calls) == 1
 
 
 @pytest.mark.parametrize('failure', [None, 'inference', 'idle', 'unload'])
