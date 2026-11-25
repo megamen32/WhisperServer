@@ -718,11 +718,10 @@ def _create_model_entry(model_name: str):
         )
 
     if cuda_available:
-        logger.warning(
-            "cudabroker_client unavailable; loading %s directly on GPU.",
-            model_name,
+        raise RuntimeError(
+            f"cudabroker_client is required for CUDA model {model_name}; "
+            "refusing an unmanaged GPU load"
         )
-        return _load_model(model_name, device="cuda", compute_type="float16")
 
     logger.warning(
         "CUDA unavailable; loading %s directly on CPU without a broker lease.",
