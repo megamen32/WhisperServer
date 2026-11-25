@@ -61,6 +61,9 @@ def library_dirs(native, prefix=None):
 
 
 def source_revision(root):
+    changed = subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=root)
+    if changed.returncode:
+        raise RuntimeError("Source contains uncommitted changes; commit the candidate before sealing or launching")
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
 
 

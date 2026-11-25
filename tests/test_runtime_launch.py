@@ -58,3 +58,17 @@ def test_launcher_discards_foreign_cuda_paths(tmp_path, monkeypatch):
     assert env["LD_LIBRARY_PATH"] == ""
     assert env["WHISPER_RUNTIME_ID"] == "checked"
     assert env["WHISPER_BUILD_REVISION"] == "abc"
+
+
+def test_uncommitted_source_cannot_claim_a_sealed_revision(tmp_path):
+    import subprocess
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    source = tmp_path / 'main.py'
+    source.write_text('version = 1\n')
+    subprocess.run(['git', 'add', 'main.py'], cwd=tmp_path, check=True)
+    subprocess.run(['git', '-c', 'user.name=Runtime test', '-c', 'user.email=runtime-test@example.invalid',
+                    'commit', '-qm', 'fixture'], cwd=tmp_path, check=True)
+    assert runtime.source_revision(tmp_path)
+    source.write_text('version = 2\n')
+    with pytest.raises(RuntimeError, match='uncommitted'):
+        runtime.source_revision(tmp_path)
