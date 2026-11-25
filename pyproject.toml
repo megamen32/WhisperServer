@@ -10,7 +10,7 @@ dependencies = [
     "diskcache~=5.6.3",
     "faster-whisper",
     "nvidia-cublas-cu12",
-    "nvidia-cudnn-cu12>=9,<10",
+    # torch owns cuDNN; cu12/cu13 wheels overwrite the same library files.
     "nemo_toolkit[asr]",
     "silero-vad",
     "torch",
@@ -51,7 +51,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend", "webui_jobs", "webui_uploads"]
+py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend", "webui_jobs", "webui_uploads", "runtime_support", "transcription_types"]
 
 [tool.setuptools.data-files]
 "share/whisperserver" = ["byok_bridge.mjs", "package.json", "package-lock.json", "templates/byok-presets.json", "templates/webui.html"]

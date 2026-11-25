@@ -3,16 +3,15 @@
 ## Environment
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --locked --python 3.10 --extra diarization --extra dev --no-install-project
+.venv/bin/python scripts/runtime.py seal
 cp .env.example .env
 ```
 
 ## Run
 
 ```bash
-python main.py
+.venv/bin/python scripts/runtime.py run
 ```
 
 ## Tests
@@ -83,7 +82,7 @@ A completed job replaces the partial transcript with its final result.
 
 Production on server 88 runs the canonical checkout
 `/home/roomhacker/PycharmProjects/WhisperServer` on `main` using its
-`.venv-new/bin/python`. `deploy/whisperserver.service` is the source for the
+`.venv/bin/python`. `deploy/whisperserver.service` is the source for the
 service command. Release directories and stacked `ExecStart` overrides must
 not select a second application version. Keep runtime settings and stored jobs
 outside Git. Before restarting, check for active jobs and preserve the job store.
@@ -95,8 +94,37 @@ cancellation, and actual GPU transcription are verified in the existing server
 environment:
 
 ```bash
-.venv-new/bin/python -m pytest -q -m "not integration"
+.venv/bin/python -m pytest -q -m "not integration"
 ```
 
 After deployment, test an uncached audio job through the public Web UI and
 confirm that partial text and progress arrive before the terminal result.
+
+
+## Reproducible native runtime
+
+Use `uv sync --locked --python 3.10 --extra diarization --extra dev --no-install-project`
+to build a clean candidate environment. `UV_PROJECT_ENVIRONMENT` can point to an
+empty directory on persistent storage. The active checkout uses only `.venv`.
+Do not install `nvidia-cudnn-cu12` alongside the cuDNN wheel selected by PyTorch:
+both distributions own the same `nvidia/cudnn/lib` files and installation order
+can mix incompatible sublibraries even when `uv pip check` passes.
+
+After the source is committed, run the candidate interpreter with
+`scripts/runtime.py seal`. This verifies NVIDIA shared libraries against wheel
+SHA256 records and records the source commit, lock digest and complete package
+inventory in the environment. `scripts/runtime.py check` is the cheap activation
+gate; a changed lock, package set, source revision, or native-file size invalidates
+it. The launcher constructs CUDA paths only from this environment and exposes
+`WHISPER_BUILD_REVISION`, `WHISPER_LOCK_SHA256`, and `WHISPER_RUNTIME_ID` to the app.
+
+Before activation, test actual GPU inference with an uncached audio fixture,
+including diarization and a Whisper backend. During activation, stop the service
+before changing the canonical checkout or the `.venv` link, fast-forward `main`
+to the tested commit, install `deploy/whisperserver.service`, and start the whole
+service. Never update HTML/source underneath a running process. Keep one rollback
+archive outside the checkout. Confirm the public consumer and `/health` after
+activation, and compare `/status` revision/runtime identity to the candidate.
+
+Runtime model references are pinned in the GigaAM and diarization adapters.
+An intentional model or dependency update requires resealing and the GPU gate.

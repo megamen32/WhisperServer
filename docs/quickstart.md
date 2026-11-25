@@ -5,16 +5,16 @@
 ```bash
 git clone https://github.com/megamen32/WhisperServer.git
 cd WhisperServer
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e "."
+uv sync --locked --python 3.10 --extra diarization --no-install-project
+.venv/bin/python scripts/runtime.py seal
 cp .env.example .env
 ```
 
 Для разработки дополнительно:
 
 ```bash
-pip install -e ".[dev]"
+uv sync --locked --python 3.10 --extra diarization --extra dev --no-install-project
+.venv/bin/python scripts/runtime.py seal
 ```
 
 ## 2. Настройка `.env`
@@ -31,7 +31,7 @@ TG_BOT_ENABLED=false
 ## 3. Запуск
 
 ```bash
-python main.py
+.venv/bin/python scripts/runtime.py run
 ```
 
 Сервер слушает `0.0.0.0:7653`; локально он доступен как `http://127.0.0.1:7653`.
