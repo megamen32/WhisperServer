@@ -129,6 +129,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("inspect", "seal", "check", "run"))
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7653)
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -140,7 +142,8 @@ def main():
             env, value = checked_environment(args.root)
             if args.command == "run":
                 os.chdir(args.root)
-                os.execve(sys.executable, [sys.executable, str(args.root / "main.py")], env)
+                os.execve(sys.executable, [sys.executable, "-m", "uvicorn", "main:app",
+                                          "--host", args.host, "--port", str(args.port)], env)
         print(json.dumps({key: value[key] for key in ("source_revision", "lock_sha256", "runtime_id", "library_dirs") if key in value}, indent=2))
     except (RuntimeError, OSError, ValueError) as exc:
         print(f"Whisper runtime: {exc}", file=sys.stderr)
