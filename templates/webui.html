@@ -518,6 +518,7 @@
                     <small>Определять, кто говорит в каждом фрагменте</small>
                 </label>
                 <button type="button" id="cancel-job" class="action" hidden disabled>Отменить задание</button>
+                <button type="button" id="retry-job" class="action" hidden>Повторить обработку</button>
             </div>
             <select id="job-history" hidden aria-label="История заданий"><option value="">Нет выбранного задания</option></select>
             <div id="diarize-status" class="status-bar" aria-live="polite"></div>
@@ -1221,6 +1222,12 @@
                     const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'history-delete'; remove.textContent = 'Удалить из истории';
                     remove.addEventListener('click', () => deleteHistoryJob(option.value, option.dataset.filename || option.value, remove));
                     const choices = document.createElement('div'); choices.className = 'history-menu';
+                    if (['error', 'failed'].includes(option.dataset.status) && option.dataset.sourceAvailable !== 'false') {
+                        const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'retry-action';
+                        retry.textContent = 'Повторить обработку'; retry.disabled = retryingJobs.has(option.value);
+                        retry.addEventListener('click', () => retryHistoryJob(option.value, retry));
+                        choices.appendChild(retry);
+                    }
                     if (['done', 'completed'].includes(option.dataset.status) && (option.dataset.sourceAvailable !== 'false' || option.dataset.sourceRemovalPending === 'true')) {
                         const source = document.createElement('button'); source.type = 'button'; source.className = 'source-action';
                         source.textContent = option.dataset.sourceRemovalPending === 'true' ? 'Повторить удаление аудио' : 'Удалить только аудио';
@@ -1248,6 +1255,8 @@
             if (preset) { document.getElementById('byok-format').value = preset.apiFormat; document.getElementById('byok-url').value = preset.baseUrl; document.getElementById('byok-model').value = preset.modelId; }
         });
         const cancelButton = document.getElementById('cancel-job');
+        const retryButton = document.getElementById('retry-job');
+        const retryingJobs = new Set();
         const diarizeInput = document.getElementById('diarize');
         const diarizeStatus = document.getElementById('diarize-status');
         const storageWarning = document.getElementById('storage-warning');
@@ -1561,6 +1570,8 @@
             errorOutput.textContent = job.error ? (typeof job.error === 'string' ? job.error : JSON.stringify(job.error)) : '';
             const active = ['uploading', 'queued', 'processing', 'cancel_requested'].includes(status);
             isProcessing = active;
+            retryButton.hidden = !['error', 'failed'].includes(status) || job.source_available === false;
+            retryButton.disabled = retryingJobs.has(String(job.id));
             cancelButton.hidden = !active;
             cancelButton.disabled = !active || status === 'cancel_requested' || cancelling;
             cancelButton.textContent = status === 'cancel_requested' || cancelling ? 'Отменяем…' : 'Отменить задание';
@@ -1731,7 +1742,7 @@
             needsFile = false; cancelling = false; currentFile = null; isProcessing = false;
             volatileJobId = ''; storageWarning.textContent = '';
             errorOutput.textContent = ''; diarizeStatus.textContent = ''; clearResult(); hideUploadProgress();
-            cancelButton.disabled = true; cancelButton.hidden = true; historySelect.value = selectedJobId;
+            cancelButton.disabled = true; cancelButton.hidden = true; retryButton.hidden = true; historySelect.value = selectedJobId;
             renderHistory();
             try { await storage('readwrite', 'selected', selectedJobId); } catch (_) {}
             if (!selectedJobId || !isCurrent(String(id), version)) return;
@@ -1798,6 +1809,7 @@
             }
         }
         historySelect.addEventListener('change', () => selectJob(historySelect.value));
+        retryButton.addEventListener('click', () => retryHistoryJob(selectedJobId, retryButton));
         cancelButton.addEventListener('click', async () => {
             const id = selectedJobId, version = generation;
             if (!id || cancelling) return;
@@ -1882,6 +1894,22 @@
                     : error.message;
             } finally { recoveryInput.value = ''; button.disabled = false; }
         });
+        async function retryHistoryJob(id, button) {
+            if (!id || retryingJobs.has(id)) return;
+            const version = generation;
+            retryingJobs.add(id); button.disabled = true; button.textContent = 'Повторяем…';
+            try {
+                await api(`${jobUrl(id)}/retry`, { method: 'POST', control: true, refreshToken: true, retryCsrf: true });
+                await loadHistory();
+                if (generation === version) { await selectJob(id); closeHistory(); }
+            } catch (error) {
+                if (generation === version) errorOutput.textContent = error.message;
+            } finally {
+                retryingJobs.delete(id); button.disabled = false; button.textContent = 'Повторить обработку';
+                retryButton.disabled = retryingJobs.has(selectedJobId); renderHistory();
+            }
+        }
+
         async function deleteSourceAudio(id, filename, button) {
             if (!id || button.disabled || !window.confirm(`Удалить исходное аудио «${filename}»? Текст и выжимки останутся в истории. Для повторного распознавания или смены разметки говорящих потребуется снова загрузить файл.`)) return;
             button.disabled = true;
