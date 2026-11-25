@@ -4,7 +4,10 @@ Each operation opens its own connection, so instances can be used by different
 threads or processes. Owner identifiers must come from the authenticated caller,
 not from untrusted request data. Payloads are JSON-compatible values.
 """
+import hashlib
 import json
+import re
+import secrets
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -17,6 +20,16 @@ class JobNotFound(LookupError):
 
 class InvalidTransition(ValueError):
     """The requested state transition is no longer valid."""
+
+
+class OwnerRevoked(InvalidTransition):
+    """A retired owner/session cannot gain access to its replacement owner."""
+
+
+class IdentityConflict(InvalidTransition):
+    def __init__(self, code, message, count=0):
+        super().__init__(message)
+        self.code, self.count = code, count
 
 
 class CapacityExceeded(ValueError):
@@ -70,6 +83,14 @@ class JobStore:
                 failures INTEGER NOT NULL, checkpoint INTEGER NOT NULL,
                 phase TEXT, unit TEXT, reason TEXT, quarantined INTEGER NOT NULL
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS webui_owners (
+                id TEXT PRIMARY KEY, recovery_hash TEXT UNIQUE, retired INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS webui_session_owners (
+                session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES webui_owners(id),
+                revoked INTEGER NOT NULL DEFAULT 0)""")
+            db.execute('CREATE INDEX IF NOT EXISTS webui_session_owner ON webui_session_owners(owner_id)')
+
             db.execute("""CREATE TABLE IF NOT EXISTS job_streams (
                 job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
                 attempt INTEGER NOT NULL, epoch INTEGER NOT NULL, segment_count INTEGER NOT NULL,
@@ -295,12 +316,120 @@ class JobStore:
             snapshots = [self._raw_record(db, row, include_result=False, include_summaries=False) for row in rows]
         return [self._decode_record(snapshot) for snapshot in snapshots]
 
+    def bind_session(self, session_id, owner=None):
+        """Bind a new browser session to a durable owner; never reuse session IDs."""
+        self._identity(session_id, 'session_id')
+        with self._transaction() as db:
+            if owner is None:
+                owner = 'owner_' + uuid.uuid4().hex
+                db.execute('INSERT INTO webui_owners(id,created_at) VALUES (?,?)', (owner, _now()))
+            self._assert_owner_active(db, owner)
+            db.execute('INSERT INTO webui_session_owners VALUES (?,?,0)', (session_id, owner))
+            return owner
+
+    @staticmethod
+    def _assert_owner_active(db, owner):
+        row = db.execute('SELECT retired FROM webui_owners WHERE id=?', (owner,)).fetchone()
+        if row and row['retired']:
+            raise OwnerRevoked('History ownership changed; reload the page')
+
+    def session_owner(self, session_id):
+        """Adopt a valid legacy session without changing its existing job owner."""
+        self._identity(session_id, 'session_id')
+        with self._transaction(readonly=True) as db:
+            row = db.execute('''SELECT s.owner_id,s.revoked,o.retired FROM webui_session_owners s
+                                JOIN webui_owners o ON o.id=s.owner_id WHERE session_id=?''',
+                             (session_id,)).fetchone()
+            if row:
+                if row['revoked'] or row['retired']:
+                    raise OwnerRevoked('Session ownership has changed')
+                return row['owner_id']
+        with self._transaction() as db:
+            self._assert_owner_active(db, session_id)
+            db.execute('INSERT OR IGNORE INTO webui_owners(id,created_at) VALUES (?,?)', (session_id, _now()))
+            db.execute('INSERT OR IGNORE INTO webui_session_owners VALUES (?,?,0)', (session_id, session_id))
+            row = db.execute('''SELECT s.owner_id,s.revoked,o.retired FROM webui_session_owners s
+                                JOIN webui_owners o ON o.id=s.owner_id WHERE session_id=?''',
+                             (session_id,)).fetchone()
+            if row['revoked'] or row['retired']:
+                raise OwnerRevoked('Session ownership has changed')
+            return row['owner_id']
+
+    def transcript_owner(self, owner_or_session):
+        """Compatibility for internal callers of the original transcript helpers."""
+        with self._transaction(readonly=True) as db:
+            row = db.execute('SELECT owner_id FROM webui_session_owners WHERE session_id=?',
+                             (owner_or_session,)).fetchone()
+            return row['owner_id'] if row else owner_or_session
+
+    def identity(self, owner):
+        with self._transaction(readonly=True) as db:
+            self._assert_owner_active(db, owner)
+            row = db.execute('SELECT recovery_hash FROM webui_owners WHERE id=?', (owner,)).fetchone()
+            count = db.execute('SELECT count(*) FROM jobs WHERE owner=?', (owner,)).fetchone()[0]
+            return {'has_recovery_key': bool(row and row['recovery_hash']), 'job_count': count}
+
+    def issue_recovery_key(self, owner, *, replace=False):
+        with self._transaction() as db:
+            self._assert_owner_active(db, owner)
+            row = db.execute('SELECT recovery_hash FROM webui_owners WHERE id=?', (owner,)).fetchone()
+            if row is None:
+                raise OwnerRevoked('Unknown history owner')
+            if row['recovery_hash'] and not replace:
+                raise IdentityConflict('key_exists', 'A recovery key already exists')
+            secret = 'wsr_' + secrets.token_urlsafe(32)
+            digest = hashlib.sha256(secret.encode()).hexdigest()
+            db.execute('UPDATE webui_owners SET recovery_hash=? WHERE id=?', (digest, owner))
+            return secret
+
+    def recover_owner(self, current_owner, current_session, new_session, recovery_key, *, merge_current=False):
+        """Transfer terminal history and rotate identity access in one job DB transaction."""
+        if not isinstance(recovery_key, str) or not re.fullmatch(r'wsr_[A-Za-z0-9_-]{43}', recovery_key):
+            raise ValueError('Invalid recovery key')
+        digest = hashlib.sha256(recovery_key.encode()).hexdigest()
+        with self._transaction() as db:
+            target = db.execute('SELECT id FROM webui_owners WHERE recovery_hash=? AND retired=0',
+                                (digest,)).fetchone()
+            if target is None:
+                raise ValueError('Invalid recovery key')
+            self._assert_owner_active(db, current_owner)
+            owner = target['id']
+            moved = 0
+            if owner != current_owner:
+                active = db.execute("""SELECT count(*) FROM jobs WHERE owner=?
+                    AND status NOT IN ('done','error','cancelled')""", (current_owner,)).fetchone()[0]
+                if active:
+                    raise IdentityConflict('active_jobs', 'Finish or cancel current jobs before recovery', active)
+                count = db.execute('SELECT count(*) FROM jobs WHERE owner=?', (current_owner,)).fetchone()[0]
+                if count and not merge_current:
+                    raise IdentityConflict('merge_required', 'Confirm transfer of current history', count)
+                moved = db.execute('UPDATE jobs SET owner=? WHERE owner=?', (owner, current_owner)).rowcount
+                # Retire the old principal so an in-flight create cannot strand a job.
+                db.execute('UPDATE webui_owners SET retired=1,recovery_hash=NULL WHERE id=?', (current_owner,))
+                db.execute('UPDATE webui_session_owners SET revoked=1 WHERE owner_id=?', (current_owner,))
+            db.execute('UPDATE webui_session_owners SET revoked=1 WHERE session_id=?', (current_session,))
+            db.execute('INSERT INTO webui_session_owners VALUES (?,?,0)', (new_session, owner))
+            return {'owner': owner, 'merged_jobs': moved}
+
+    def mark_source_removed(self, owner, job_id, *, confirmed=False):
+        with self._transaction() as db:
+            row = self._owned(db, owner, job_id)
+            if row['status'] != 'done':
+                raise InvalidTransition('Source audio can only be removed from a completed job')
+            settings = json.loads(row['diarization'])
+            settings['source_removed'] = True
+            settings['source_removal_pending'] = not confirmed
+            db.execute('UPDATE jobs SET diarization=?,updated_at=? WHERE id=?',
+                       (self._json(settings), _now(), job_id))
+            return self._record(db, self._owned(db, owner, job_id))
+
     def create(self, owner, diarization):
         self._identity(owner, 'owner')
         job_id = uuid.uuid4().hex
         settings = self._json(diarization)
         now = _now()
         with self._transaction() as db:
+            self._assert_owner_active(db, owner)
             if db.execute('SELECT count(*) FROM jobs').fetchone()[0] >= self.max_jobs:
                 raise CapacityExceeded('max_jobs reached')
             db.execute('INSERT INTO jobs VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)',
@@ -389,6 +518,8 @@ class JobStore:
             if status in ('uploading', 'queued'):
                 settings['diarize'] = desired
             elif status in ('done', 'error') and settings['diarize'] != desired:
+                if json.loads(row['diarization']).get('source_removed'):
+                    raise InvalidTransition('Source audio was removed; upload the file again to reprocess')
                 settings['diarize'] = desired
                 status, next_attempt = 'queued', attempt + 1
                 db.execute('DELETE FROM summaries WHERE job_id=?', (job_id,))
@@ -490,6 +621,8 @@ class JobStore:
             row = self._owned(db, owner, job_id)
             if row['status'] not in ('done', 'error', 'cancelled'):
                 raise InvalidTransition('only terminal jobs can be retried')
+            if json.loads(row['diarization']).get('source_removed'):
+                raise InvalidTransition('Source audio was removed; upload the file again to reprocess')
             db.execute('DELETE FROM summaries WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM job_recovery WHERE job_id=?', (job_id,))
             db.execute('''UPDATE jobs SET attempt=attempt+1, status='queued', diarization=?,

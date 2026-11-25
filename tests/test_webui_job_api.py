@@ -312,7 +312,7 @@ async def test_summary_rejects_changed_attempt(monkeypatch):
     monkeypatch.setattr(main, '_omniroute_api_key', lambda: 'test')
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
         token = (await client.post('/web/session', headers={'origin': 'http://testserver'})).json()['token']
-        owner = client.cookies[main.WEBUI_SESSION_COOKIE]
+        owner = main._load_webui_session(client.cookies[main.WEBUI_SESSION_COOKIE])["owner_id"]
         store = main._job_store()
         settings = {'filename': 'x', 'size': 3, 'model': 'small', 'diarize': False, 'desired_diarize': False}
         job = store.create(owner, settings)
@@ -350,7 +350,7 @@ async def test_delete_and_cancel_free_full_spool(monkeypatch):
         assert (await mutate('PUT', f'/web/jobs/{first}/upload?offset=0', content=b'abc')).status_code == 200
         assert (await mutate('PUT', f'/web/jobs/{second}/upload?offset=0', content=b'def')).status_code == 400
         assert (await mutate('DELETE', f'/web/jobs/{first}')).status_code == 409
-        owner = client.cookies[main.WEBUI_SESSION_COOKIE]
+        owner = main._load_webui_session(client.cookies[main.WEBUI_SESSION_COOKIE])["owner_id"]
         store = main._job_store()
         store.enqueue(owner, first, 1)
         store.start(owner, first, 1)
@@ -784,7 +784,7 @@ async def test_active_cancellation_requires_channel(monkeypatch):
     monkeypatch.setattr(main.app.state, 'job_cancel_flags', None)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
         token = (await client.post('/web/session', headers={'origin': 'http://testserver'})).json()['token']
-        owner = client.cookies[main.WEBUI_SESSION_COOKIE]
+        owner = main._load_webui_session(client.cookies[main.WEBUI_SESSION_COOKIE])["owner_id"]
         store = main._job_store()
         job = store.create(owner, {'filename': 'x', 'size': 3, 'model': 'small', 'diarize': False})
         store.enqueue(owner, job['id'], 1)

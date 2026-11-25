@@ -60,7 +60,7 @@ from metrics import (
 from model_registry import MODEL_PRIORITY, MODEL_SUPERSEDES, WHISPER_MODEL_IDS
 from model_registry import select_compatible_loaded_model as _select_compatible_loaded_model
 from attribution import AttributionStore, normalize_comment
-from webui_jobs import JobStore, JobNotFound, InvalidTransition, CapacityExceeded
+from webui_jobs import IdentityConflict, OwnerRevoked, JobStore, JobNotFound, InvalidTransition, CapacityExceeded
 from webui_uploads import UploadSpool, UploadConflict
 
 load_dotenv()
@@ -346,7 +346,11 @@ def _load_webui_session(sid):
     with _session_db() as db:
         row = db.execute("SELECT token, expires FROM sessions WHERE id=? AND expires>?", (sid, time.time())).fetchone()
     if row:
-        session = {'token': row[0], 'expires': row[1]}
+        try:
+            owner = _job_store().session_owner(sid)
+        except OwnerRevoked:
+            return None
+        session = {'token': row[0], 'expires': row[1], 'owner_id': owner}
         _webui_sessions[sid] = session
         return session
     return None
@@ -355,8 +359,8 @@ def _load_webui_session(sid):
 # The browser never receives the summariser credential and never sends the
 # transcript back for summarisation. The server keeps the text under an opaque
 # id and the browser only sends that id; the server then forwards the text to
-# OmniRoute itself. Ids are unguessable and bound to the session that produced
-# them, so one visitor cannot ask for another visitor's transcript.
+# OmniRoute itself. Ids are unguessable and bound to the durable history owner,
+# so one visitor cannot ask for another visitor's transcript.
 WEBUI_TRANSCRIPT_TTL_SECONDS = int(os.getenv("WEBUI_TRANSCRIPT_TTL_SECONDS", "7200"))
 WEBUI_TRANSCRIPT_MAX_CHARS = int(os.getenv("WEBUI_TRANSCRIPT_MAX_CHARS", "2000000"))
 WEBUI_TRANSCRIPT_MAX_ENTRIES = int(os.getenv("WEBUI_TRANSCRIPT_MAX_ENTRIES", "64"))
@@ -443,6 +447,7 @@ def _prune_webui_transcripts(now=None):
 def _store_webui_transcript(session_id, text):
     """Keep the transcript text server-side and return its opaque id."""
     _prune_webui_transcripts()
+    session_id = _job_store().transcript_owner(session_id)
     if not text:
         return ""
     transcript_id = secrets.token_urlsafe(24)
@@ -456,6 +461,7 @@ def _store_webui_transcript(session_id, text):
 
 
 def _get_webui_transcript(session_id, transcript_id):
+    session_id = _job_store().transcript_owner(session_id)
     _prune_webui_transcripts()
     entry = _webui_transcripts.get(transcript_id or "")
     if not entry:
@@ -464,7 +470,7 @@ def _get_webui_transcript(session_id, transcript_id):
             return _transcript_text_from_payload(job['result']) if job['status'] == 'done' else None
         except JobNotFound:
             return None
-    # The transcript belongs to the session that produced it.
+    # The transcript belongs to the authenticated durable history owner.
     if entry.get("session_id") != session_id:
         return None
     return entry.get("text") or ""
@@ -486,6 +492,7 @@ def _summary_rate_limit(session_id):
 
 def _new_webui_transcript(session_id):
     """Reserve an opaque id before the stream starts; the text arrives later."""
+    session_id = _job_store().transcript_owner(session_id)
     _prune_webui_transcripts()
     transcript_id = secrets.token_urlsafe(24)
     _webui_transcripts[transcript_id] = {
@@ -558,12 +565,14 @@ def _prune_webui_sessions(now=None):
         _webui_sessions.pop(sid, None)
 
 
-def _create_webui_session():
+def _create_webui_session(*, bind_owner=True):
     now = time.time()
     sid = secrets.token_urlsafe(32)
     token = _new_webui_token()
     _webui_sessions[sid] = {"token": token, "expires": now + WEBUI_SESSION_TTL_SECONDS}
     _save_webui_session(sid)
+    if bind_owner:
+        _job_store().bind_session(sid)
     return sid, token
 
 
@@ -2341,9 +2350,108 @@ async def refresh_webui_session(request: Request):
 
 def _job_owner(request):
     sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
-    if not _load_webui_session(sid):
+    session = _load_webui_session(sid)
+    if not session:
         raise HTTPException(status_code=403, detail="Invalid or expired web UI session")
-    return sid
+    return session['owner_id']
+
+
+def _forget_webui_session(sid):
+    _webui_sessions.pop(sid, None)
+    with _session_db() as db:
+        db.execute("DELETE FROM csrf_tokens WHERE session_id=?", (sid,))
+        db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+
+async def _identity_payload(request):
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 4096:
+            raise HTTPException(status_code=413, detail="Identity request too large")
+    try:
+        payload = json.loads(body) if body else {}
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid identity request")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid identity request")
+    return payload
+
+
+@app.get("/web/identity")
+async def web_identity(request: Request):
+    return JSONResponse(_job_store().identity(_job_owner(request)),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/web/identity/recovery-key")
+async def web_identity_key(request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    payload = await _identity_payload(request)
+    replace = payload.get('replace', False)
+    if type(replace) is not bool:
+        raise HTTPException(status_code=400, detail="Invalid replace setting")
+    try:
+        secret = _job_store().issue_recovery_key(owner, replace=replace)
+    except IdentityConflict as error:
+        raise HTTPException(status_code=409, detail={'code': error.code})
+    return JSONResponse({'recovery_key': secret}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/web/identity/recover")
+async def web_identity_recover(request: Request):
+    _consume_webui_token(request)
+    current_owner = _job_owner(request)
+    current_sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    payload = await _identity_payload(request)
+    merge = payload.get('merge_current', False)
+    if type(merge) is not bool:
+        raise HTTPException(status_code=400, detail="Invalid merge setting")
+    new_sid, new_token = _create_webui_session(bind_owner=False)
+    try:
+        restored = await asyncio.to_thread(
+            _job_store().recover_owner, current_owner, current_sid, new_sid,
+            payload.get('recovery_key'), merge_current=merge)
+    except IdentityConflict as error:
+        _forget_webui_session(new_sid)
+        raise HTTPException(status_code=409, detail={'code': error.code, 'count': error.count})
+    except (ValueError, OwnerRevoked):
+        _forget_webui_session(new_sid)
+        raise HTTPException(status_code=400, detail="Ключ восстановления не подходит")
+    except BaseException:
+        _forget_webui_session(new_sid)
+        raise
+    _forget_webui_session(current_sid)
+    # The legacy transcript tunnel uses the same stable owner as durable jobs.
+    for entry in _webui_transcripts.values():
+        if entry.get('session_id') == current_owner:
+            entry['session_id'] = restored['owner']
+    request.state.webui_next_csrf = new_token
+    response = JSONResponse({'ok': True, 'merged_jobs': restored['merged_jobs'], 'token': new_token},
+                            headers={"Cache-Control": "no-store"})
+    _set_webui_session_cookie(response, request, new_sid)
+    return response
+
+
+@app.delete('/web/jobs/{job_id}/source')
+async def web_jobs_remove_source(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    async with _job_state_lock(job_id):
+        _job_get(owner, job_id)
+        try:
+            job = _job_store().mark_source_removed(owner, job_id)
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        try:
+            await asyncio.to_thread(_job_spool().remove, job_id)
+        except OSError:
+            _notify_job(job_id)
+            raise HTTPException(status_code=503, detail="Не удалось удалить аудио. Повторите удаление в меню записи.")
+        job = _job_store().mark_source_removed(owner, job_id, confirmed=True)
+    _notify_job(job_id)
+    return _job_view(job)
 
 
 def _job_get(owner, job_id):
@@ -2368,6 +2476,8 @@ def _job_view(job, *, include_offset=True):
                     'percent': None, 'processed_seconds': 0.0, 'total_seconds': None, 'segments': 0}
     return {**job, **{k: settings[k] for k in ('filename', 'size', 'model')},
             'diarize': settings.get('desired_diarize', settings['diarize']),
+            'source_available': not settings.get('source_removed', False),
+            'source_removal_pending': settings.get('source_removal_pending', False),
             'progress': progress,
             'offset': _job_spool().offset(job['id']) if include_offset else None, 'transcript_id': job['id'] if job['status'] == 'done' else None}
 
@@ -2377,6 +2487,7 @@ def _create_idempotent_job(store, owner, request_id, settings):
     store._identity(owner, 'owner')
     encoded = store._json(settings)
     with store._transaction() as db:
+        store._assert_owner_active(db, owner)
         db.execute('''CREATE TABLE IF NOT EXISTS webui_create_requests (
             owner TEXT NOT NULL, request_id TEXT NOT NULL, settings TEXT NOT NULL,
             job_id TEXT NOT NULL,
@@ -2841,7 +2952,7 @@ async def web_transcribe(
 ):
     """First-party Web UI tunnel: API_KEY stays server-side; CSRF is session-scoped."""
     next_token = _consume_webui_token(request)
-    session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    session_id = _job_owner(request)
     transcript_id = _new_webui_transcript(session_id)
     response = await _transcribe_impl(file, model, language, beam_size, temperature, stream, words, vad_filter, diarize)
     if not hasattr(response, "headers"):
@@ -2867,7 +2978,7 @@ async def web_byok_presets():
 
 @app.post("/web/summarize")
 async def web_summarize(request: Request):
-    """Reuse a session-scoped summary before spending a model request."""
+    """Reuse an owner-scoped summary before spending a model request."""
     next_token = _consume_webui_token(request)
     try:
         payload = await request.json()
@@ -2875,7 +2986,7 @@ async def web_summarize(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-    sid = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    sid = _job_owner(request)
     transcript_id = str(payload.get("transcript_id") or "")
     store = _job_store()
     try:
@@ -2942,7 +3053,7 @@ async def _web_summarize_uncached(request: Request, next_token):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    session_id = request.cookies.get(WEBUI_SESSION_COOKIE, "")
+    session_id = _job_owner(request)
     transcript_id = str(payload.get("transcript_id") or "")
     store = _job_store()
     try:

@@ -346,7 +346,16 @@
         .history-actions summary { display: grid; place-items: center; width: 44px; height: 44px; cursor: pointer; list-style: none; border-radius: 9px; font-size: 1.3rem; }
         .history-actions summary::-webkit-details-marker { display: none; }
         .history-actions summary:hover, .history-actions[open] summary { background: #263343; }
-        .history-delete { position: absolute; z-index: 2; right: 0; top: 44px; min-width: 190px; min-height: 44px; padding: 10px; border: 1px solid #48566b; border-radius: 9px; color: #ffc0c3; background: #1a2533; cursor: pointer; }
+        .history-menu { position: absolute; z-index: 2; right: 0; top: 44px; width: 206px; padding: 4px; border: 1px solid #48566b; border-radius: 9px; background: #1a2533; }
+        .history-menu button { display: block; width: 100%; min-height: 44px; border: 0; border-radius: 6px; background: transparent; text-align: left; padding: 9px; cursor: pointer; }
+        .history-menu button:hover { background: #263343; }
+        .history-delete { color: #ffc0c3; }
+        .history-access { margin: 0 4px 16px; padding: 10px; border: 1px solid #344154; border-radius: 10px; font-size: .82rem; }
+        .history-access summary { cursor: pointer; color: #c5d7e8; }
+        .history-access p { color: #9aa8ba; line-height: 1.5; }
+        .history-access input { width: 100%; min-height: 42px; padding: 8px; border: 1px solid #374559; border-radius: 8px; background: #101721; margin: 6px 0; }
+        .history-access button { margin: 5px 0; font-size: .82rem; width: 100%; }
+        .history-access label { display: block; margin-top: 12px; }
         .history-backdrop { display: none; }
         .history-empty { padding: 10px; color: #8291a5; font-size: .85rem; }
         .history-toggle { display: none; }
@@ -465,6 +474,23 @@
     <aside class="history-sidebar" id="history-sidebar" aria-label="История расшифровок">
         <button type="button" class="tool-button history-toggle" id="history-close" aria-label="Закрыть историю">✕</button>
         <h2>История расшифровок</h2>
+        <details class="history-access">
+            <summary>Сохранить доступ к истории</summary>
+            <p>Сохраните ключ в менеджере паролей. Он вернёт вашу историю после очистки cookies или на другом устройстве. Любой, у кого есть ключ, получит доступ к записям.</p>
+            <p id="identity-status" role="status"></p>
+            <button type="button" class="tool-button" id="create-recovery-key">Создать ключ восстановления</button>
+            <div id="recovery-key-output" hidden>
+                <label for="issued-recovery-key">Ключ показан только сейчас</label>
+                <input id="issued-recovery-key" type="password" readonly autocomplete="off" spellcheck="false">
+                <button type="button" class="tool-button" id="copy-recovery-key">Скопировать ключ</button>
+                <button type="button" class="tool-button" id="hide-recovery-key">Я сохранил ключ</button>
+            </div>
+            <form id="recover-history-form">
+                <label for="recover-history-key">Восстановить историю по ключу</label>
+                <input id="recover-history-key" type="password" autocomplete="off" spellcheck="false" required>
+                <button type="submit" class="tool-button" id="recover-history-button">Восстановить историю</button>
+            </form>
+        </details>
         <nav class="history-list" id="history-list" aria-label="Прошлые задания"></nav>
     </aside>
     <button type="button" class="history-backdrop" id="history-backdrop" tabindex="-1" aria-label="Закрыть историю"></button>
@@ -1192,7 +1218,14 @@
                     const summary = document.createElement('summary'); summary.textContent = '⋯'; summary.setAttribute('aria-label', `Действия с записью ${option.dataset.filename || option.value}`);
                     const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'history-delete'; remove.textContent = 'Удалить из истории';
                     remove.addEventListener('click', () => deleteHistoryJob(option.value, option.dataset.filename || option.value, remove));
-                    menu.append(summary, remove); row.appendChild(menu);
+                    const choices = document.createElement('div'); choices.className = 'history-menu';
+                    if (['done', 'completed'].includes(option.dataset.status) && (option.dataset.sourceAvailable !== 'false' || option.dataset.sourceRemovalPending === 'true')) {
+                        const source = document.createElement('button'); source.type = 'button'; source.className = 'source-action';
+                        source.textContent = option.dataset.sourceRemovalPending === 'true' ? 'Повторить удаление аудио' : 'Удалить только аудио';
+                        source.addEventListener('click', () => deleteSourceAudio(option.value, option.dataset.filename || option.value, source));
+                        choices.appendChild(source);
+                    }
+                    choices.appendChild(remove); menu.append(summary, choices); row.appendChild(menu);
                 }
                 historyList.appendChild(row);
             }
@@ -1295,7 +1328,10 @@
                     await refresh();
                     ({ response, payload } = await send());
                 }
-                if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : `Ошибка сервера: ${response.status}`);
+                if (!response.ok) {
+                    const error = new Error(typeof payload.detail === 'string' ? payload.detail : `Ошибка сервера: ${response.status}`);
+                    error.detail = payload.detail; error.status = response.status; throw error;
+                }
                 return payload;
             };
             if (readOnly || control) return run();
@@ -1411,6 +1447,8 @@
                 if (!job.id) continue;
                 const option = new Option(`${job.filename || job.id} — ${job.status || 'статус неизвестен'}`, job.id);
                 option.dataset.status = job.status || ''; option.dataset.filename = job.filename || job.id;
+                option.dataset.sourceAvailable = String(job.source_available !== false);
+                option.dataset.sourceRemovalPending = String(Boolean(job.source_removal_pending));
                 historySelect.add(option);
             }
             if (selectedJobId && !Array.from(historySelect.options).some(option => option.value === selectedJobId)) {
@@ -1774,6 +1812,88 @@
                 await refreshJob(id, version, true);
             }
         });
+        const identityStatus = document.getElementById('identity-status');
+        const createRecoveryKey = document.getElementById('create-recovery-key');
+        const recoveryKeyOutput = document.getElementById('recovery-key-output');
+        const issuedRecoveryKey = document.getElementById('issued-recovery-key');
+        const recoveryInput = document.getElementById('recover-history-key');
+        let hasRecoveryKey = false;
+        async function loadIdentityControls() {
+            try {
+                const info = await api('/web/identity');
+                hasRecoveryKey = Boolean(info.has_recovery_key);
+                createRecoveryKey.textContent = hasRecoveryKey ? 'Заменить ключ восстановления' : 'Создать ключ восстановления';
+                identityStatus.textContent = hasRecoveryKey ? 'Ключ восстановления создан. Храните его в безопасном месте.' : 'Для восстановления на другом устройстве нужен сохранённый ключ.';
+            } catch (_) { identityStatus.textContent = 'Не удалось проверить доступ к истории'; }
+        }
+        function clearRecoverySecret() {
+            issuedRecoveryKey.value = ''; recoveryKeyOutput.hidden = true;
+        }
+        createRecoveryKey.addEventListener('click', async () => {
+            if (createRecoveryKey.disabled) return;
+            if (hasRecoveryKey && !window.confirm('Создать новый ключ? Старый ключ перестанет работать. Доступ на уже подключённых устройствах сохранится.')) return;
+            createRecoveryKey.disabled = true; clearRecoverySecret();
+            try {
+                const payload = await api('/web/identity/recovery-key', {
+                    method: 'POST', refreshToken: true, headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ replace: hasRecoveryKey }),
+                });
+                issuedRecoveryKey.value = payload.recovery_key;
+                recoveryKeyOutput.hidden = false;
+                await loadIdentityControls();
+                identityStatus.textContent = 'Скопируйте ключ и сохраните его. После закрытия страницы увидеть этот ключ снова нельзя.';
+            } catch (error) {
+                identityStatus.textContent = error.detail?.code === 'key_exists' ? 'Ключ уже создан на другом устройстве. Обновите страницу, чтобы заменить его.' : error.message;
+            } finally { createRecoveryKey.disabled = false; }
+        });
+        document.getElementById('copy-recovery-key').addEventListener('click', async () => {
+            if (issuedRecoveryKey.value) await copyTextToClipboard(issuedRecoveryKey.value, 'Ключ скопирован');
+        });
+        document.getElementById('hide-recovery-key').addEventListener('click', clearRecoverySecret);
+        window.addEventListener('pagehide', () => { clearRecoverySecret(); recoveryInput.value = ''; });
+        document.getElementById('recover-history-form').addEventListener('submit', async event => {
+            event.preventDefault();
+            const button = document.getElementById('recover-history-button');
+            if (button.disabled || !recoveryInput.value.trim()) return;
+            const recoveryKey = recoveryInput.value.trim();
+            button.disabled = true;
+            const recover = mergeCurrent => api('/web/identity/recover', {
+                method: 'POST', refreshToken: true, headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ recovery_key: recoveryKey, merge_current: mergeCurrent }),
+            });
+            try {
+                let payload;
+                try { payload = await recover(false); }
+                catch (error) {
+                    if (error.detail?.code !== 'merge_required') throw error;
+                    if (!window.confirm(`В текущей истории записей: ${error.detail.count}. Перенести их в восстанавливаемую историю? Тексты и выжимки сохранятся. Старый ключ текущей истории и доступ к ней на других устройствах перестанут работать.`)) return;
+                    payload = await recover(true);
+                }
+                clearRecoverySecret();
+                await selectJob('');
+                await loadHistory();
+                await loadIdentityControls();
+                identityStatus.textContent = payload.merged_jobs ? 'История восстановлена, текущие записи перенесены.' : 'История восстановлена.';
+            } catch (error) {
+                identityStatus.textContent = error.detail?.code === 'active_jobs'
+                    ? 'Завершите или отмените текущие задания перед восстановлением истории.'
+                    : error.message;
+            } finally { recoveryInput.value = ''; button.disabled = false; }
+        });
+        async function deleteSourceAudio(id, filename, button) {
+            if (!id || button.disabled || !window.confirm(`Удалить исходное аудио «${filename}»? Текст и выжимки останутся в истории. Для повторного распознавания или смены разметки говорящих потребуется снова загрузить файл.`)) return;
+            button.disabled = true;
+            try {
+                await api(`${jobUrl(id)}/source`, { method: 'DELETE', refreshToken: true });
+                await loadHistory();
+                if (selectedJobId === id) await refreshJob(id, generation);
+                setStatus('Аудио удалено. Текст и выжимки сохранены.');
+            } catch (error) {
+                errorOutput.textContent = error.message; button.disabled = false;
+                try { await loadHistory(); } catch (_) {}
+            }
+        }
+
         async function deleteHistoryJob(id, filename, button) {
             if (!id || button.disabled || !window.confirm(`Удалить запись «${filename}» из истории?`)) return;
             button.disabled = true;
@@ -1793,6 +1913,11 @@
         }
         diarizeInput.addEventListener('change', async () => {
             if (!selectedJobId) return;
+            if (selectedJob?.source_available === false) {
+                diarizeInput.checked = !diarizeInput.checked;
+                diarizeStatus.textContent = 'Исходное аудио удалено. Для новой разметки загрузите файл снова.';
+                return;
+            }
             const id = selectedJobId, version = generation, value = diarizeInput.checked;
             diarizeInput.disabled = true; diarizeStatus.textContent = 'Ожидаем применения настройки…';
             try {
@@ -2019,6 +2144,7 @@
         window.addEventListener('pagehide', closeJobEvents);
         loadModels();
         initializationPromise = initializeJobs();
+        initializationPromise.then(loadIdentityControls);
     </script>
 </body>
 </html>

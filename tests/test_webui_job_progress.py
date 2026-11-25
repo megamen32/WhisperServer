@@ -93,7 +93,8 @@ async def test_job_exposes_segments_before_worker_finishes(monkeypatch):
             assert view["result"]["text"] == "first fragment"
             assert view["progress"]["processed_seconds"] == 20.0
             assert view["progress"]["percent"] == 50.0
-            owner = client.cookies.get(main.WEBUI_SESSION_COOKIE)
+            sid = client.cookies.get(main.WEBUI_SESSION_COOKIE)
+            owner = main._load_webui_session(sid)["owner_id"]
             persisted = JobStore(main.WEBUI_JOB_DIR / "jobs.sqlite").get(owner, job_id)
             assert persisted["result"]["segments"] == [segment]
             # Subscriber attaches after the first fragment and immediately
@@ -101,7 +102,7 @@ async def test_job_exposes_segments_before_worker_finishes(monkeypatch):
             async def receive():
                 return {"type": "http.request", "body": b"", "more_body": False}
             request = Request({"type": "http", "method": "GET", "path": f"/web/jobs/{job_id}/events",
-                               "headers": [(b"cookie", f"{main.WEBUI_SESSION_COOKIE}={owner}".encode())]}, receive)
+                               "headers": [(b"cookie", f"{main.WEBUI_SESSION_COOKIE}={sid}".encode())]}, receive)
             stream = await main.web_jobs_events(job_id, request)
             assert stream.headers["x-accel-buffering"] == "no"
             event = await anext(stream.body_iterator)

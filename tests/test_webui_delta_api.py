@@ -15,16 +15,17 @@ def isolated(tmp_path, monkeypatch):
     main._webui_sessions.clear()
 
 
-def request_for(owner, job_id):
+def request_for(session_id, job_id):
     async def receive():
         return {'type': 'http.request', 'body': b'', 'more_body': False}
     return Request({'type': 'http', 'method': 'GET', 'path': f'/web/jobs/{job_id}/events',
-        'headers': [(b'cookie', f'{main.WEBUI_SESSION_COOKIE}={owner}'.encode())]}, receive)
+        'headers': [(b'cookie', f'{main.WEBUI_SESSION_COOKIE}={session_id}'.encode())]}, receive)
 
 
 @pytest.mark.asyncio
 async def test_delta_resume_reset_and_metadata_only_history():
-    owner, _ = main._create_webui_session()
+    sid, _ = main._create_webui_session()
+    owner = main._load_webui_session(sid)["owner_id"]
     store = main._job_store()
     job = store.create(owner, {'filename': 'delta.wav', 'size': 3, 'model': 'small', 'diarize': False})
     job_id = job['id']
@@ -33,7 +34,7 @@ async def test_delta_resume_reset_and_metadata_only_history():
     segments = [{'start': i, 'end': i + 1, 'text': 'fragment ' + str(i)} for i in range(4)]
     for segment in segments:
         store.append_progress(owner, job_id, 1, segment=segment, progress={'phase': 'transcribing'})
-    stream = await main.web_jobs_events(job_id, request_for(owner, job_id), cursor='1:0:2')
+    stream = await main.web_jobs_events(job_id, request_for(sid, job_id), cursor='1:0:2')
     event = json.loads((await anext(stream.body_iterator)).split('data: ', 1)[1])
     assert event['segments'] == segments[2:] and event['cursor'] == '1:0:4'
     assert not event['reset'] and 'segments' not in event['job']['result']
@@ -43,7 +44,7 @@ async def test_delta_resume_reset_and_metadata_only_history():
     event = store.stream_delta(owner, job_id, '1:0:4')
     assert event['reset'] and event['cursor'] == '1:1:1' and event['segments'] == segments[:1]
     store.complete(owner, job_id, 1, {'text': segments[0]['text'], 'segments': segments[:1]})
-    history = await main.web_jobs_list(request_for(owner, job_id))
+    history = await main.web_jobs_list(request_for(sid, job_id))
     assert len(history['jobs']) == 1
     assert 'result' not in history['jobs'][0] and 'summaries' not in history['jobs'][0]
     assert store.get(owner, job_id)['result']['segments'] == segments[:1]
@@ -119,7 +120,8 @@ async def test_cancel_is_accepted_while_own_upload_fsync_waits(monkeypatch, disc
 @pytest.mark.asyncio
 async def test_sse_checks_owner_and_last_event_id_precedes_url_cursor():
     from fastapi import HTTPException
-    owner, _ = main._create_webui_session()
+    sid, _ = main._create_webui_session()
+    owner = main._load_webui_session(sid)["owner_id"]
     other, _ = main._create_webui_session()
     store = main._job_store()
     job_id = store.create(owner, {'filename': 'x', 'size': 1, 'model': 'small', 'diarize': False})['id']
@@ -131,9 +133,9 @@ async def test_sse_checks_owner_and_last_event_id_precedes_url_cursor():
         await main.web_jobs_events(job_id, request_for(other, job_id))
     assert forbidden.value.status_code == 404
     with pytest.raises(HTTPException) as invalid:
-        await main.web_jobs_events(job_id, request_for(owner, job_id), cursor='bad')
+        await main.web_jobs_events(job_id, request_for(sid, job_id), cursor='bad')
     assert invalid.value.status_code == 400
-    request = request_for(owner, job_id)
+    request = request_for(sid, job_id)
     request.scope['headers'].append((b'last-event-id', b'1:0:2'))
     stream = await main.web_jobs_events(job_id, request, cursor='1:0:0')
     first = await anext(stream.body_iterator)

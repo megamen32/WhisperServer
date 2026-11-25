@@ -108,10 +108,9 @@ def test_summarize_sends_only_the_id_upstream(client, monkeypatch):
     monkeypatch.setattr(server, "_omniroute_api_key", lambda: "sk-test")
 
     token = _session(client)
-    # Bind the transcript to the session the client actually owns.
-    server._webui_transcripts[transcript_id]["session_id"] = client.cookies.get(
-        server.WEBUI_SESSION_COOKIE
-    )
+    # Bind the transcript to the durable owner authenticated by this session.
+    sid = client.cookies.get(server.WEBUI_SESSION_COOKIE)
+    server._webui_transcripts[transcript_id]["session_id"] = server._load_webui_session(sid)["owner_id"]
 
     response = client.post(
         "/web/summarize",

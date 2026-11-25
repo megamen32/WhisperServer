@@ -4,7 +4,7 @@
 
 `GET /web/jobs` returns only job metadata. It omits transcript and summary payloads,
 so opening the history sidebar does not read every completed transcript.
-`GET /web/jobs/{id}` remains the full, session-owned snapshot and is the
+`GET /web/jobs/{id}` remains the full, owner-scoped snapshot and is the
 fallback after a lost stream. Both reads use read transactions.
 
 `GET /web/jobs/{id}/events?cursor=attempt:epoch:sequence` sends SSE messages:
@@ -32,8 +32,9 @@ sent every 15 seconds when no result changes. In-process notifications wake
 subscribers immediately; a five-second durable-state read also observes changes
 from another process. Healthy browser streams do not repeatedly fetch full
 transcript snapshots. The final delta triggers one full GET to reconcile final
-speaker text, metrics and saved summaries. All routes keep session ownership;
-unknown and other-session jobs both return 404.
+speaker text, metrics and saved summaries. All routes resolve the authenticated session to its durable history owner;
+unknown and other-owner jobs both return 404. See [history access](webui-history.md)
+for recovery, migration, and explicit source removal.
 
 Segments are individual SQLite rows. A segment and its cursor are committed in
 the same transaction. The hot job row stores small progress state, not the
