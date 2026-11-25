@@ -68,3 +68,30 @@ def test_vad_preserves_original_offsets_and_bounds_padded_regions(monkeypatch):
             return 'речь'
     segments, _ = GigaAMModel(Decoder()).transcribe('voice.wav', vad_filter=True)
     assert [(s.start, s.end) for s in segments] == [(1, 21), (21, 41), (41, 43)]
+
+def test_chunk_plan_disk_quota_and_cleanup(monkeypatch, tmp_path):
+    monkeypatch.setattr(gigaam_backend, "decode_audio", lambda *a, **k: np.zeros(16000))
+    monkeypatch.setattr(gigaam_backend, "get_speech_timestamps",
+                        lambda *a: [{"start": 0, "end": 16000}])
+    plan = gigaam_backend.GigaAMChunkPlan("voice.wav", vad_filter=True, spool_dir=tmp_path,
+                                         max_active_bytes=100_000)
+    assert sum(p.stat().st_size for p in tmp_path.glob("gigaam-plan-*/audio.pcm")) == 64_000
+    import pytest
+    with pytest.raises(ValueError, match="storage limit"):
+        gigaam_backend.GigaAMChunkPlan("another.wav", vad_filter=True, spool_dir=tmp_path,
+                                       max_active_bytes=100_000)
+    assert len(list(tmp_path.glob("gigaam-plan-*"))) == 1
+    plan.close()
+    assert not list(tmp_path.glob("gigaam-plan-*"))
+
+
+def test_stale_plan_cleanup_keeps_live_worker_storage(tmp_path):
+    import os
+    stale = tmp_path / "gigaam-plan-99999999-stale"
+    stale.mkdir()
+    (stale / "audio.pcm").write_bytes(b"old")
+    alive = tmp_path / f"gigaam-plan-{os.getpid()}-active"
+    alive.mkdir()
+    gigaam_backend.cleanup_stale_chunk_plans(tmp_path)
+    assert not stale.exists()
+    assert alive.exists()

@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import inspect
 import multiprocessing as mp
 import signal
 import subprocess
@@ -29,6 +30,8 @@ import hashlib
 import hmac
 import weakref
 from contextlib import asynccontextmanager, contextmanager, ExitStack
+from types import SimpleNamespace
+from audio_checkpoints import AudioCheckpoints, CooperativeQueue, computation_key
 from runtime_support import LazyImport, RestartBudget, IdleModelCache, cuda_device_visible
 WhisperModel = LazyImport("faster_whisper", "WhisperModel")
 GigaAMModel = LazyImport("gigaam_backend", "GigaAMModel")
@@ -267,7 +270,6 @@ WEBUI_MAX_SPOOL_BYTES = int(os.getenv("WEBUI_MAX_SPOOL_BYTES", str(2 * 1024 ** 3
 _job_tasks = set()
 _job_tasks_by_attempt = {}
 _job_lock = asyncio.Lock()
-_job_worker_slot = asyncio.Semaphore(1)
 
 
 def _job_store():
@@ -627,6 +629,9 @@ def transcription_cache_key(prefix: str, model: str, language: str, audio_hash: 
     routed_model = OPENAI_MODEL_MAP.get(model, model)
     if model == OPENAI_WHISPER_ALIAS and routed_model != OPENAI_WHISPER_INTERNAL_MODEL:
         model = f"{model}@{routed_model}"
+    if routed_model == "gigaam-v3":
+        from gigaam_backend import GIGAAM_V3_REVISION, GIGAAM_ADAPTER_VERSION
+        model = f"{model}@{GIGAAM_V3_REVISION}:{GIGAAM_ADAPTER_VERSION}"
     speaker_part = ":community-1-v2" if diarize else ""
     return f"{prefix}:vad-v1:{int(vad_filter)}:{model}:{language}{words_part}:{audio_hash}{speaker_part}"
 
@@ -1017,306 +1022,499 @@ class WorkerStopped(Exception):
 
 def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_flags=None):
     model_cache = {}
+    ready = CooperativeQueue()
+    from gigaam_backend import cleanup_stale_chunk_plans
+    pcm_root = Path(os.getenv('WHISPER_PCM_DIR', str(WEBUI_JOB_DIR / 'pcm')))
+    cleanup_stale_chunk_plans(pcm_root)
+    try:
+        checkpoint_store = AudioCheckpoints(os.getenv(
+            'WHISPER_CHECKPOINT_DB', str(WEBUI_JOB_DIR / 'audio-checkpoints.sqlite')))
+    except Exception:
+        logger.exception('Audio checkpoint store unavailable; decoding without reuse')
+        checkpoint_store = None
 
-    while not stop_event.is_set():
-        try:
-            all_requests = []
+    def checkpoint_get(signature, unit):
+        nonlocal checkpoint_store
+        if checkpoint_store is not None:
             try:
-                while True:
-                    all_requests.append(request_queue.get_nowait())
-            except:
-                pass
+                return checkpoint_store.get(signature, unit)
+            except Exception:
+                logger.exception('Could not read audio checkpoint; disabling reuse for this worker')
+                checkpoint_store = None
+        return None
 
-            if not all_requests:
-                time.sleep(0.05)
-                continue
+    def checkpoint_put(signature, unit, payload):
+        nonlocal checkpoint_store
+        if checkpoint_store is not None:
+            try:
+                return checkpoint_store.put(signature, unit, payload)
+            except Exception:
+                logger.exception('Could not persist audio checkpoint; continuing transcription')
+                checkpoint_store = None
+        return payload
 
-            all_requests.sort(key=lambda r: MODEL_PRIORITY.get(r["model"], 999))
+    def execute_request(request):
+        requested_model_name = request["model"]
+        public_requested_model = request.get("requested_model", requested_model_name)
+        audio_bytes = request.get("audio_bytes")
+        request_id = request["request_id"]
+        lang = request.get("language")
+        cache_key = request.get("cache_key")
+        beam_size = request.get("beam_size", 5)
+        temperature = request.get("temperature", 0.0)
+        stream = request.get("stream")
+        report_progress = request.get("progress", False)
+        vad_filter = request.get("vad_filter", WHISPER_VAD_ENABLED)
+        model_name = requested_model_name
+        model_substituted = False
+        substitution_reason = None
+        temp_path = None
+        owns_temp = False
+        chunk_plan = None
+        reused_chunks = 0
+        computed_chunks = 0
+        diarization_reused = False
+        success = False
+        error_text = None
+        audio_seconds = None
+        load_ms = 0.0
+        inference_ms = 0.0
+        queue_ms = max(0.0, (time.perf_counter() - request.get("queued_at", time.perf_counter())) * 1000)
+        cold_load = False
+        info = None
+        model = None
+        segments = None
+        model_session = ExitStack()
+        cancelled = False
+        terminal_payload = None
+        job_key = request.get('web_job_key')
 
-            for request in all_requests:
-                requested_model_name = request["model"]
-                public_requested_model = request.get("requested_model", requested_model_name)
-                audio_bytes = request["audio_bytes"]
-                request_id = request["request_id"]
-                lang = request.get("language")
-                cache_key = request.get("cache_key")
-                beam_size = request.get("beam_size", 5)
-                temperature = request.get("temperature", 0.0)
-                stream = request.get("stream")
-                report_progress = request.get("progress", False)
-                vad_filter = request.get("vad_filter", WHISPER_VAD_ENABLED)
-                model_name = requested_model_name
-                model_substituted = False
-                substitution_reason = None
-                temp_path = None
-                success = False
-                error_text = None
-                audio_seconds = None
-                load_ms = 0.0
-                inference_ms = 0.0
-                queue_ms = max(0.0, (time.perf_counter() - request.get("queued_at", time.perf_counter())) * 1000)
-                cold_load = False
-                info = None
-                model = None
-                segments = None
-                model_session = ExitStack()
-                cancelled = False
-                terminal_payload = None
-                job_key = request.get('web_job_key')
+        def check_cancel():
+            if job_key is not None and cancel_flags is not None and cancel_flags.get(job_key, False):
+                raise WebJobCancelled('Web job cancelled')
 
-                def check_cancel():
-                    if job_key is not None and cancel_flags is not None and cancel_flags.get(job_key, False):
-                        raise WebJobCancelled('Web job cancelled')
+        def publish_progress(phase, **extra):
+            if report_progress:
+                response_queue.put({'request_id': request_id, 'progress': {
+                    'phase': phase, 'total_seconds': audio_seconds, **extra}})
 
-                def publish_progress(phase, **extra):
-                    if report_progress:
-                        response_queue.put({'request_id': request_id, 'progress': {
-                            'phase': phase, 'total_seconds': audio_seconds, **extra}})
+        try:
+            check_cancel()
+            publish_progress('preparing')
+            if request.get('audio_path'):
+                temp_path = request['audio_path']
+                audio_hash = request['audio_hash']
+            else:
+                with tempfile.NamedTemporaryFile(delete=False) as temp:
+                    temp.write(audio_bytes)
+                    temp.flush()
+                    temp_path = temp.name
+                owns_temp = True
+                audio_hash = request.get('audio_hash') or hash_bytes(audio_bytes)
+            # Do not retain an additional recording-sized byte buffer while other
+            # requests use the worker. Web jobs arrive as their durable spool path.
+            audio_bytes = None
+            request.pop('audio_bytes', None)
+            audio_seconds = audio_duration_seconds(temp_path)
+            diarize = request.get("diarize", False)
+            check_cancel()
+            speaker_turns = []
+            if diarize:
+                publish_progress('diarizing')
+                import diarization_backend as diarization_contract
+                revision = getattr(diarization_contract, 'DIARIZATION_MODEL_REVISION', None)
+                diarization_key = (computation_key(audio_hash, 'community-1', revision, {
+                    'adapter': getattr(diarization_contract, 'DIARIZATION_ADAPTER_VERSION', 'unknown'),
+                    'vad_filter': vad_filter,
+                }) if revision else None)
+                saved_turns = checkpoint_get(diarization_key, 'turns') if diarization_key else None
+                if saved_turns is None:
+                    last_hook = {'time': 0.0, 'step': None}
+                    def diarization_progress(step_name, step_artifact=None, file=None, total=None, completed=None):
+                        check_cancel()
+                        now = time.monotonic()
+                        if (step_name != last_hook['step'] or now - last_hook['time'] >= .25
+                                or (total is not None and completed == total)):
+                            publish_progress('diarizing', step=str(step_name), percent=None,
+                                             completed=int(completed) if completed is not None else None,
+                                             total=int(total) if total is not None else None)
+                            last_hook.update(time=now, step=step_name)
+                    parameters = inspect.signature(diarize_audio).parameters
+                    hooks = ({'progress_hook': diarization_progress}
+                             if 'progress_hook' in parameters or any(
+                                 p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()) else {})
+                    speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter,
+                                                 model_provider=_diarization_model_session, **hooks)
+                    if diarization_key:
+                        speaker_turns = checkpoint_put(diarization_key, 'turns', {'turns': speaker_turns})['turns']
+                else:
+                    speaker_turns = saved_turns['turns']
+                    diarization_reused = True
+            check_cancel()
 
-                try:
+            if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
+                model_name = _select_openai_whisper_model(model_cache)
+                model_substituted = model_name != OPENAI_DEFAULT_MODEL
+                substitution_reason = "loaded_model_alias" if model_substituted else "default_model"
+                logger.info(
+                    "Resolved %s to %s (loaded=%s)",
+                    OPENAI_WHISPER_ALIAS,
+                    model_name,
+                    sorted(model_cache.keys(), key=MODEL_PRIORITY.get),
+                )
+            else:
+                compatible_model = _select_compatible_loaded_model(model_name, model_cache)
+                if compatible_model is not None:
+                    model_name = compatible_model
+                    model_substituted = True
+                    substitution_reason = "compatible_loaded_model"
+                    logger.info(
+                        "Serving %s with already loaded compatible model %s",
+                        public_requested_model,
+                        model_name,
+                    )
+
+            publish_progress('loading')
+            reset_cuda_peak_memory()
+            cold_load = model_name not in model_cache
+            load_started = time.perf_counter()
+            if model_name not in model_cache:
+                ensure_vram_for_model(model_name, model_cache)
+                model_cache[model_name] = _create_model_entry(model_name)
+            check_cancel()
+
+            model_entry = model_cache[model_name]
+            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                model_entry.acquire()
+                model = model_session.enter_context(model_entry.inference())
+            else:
+                model = model_entry
+            load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
+            usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
+            if public_requested_model != model_name:
+                usage_dict[public_requested_model] = usage_dict.get(public_requested_model, 0) + 1
+
+            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                model_entry.touch(active=True)
+            inference_started = time.perf_counter()
+            all_segments = []
+            all_words = []
+
+            def _decode(current_beam: int):
+                """Decode the whole recording; faster-whisper decodes lazily."""
+                check_cancel()
+                # A non-streaming web job retains the normal OOM retry.
+                # Clear its previous attempt's partial decode on retry.
+                publish_progress('transcribing', processed_seconds=0.0, reset=True)
+                segments, info = model.transcribe(
+                    temp_path,
+                    beam_size=current_beam,
+                    language=lang,
+                    temperature=temperature,
+                    word_timestamps=request.get("words", False) or diarize,
+                    **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
+                    condition_on_previous_text=False,
+                    **build_vad_transcribe_options(vad_filter),
+                    no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
+                    log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
+                    compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
+                )
+                decoded_segments = []
+                decoded_words = []
+                for seg in segments:
                     check_cancel()
-                    publish_progress('preparing')
-                    with tempfile.NamedTemporaryFile(delete=False) as temp:
-                        temp.write(audio_bytes)
-                        temp.flush()
-                        temp_path = temp.name
-                    audio_seconds = audio_duration_seconds(temp_path)
-                    diarize = request.get("diarize", False)
-                    check_cancel()
-                    if diarize:
-                        publish_progress('diarizing')
-                    speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter, model_provider=_diarization_model_session) if diarize else []
-                    check_cancel()
-
-                    if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
-                        model_name = _select_openai_whisper_model(model_cache)
-                        model_substituted = model_name != OPENAI_DEFAULT_MODEL
-                        substitution_reason = "loaded_model_alias" if model_substituted else "default_model"
-                        logger.info(
-                            "Resolved %s to %s (loaded=%s)",
-                            OPENAI_WHISPER_ALIAS,
-                            model_name,
-                            sorted(model_cache.keys(), key=MODEL_PRIORITY.get),
-                        )
-                    else:
-                        compatible_model = _select_compatible_loaded_model(model_name, model_cache)
-                        if compatible_model is not None:
-                            model_name = compatible_model
-                            model_substituted = True
-                            substitution_reason = "compatible_loaded_model"
-                            logger.info(
-                                "Serving %s with already loaded compatible model %s",
-                                public_requested_model,
-                                model_name,
-                            )
-
-                    publish_progress('loading')
-                    reset_cuda_peak_memory()
-                    cold_load = model_name not in model_cache
-                    load_started = time.perf_counter()
-                    if model_name not in model_cache:
-                        ensure_vram_for_model(model_name, model_cache)
-                        model_cache[model_name] = _create_model_entry(model_name)
-                    check_cancel()
-
-                    model_entry = model_cache[model_name]
-                    if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                        model_entry.acquire()
-                        model = model_session.enter_context(model_entry.inference())
-                    else:
-                        model = model_entry
-                    load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
-                    usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
-                    if public_requested_model != model_name:
-                        usage_dict[public_requested_model] = usage_dict.get(public_requested_model, 0) + 1
-
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                         model_entry.touch(active=True)
-                    inference_started = time.perf_counter()
-                    all_segments = []
-                    all_words = []
+                    seg_text = (seg.text or "").strip()
+                    if not seg_text:
+                        logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
+                        continue
+                    seg_data = {
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg_text,
+                        "avg_logprob": getattr(seg, "avg_logprob", None),
+                        "no_speech_prob": getattr(seg, "no_speech_prob", None),
+                        "compression_ratio": getattr(seg, "compression_ratio", None),
+                    }
+                    logger.info("%s processed segment %.2f-%.2f (%d characters)", model_name, seg.start, seg.end, len(seg_text))
+                    if (request.get("words", False) or diarize) and getattr(seg, "words", None):
+                        words = [
+                            {"start": w.start, "end": w.end, "word": w.word}
+                            for w in seg.words
+                        ]
+                    else:
+                        words = []
 
-                    def _decode(current_beam: int):
-                        """Decode the whole recording; faster-whisper decodes lazily."""
-                        check_cancel()
-                        # A non-streaming web job retains the normal OOM retry.
-                        # Clear its previous attempt's partial decode on retry.
-                        publish_progress('transcribing', processed_seconds=0.0, reset=True)
-                        segments, info = model.transcribe(
-                            temp_path,
-                            beam_size=current_beam,
-                            language=lang,
-                            temperature=temperature,
-                            word_timestamps=request.get("words", False) or diarize,
-                            **({"speaker_turns": speaker_turns} if diarize and model_name == "gigaam-v3" else {}),
-                            condition_on_previous_text=False,
-                            **build_vad_transcribe_options(vad_filter),
-                            no_speech_threshold=WHISPER_NO_SPEECH_THRESHOLD,
-                            log_prob_threshold=WHISPER_LOG_PROB_THRESHOLD,
-                            compression_ratio_threshold=WHISPER_COMPRESSION_RATIO_THRESHOLD,
-                        )
-                        decoded_segments = []
-                        decoded_words = []
-                        for seg in segments:
-                            check_cancel()
-                            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                                model_entry.touch(active=True)
-                            seg_text = (seg.text or "").strip()
-                            if not seg_text:
-                                logger.info("%s skipped empty/VAD-only segment %.2f-%.2f", model_name, seg.start, seg.end)
-                                continue
-                            seg_data = {
-                                "start": seg.start,
-                                "end": seg.end,
-                                "text": seg_text,
-                                "avg_logprob": getattr(seg, "avg_logprob", None),
-                                "no_speech_prob": getattr(seg, "no_speech_prob", None),
-                                "compression_ratio": getattr(seg, "compression_ratio", None),
-                            }
-                            logger.info("%s processed segment: %s", model_name, seg_data)
-                            if (request.get("words", False) or diarize) and getattr(seg, "words", None):
-                                words = [
-                                    {"start": w.start, "end": w.end, "word": w.word}
-                                    for w in seg.words
-                                ]
-                            else:
-                                words = []
+                    attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
+                    decoded_segments.extend(attributed)
+                    decoded_words.extend(words)
+                    if stream or report_progress:
+                        for part in attributed:
+                            payload = {"request_id": request_id, "segment": part}
+                            if request.get("words", False):
+                                payload["words"] = [w for w in words if w["start"] >= part["start"] and w["end"] <= part["end"]]
+                            response_queue.put(payload)
+                return decoded_segments, decoded_words, info
 
-                            attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
-                            decoded_segments.extend(attributed)
-                            decoded_words.extend(words)
-                            if stream or report_progress:
-                                for part in attributed:
-                                    payload = {"request_id": request_id, "segment": part}
-                                    if request.get("words", False):
-                                        payload["words"] = [w for w in words if w["start"] >= part["start"] and w["end"] <= part["end"]]
-                                    response_queue.put(payload)
-                        return decoded_segments, decoded_words, info
-
-                    try:
-                        all_segments, all_words, info = _decode(beam_size)
-                    except Exception as exc:
-                        if not is_cuda_oom(exc):
-                            raise
-                        logger.warning(
-                            "CUDA out of memory during %s inference (beam=%d): %s",
-                            model_name,
-                            beam_size,
-                            exc,
-                        )
-                        if stream:
-                            raise GpuOutOfMemoryError(
-                                "CUDA out of memory during streaming inference; the GPU is busy"
-                            ) from exc
-                        release_cached_models(model_cache, keep=model_name)
-                        try:
-                            all_segments, all_words, info = _decode(RETRY_BEAM_SIZE)
-                            logger.warning(
-                                "Retry with beam=%d succeeded for %s",
-                                RETRY_BEAM_SIZE,
-                                model_name,
-                            )
-                        except Exception as retry_exc:
-                            if not is_cuda_oom(retry_exc):
-                                raise
-                            raise GpuOutOfMemoryError(
-                                "CUDA out of memory: the GPU is occupied by another tenant"
-                            ) from retry_exc
-                    inference_ms = (time.perf_counter() - inference_started) * 1000
-
+            chunked = (model_name == 'gigaam-v3' and getattr(model, 'supports_audio_chunks', False)
+                       and (vad_filter or diarize))
+            if chunked:
+                from gigaam_backend import GigaAMChunkPlan, GIGAAM_ADAPTER_VERSION
+                model_revision = model.checkpoint_revision
+                # The continuation must not retain a pinned GPU model between quanta.
+                model = None
+                model_session.close()
+                model_session = ExitStack()
+                chunk_plan = GigaAMChunkPlan(temp_path, vad_filter=vad_filter,
+                                            vad_parameters=build_vad_transcribe_options(vad_filter).get('vad_parameters'),
+                                            speaker_turns=speaker_turns if diarize else None,
+                                            spool_dir=pcm_root, expected_seconds=audio_seconds)
+                signature = computation_key(audio_hash, model_name, model_revision, {
+                    'adapter': GIGAAM_ADAPTER_VERSION, 'language': lang,
+                    'beam_size': beam_size, 'retry_beam_size': RETRY_BEAM_SIZE, 'temperature': temperature,
+                    'words': bool(request.get('words')), 'vad': build_vad_transcribe_options(vad_filter),
+                    'speaker_turns': speaker_turns if diarize else None,
+                    'chunks': chunk_plan.chunks,
+                })
+                info = SimpleNamespace(language=lang or 'ru', language_probability=1.0 if lang else 0.0)
+                # Global diarization remains one quality-preserving pass. Its completed
+                # result and the bounded ASR units are independently reusable.
+                publish_progress('transcribing', processed_seconds=0.0, reset=True)
+                yield
+                for index, (chunk_start, chunk_end) in enumerate(chunk_plan.chunks):
                     check_cancel()
-                    result = {
-                        "text": " ".join([s["text"] for s in all_segments]),
-                        "segments": all_segments,
-                        "language": info.language,
-                        "language_probability": info.language_probability,
-                        "requested_model": public_requested_model,
-                        "served_model": model_name,
-                        "model_substituted": model_substituted,
-                        "substitution_reason": substitution_reason,
-                    }
-                    client_comment = request.get("client_comment")
-                    if client_comment:
-                        result["client_comment"] = client_comment
-                    if request.get("words", False):
-                        result["words"] = all_words
-                    if diarize:
-                        result["duration"] = audio_seconds or 0.0
-                        result["speaker_text"] = speaker_text(all_segments)
-                        result["speaker_turns"] = speaker_turns
-                        result["diarization_model"] = "pyannote/speaker-diarization-community-1"
-                        result["diarization_device"] = "cuda" if torch.cuda.is_available() else "cpu"
-
-                    if cache_key:
-                        transcription_cache.set(cache_key, result, expire=CACHE_TTL)
-
-                    terminal_payload = {
-                        "request_id": request_id,
-                        "result": result,
-                        "final": True,
-                    }
-                    success = True
-
-                except WebJobCancelled:
-                    cancelled = True
-                    error_text = 'Web job cancelled'
-                except Exception as e:
-                    error_text = str(e)
-                    logger.exception("Ошибка в worker:")
-                    error_payload = {
-                        "request_id": request_id,
-                        "error": str(e)
-                    }
-                    if isinstance(e, GpuOutOfMemoryError):
-                        error_payload["error_code"] = e.code
-                        error_payload["retryable"] = e.retryable
-                    terminal_payload = error_payload
-                finally:
-                    # Drop worker-local references before marking the cached
-                    # model idle so broker eviction can actually free VRAM.
-                    model = None
-                    segments = None
+                    unit = checkpoint_get(signature, index)
+                    if unit is None:
+                        chunk_segments = None
+                        for current_beam in (beam_size, RETRY_BEAM_SIZE):
+                            scope = ExitStack()
+                            try:
+                                if model_name not in model_cache:
+                                    ensure_vram_for_model(model_name, model_cache)
+                                    model_cache[model_name] = _create_model_entry(model_name)
+                                model_entry = model_cache[model_name]
+                                if ManagedModel is not None and isinstance(model_entry, ManagedModel):
+                                    model_entry.acquire()
+                                    model = scope.enter_context(model_entry.inference())
+                                else:
+                                    model = model_entry
+                                decode_started = time.perf_counter()
+                                chunk_segments, chunk_info = model.decode_chunk(
+                                    chunk_plan, index, language=lang, beam_size=current_beam)
+                                inference_ms += (time.perf_counter() - decode_started) * 1000
+                                break
+                            except Exception as exc:
+                                if not is_cuda_oom(exc):
+                                    raise
+                                if stream or current_beam == RETRY_BEAM_SIZE:
+                                    raise GpuOutOfMemoryError('CUDA out of memory during audio chunk inference') from exc
+                            finally:
+                                model = None
+                                scope.close()
+                            release_cached_models(model_cache, keep=model_name)
+                        normalized = []
+                        for segment in chunk_segments:
+                            text = (segment.text or '').strip()
+                            if not text:
+                                continue
+                            data = {'start': segment.start, 'end': segment.end, 'text': text,
+                                    'avg_logprob': getattr(segment, 'avg_logprob', None),
+                                    'no_speech_prob': getattr(segment, 'no_speech_prob', None),
+                                    'compression_ratio': getattr(segment, 'compression_ratio', None)}
+                            normalized.extend(attribute_segment(data, [], speaker_turns) if diarize else [data])
+                        # Empty speech is a completed unit too. Commit before publication,
+                        # so a crash after emission does not force duplicate computation.
+                        computed_chunks += 1
+                        unit = checkpoint_put(signature, index, {
+                            'segments': normalized, 'language': chunk_info.language,
+                            'language_probability': chunk_info.language_probability})
+                    else:
+                        reused_chunks += 1
+                    check_cancel()
+                    info = SimpleNamespace(language=unit['language'], language_probability=unit['language_probability'])
+                    all_segments.extend(unit['segments'])
+                    if stream or report_progress:
+                        for segment in unit['segments']:
+                            payload = {'request_id': request_id, 'segment': segment}
+                            if request.get('words'):
+                                payload['words'] = []
+                            response_queue.put(payload)
+                    publish_progress('transcribing', processed_seconds=chunk_end / 16000)
+                    if index + 1 < len(chunk_plan.chunks):
+                        yield
+            else:
+                try:
+                    all_segments, all_words, info = _decode(beam_size)
+                except Exception as exc:
+                    if not is_cuda_oom(exc):
+                        raise
+                    logger.warning(
+                        "CUDA out of memory during %s inference (beam=%d): %s",
+                        model_name,
+                        beam_size,
+                        exc,
+                    )
+                    if stream:
+                        raise GpuOutOfMemoryError(
+                            "CUDA out of memory during streaming inference; the GPU is busy"
+                        ) from exc
+                    release_cached_models(model_cache, keep=model_name)
                     try:
-                        model_session.close()
-                    except Exception:
-                        logger.exception("Failed to mark model idle")
-                    if temp_path:
-                        Path(temp_path).unlink(missing_ok=True)
-                    duration = audio_seconds or getattr(info, "duration", None)
-                    metric = {
-                        "requested_model": public_requested_model,
-                        "served_model": model_name,
-                        "model_substituted": model_substituted,
-                        "substitution_reason": substitution_reason,
-                        "device": "cuda" if torch.cuda.is_available() else "cpu",
-                        "cold_load": cold_load if "cold_load" in locals() else False,
-                        "load_ms": round(load_ms, 3),
-                        "queue_ms": round(queue_ms, 3),
-                        "audio_seconds": round(duration, 3) if duration is not None else None,
-                        "inference_ms": round(inference_ms, 3),
-                        "rtf": round(inference_ms / 1000 / duration, 5) if duration and duration > 0 else None,
-                        "peak_vram_mb": peak_vram_mb(),
-                        "success": success,
-                    }
-                    if request.get("client_comment"):
-                        metric["client_comment"] = request["client_comment"]
-                    if error_text:
-                        metric["error"] = error_text
-                    append_metric(metric)
-                if cancelled:
-                    terminal_payload = {'request_id': request_id, 'error': 'Web job cancelled',
-                                        'error_code': 'web_job_cancelled', 'final': True}
-                if terminal_payload is not None:
-                    response_queue.put(terminal_payload)
+                        all_segments, all_words, info = _decode(RETRY_BEAM_SIZE)
+                        logger.warning(
+                            "Retry with beam=%d succeeded for %s",
+                            RETRY_BEAM_SIZE,
+                            model_name,
+                        )
+                    except Exception as retry_exc:
+                        if not is_cuda_oom(retry_exc):
+                            raise
+                        raise GpuOutOfMemoryError(
+                            "CUDA out of memory: the GPU is occupied by another tenant"
+                        ) from retry_exc
+                inference_ms = (time.perf_counter() - inference_started) * 1000
 
+            check_cancel()
+            result = {
+                "text": " ".join([s["text"] for s in all_segments]),
+                "segments": all_segments,
+                "language": info.language,
+                "language_probability": info.language_probability,
+                "requested_model": public_requested_model,
+                "served_model": model_name,
+                "model_substituted": model_substituted,
+                "substitution_reason": substitution_reason,
+            }
+            if chunked:
+                result['served_model_revision'] = model_revision
+                result['resumed_chunks'] = reused_chunks
+                result['computed_chunks'] = computed_chunks
+                result['chunks_total'] = len(chunk_plan.chunks)
+            if diarize:
+                result['diarization_reused'] = diarization_reused
+            client_comment = request.get("client_comment")
+            if client_comment:
+                result["client_comment"] = client_comment
+            if request.get("words", False):
+                result["words"] = all_words
+            if diarize:
+                result["duration"] = audio_seconds or 0.0
+                result["speaker_text"] = speaker_text(all_segments)
+                result["speaker_turns"] = speaker_turns
+                result["diarization_model"] = "pyannote/speaker-diarization-community-1"
+                result["diarization_device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+            if cache_key:
+                transcription_cache.set(cache_key, result, expire=CACHE_TTL)
+
+            terminal_payload = {
+                "request_id": request_id,
+                "result": result,
+                "final": True,
+            }
+            success = True
+
+        except WebJobCancelled:
+            cancelled = True
+            error_text = 'Web job cancelled'
         except Exception as e:
-            logger.exception("Фатальная ошибка в loop:")
-            time.sleep(1)
+            error_text = str(e)
+            logger.exception("Ошибка в worker:")
+            error_payload = {
+                "request_id": request_id,
+                "error": str(e)
+            }
+            if isinstance(e, GpuOutOfMemoryError):
+                error_payload["error_code"] = e.code
+                error_payload["retryable"] = e.retryable
+            terminal_payload = error_payload
+        finally:
+            # Drop worker-local references before marking the cached
+            # model idle so broker eviction can actually free VRAM.
+            model = None
+            segments = None
+            try:
+                model_session.close()
+            except Exception:
+                logger.exception("Failed to mark model idle")
+            if chunk_plan is not None:
+                chunk_plan.close()
+            if temp_path and owns_temp:
+                Path(temp_path).unlink(missing_ok=True)
+            duration = audio_seconds or getattr(info, "duration", None)
+            metric = {
+                "requested_model": public_requested_model,
+                "served_model": model_name,
+                "model_substituted": model_substituted,
+                "substitution_reason": substitution_reason,
+                "device": "cuda" if torch.cuda.is_available() else "cpu",
+                "cold_load": cold_load if "cold_load" in locals() else False,
+                "load_ms": round(load_ms, 3),
+                "queue_ms": round(queue_ms, 3),
+                "audio_seconds": round(duration, 3) if duration is not None else None,
+                "inference_ms": round(inference_ms, 3),
+                "rtf": round(inference_ms / 1000 / duration, 5) if duration and duration > 0 else None,
+                "peak_vram_mb": peak_vram_mb(),
+                "success": success,
+                "resumed_chunks": reused_chunks,
+                "computed_chunks": computed_chunks,
+                "chunks_total": len(chunk_plan.chunks) if chunk_plan is not None else 0,
+                "diarization_reused": diarization_reused,
+            }
+            if request.get("client_comment"):
+                metric["client_comment"] = request["client_comment"]
+            if error_text:
+                metric["error"] = error_text
+            append_metric(metric)
+        if cancelled:
+            terminal_payload = {'request_id': request_id, 'error': 'Web job cancelled',
+                                'error_code': 'web_job_cancelled', 'final': True}
+        if terminal_payload is not None:
+            response_queue.put(terminal_payload)
 
-    # Normal worker shutdown must release cached ASR leases as well.
-    for entry in model_cache.values():
-        if ManagedModel is not None and isinstance(entry, ManagedModel):
-            entry.release()
+
+    def admit():
+        # A bounded drain keeps a busy producer from monopolizing the worker.
+        for _ in range(64):
+            try:
+                request = request_queue.get_nowait()
+            except thread_queue.Empty:
+                break
+            ready.add(execute_request(request))
+
+    response_queue.put({'__worker_ready__': True})
+    try:
+        while not stop_event.is_set():
+            prune = globals().get('_prune_idle_diarizer')
+            if prune is not None:
+                prune()
+            admit()
+            if not ready:
+                time.sleep(.05)
+                continue
+            steps = ready.pop()
+            finished = False
+            try:
+                next(steps)
+            except StopIteration:
+                finished = True
+            except Exception:
+                finished = True
+                logger.exception('Unexpected transcription task failure')
+            # Newly arrived work goes ahead of this continuation, while older
+            # runnable continuations retain FIFO order and cannot be starved.
+            admit()
+            if not finished:
+                ready.add(steps)
+    finally:
+        ready.close()
+        clear = globals().get('_clear_idle_diarizer')
+        if clear is not None:
+            clear()
+        for entry in model_cache.values():
+            if ManagedModel is not None and isinstance(entry, ManagedModel):
+                entry.release()
 
 
 async def response_listener(stop_event, response_queue, retire_event=None, *, generation=None):
@@ -1739,6 +1937,11 @@ async def _transcribe_impl(
 
     audio_bytes = await file.read()
     audio_hash = hash_bytes(audio_bytes)
+    audio_path = getattr(getattr(file, 'file', None), 'name', None) if web_job_key is not None else None
+    if not isinstance(audio_path, str) or not Path(audio_path).is_file():
+        audio_path = None
+    if audio_path is not None:
+        audio_bytes = None
     cache_key = transcription_cache_key("native", model, language, audio_hash, vad_filter=vad_filter, words=words, diarize=diarize)
 
     # Remember who sent this file; the cache key stays independent of it.
@@ -1807,6 +2010,8 @@ async def _transcribe_impl(
         app.state.request_queue.put({
             "request_id": request_id,
             "audio_bytes": audio_bytes,
+            "audio_path": audio_path,
+            "audio_hash": audio_hash,
             "model": actual_model,
             "requested_model": model,
             "language": language,
@@ -2077,15 +2282,17 @@ def _drain_deferred_web_jobs():
 
 
 async def _run_web_job(owner, job_id, attempt, generation=None):
-    async with _job_worker_slot:
-        if generation is not None and generation != getattr(app.state, 'worker_generation', None):
-            try:
-                _job_store().fail(owner, job_id, attempt, 'Model worker stopped before processing queued job')
-            except (InvalidTransition, JobNotFound):
-                pass
-            return
-        await _execute_web_job(owner, job_id, attempt)
-
+    if generation is not None and generation != getattr(app.state, 'worker_generation', None):
+        try:
+            interrupted = _job_store().interrupt_for_retry(owner, job_id, attempt)
+            if interrupted['status'] == 'queued':
+                _defer_or_launch_web_job(owner, interrupted)
+            elif interrupted['status'] == 'cancelled':
+                _job_spool().remove(job_id)
+        except (InvalidTransition, JobNotFound):
+            pass
+        return
+    await _execute_web_job(owner, job_id, attempt)
 
 async def _execute_web_job(owner, job_id, attempt):
     store = _job_store()

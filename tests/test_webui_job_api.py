@@ -16,6 +16,8 @@ def isolated_webui(tmp_path, monkeypatch):
     # ASGITransport intentionally skips lifespan; tests inject their own channel.
     monkeypatch.setattr(main.app.state, 'job_cancel_flags', {}, raising=False)
     monkeypatch.setattr(main.app.state, 'worker_accepting', True, raising=False)
+    monkeypatch.setattr(main.app.state, 'worker_ready', True, raising=False)
+    monkeypatch.setattr(main.app.state, 'deferred_web_jobs', {}, raising=False)
     monkeypatch.setattr(main.app.state, 'model_process', type('Alive', (), {'is_alive': lambda self: True})(), raising=False)
     main._webui_sessions.clear()
     main._webui_transcripts.clear()
@@ -100,7 +102,10 @@ async def test_real_worker_queue_cancel_discards_late_result(monkeypatch):
                     break
                 await asyncio.sleep(.01)
             worker_request = requests.get_nowait()
-            assert worker_request['audio_bytes'] == b'abc'
+            assert worker_request['audio_bytes'] is None
+            from pathlib import Path
+            assert Path(worker_request['audio_path']).read_bytes() == b'abc'
+            assert worker_request['audio_hash'] == main.hash_bytes(b'abc')
             assert (await mutate('POST', f'/web/jobs/{job_id}/cancel')).json()['status'] == 'cancel_requested'
             assert flags[(job_id, 1)] is True
             assert worker_request['web_job_key'] == (job_id, 1)
@@ -479,6 +484,7 @@ def test_worker_cooperative_cancellation(stage, monkeypatch):
     worker = threading.Thread(target=main.model_worker, args=(requests, responses, stop, {}, flags))
     worker.start()
     try:
+        assert responses.get(timeout=3).get('__worker_ready__')
         if stage != 'queued':
             assert entered.wait(3)
             flags[('job', 1)] = True
@@ -603,9 +609,10 @@ async def test_worker_death_unblocks_job_and_next_job(monkeypatch, cancel_first)
         process.alive = False
         await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 3)
         job = (await client.get(f'/web/jobs/{first}')).json()
-        assert job['status'] == ('cancelled' if cancel_first else 'error')
+        assert job['status'] == ('cancelled' if cancel_first else 'queued')
         if not cancel_first:
-            assert 'worker stopped' in job['error'].lower()
+            assert job['attempt'] == 2 and job['error'] is None
+            assert len(main.app.state.deferred_web_jobs) == 1
         second, started = await start_job()
         assert started.status_code == 503
         await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 3)
@@ -838,31 +845,25 @@ async def test_supervisor_replaces_dead_worker_without_replaying_queue(monkeypat
     monkeypatch.setattr(main.app.state, 'response_listener_task', listener, raising=False)
     supervisor = None
     try:
-        settings = {'filename': 'x', 'size': 3, 'model': 'small', 'diarize': False, 'desired_diarize': False}
-        store = main._job_store()
-        queued = store.create('owner', settings)
-        store.enqueue('owner', queued['id'], 1)
-        async with main._job_worker_slot:
-            main._launch_job('owner', queued)
-            supervisor = asyncio.create_task(main._worker_supervisor(ctx))
-            for _ in range(100):
-                if not main.app.state.worker_accepting: break
-                await asyncio.sleep(.01)
-            assert not main._worker_accepts_requests()
-            for _ in range(200):
-                if ctx.processes and main.app.state.worker_accepting:
-                    break
-                await asyncio.sleep(.02)
-            assert len(ctx.processes) == 1 and main.app.state.worker_accepting
-            assert old_request.closed and old_response.closed
-            assert main.app.state.request_queue is not old_request
-            assert main.app.state.request_queue.empty()
-            with pytest.raises(main.WorkerStopped):
-                await future
-            assert 'stopped' in (await stream.get())['error']
-            assert await stream.get() is None
-        await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 3)
-        assert store.get('owner', queued['id'])['status'] == 'error'
+        supervisor = asyncio.create_task(main._worker_supervisor(ctx))
+        for _ in range(100):
+            if not main.app.state.worker_accepting: break
+            await asyncio.sleep(.01)
+        assert not main._worker_accepts_requests()
+        for _ in range(200):
+            if ctx.processes and main.app.state.worker_accepting:
+                break
+            await asyncio.sleep(.02)
+        assert len(ctx.processes) == 1 and main.app.state.worker_accepting
+        assert old_request.closed and old_response.closed
+        assert main.app.state.request_queue is not old_request
+        assert main.app.state.request_queue.empty()
+        with pytest.raises(main.WorkerStopped):
+            await future
+        assert 'stopped' in (await stream.get())['error']
+        assert await stream.get() is None
+        # Raw old-generation requests are never blindly replayed. Durable Web
+        # UI jobs use the separately tested attempt/readiness recovery path.
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
             token = (await client.post('/web/session', headers={'origin': 'http://testserver'})).json()['token']
             async def mutate(method, path, **kwargs):

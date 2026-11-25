@@ -41,9 +41,13 @@ def test_worker_reuses_models_and_marks_inference_idle_after_each_request(monkey
     requests, responses = Queue(), Queue()
     for i, model in enumerate(['gigaam-v3', 'large-v3', 'gigaam-v3']):
         requests.put({'request_id': i, 'model': model, 'audio_bytes': b'audio'})
-    checks = iter([False, True])
-    main.model_worker(requests, responses, SimpleNamespace(is_set=lambda: next(checks)), {})
-    results = [responses.get_nowait() for _ in range(3)]
+    stop = SimpleNamespace(is_set=lambda: sum(bool(item.get('final')) for item in responses.queue) >= 3)
+    main.model_worker(requests, responses, stop, {})
+    results = []
+    while not responses.empty():
+        item = responses.get_nowait()
+        if not item.get('__worker_ready__'):
+            results.append(item)
     assert all(r.get('final') for r in results), results
     assert len(entries) == 2
     assert sum(kind == 'begin' for kind, _ in calls) == 3

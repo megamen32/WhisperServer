@@ -94,7 +94,9 @@ def test_worker_returns_labelled_segments_and_words(monkeypatch, stream):
     main.model_worker(requests, responses, SimpleNamespace(is_set=lambda: next(checks)), {})
     messages = []
     while not responses.empty():
-        messages.append(responses.get_nowait())
+        message = responses.get_nowait()
+        if not message.get("__worker_ready__"):
+            messages.append(message)
     result = messages[-1]["result"]
     assert options[0]["word_timestamps"] is True
     assert [s["speaker"] for s in result["segments"]] == ["SPEAKER_00", "SPEAKER_01"]
