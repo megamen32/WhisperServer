@@ -48,47 +48,50 @@ class GigaAMModel:
                    **_: Any) -> tuple[Iterable[ParakeetSegment], ParakeetInfo]:
         """Decode one audio file and normalize GigaAM's text-only result."""
         info = ParakeetInfo(language=language or "ru", language_probability=1.0 if language else 0.0)
-        if not vad_filter and speaker_turns is None:
-            try:
-                text = str(self._model.transcribe(audio_path) or "").strip()
-                return ([ParakeetSegment(start=0.0, end=0.0, text=text)] if text else []), info
-            except ValueError as exc:
-                if "Too long wav file" not in str(exc):
-                    raise
-
-        # GigaAM's short decoder is limited to 25 seconds. Use the existing
-        # local Silero frontend instead of requiring gated pyannote weights.
-        rate = 16000
-        limit = 20 * rate
-        audio = decode_audio(audio_path, sampling_rate=rate)
-        if speaker_turns is not None:
-            # Decode each exclusive speaker turn separately: GigaAM has no word
-            # timestamps, so tagging a whole VAD region would mix speakers.
-            regions = [{'start': max(0, int(turn['start'] * rate)),
-                        'end': min(len(audio), int(turn['end'] * rate))}
-                       for turn in speaker_turns]
-        elif vad_filter:
-            options = dict(vad_parameters or {})
-            options['max_speech_duration_s'] = 20
-            regions = get_speech_timestamps(audio, VadOptions(**options))
-        else:
-            regions = [{'start': 0, 'end': len(audio)}]
-        segments = []
-        with tempfile.TemporaryDirectory(prefix='gigaam-chunks-') as directory:
-            path = str(Path(directory) / 'chunk.wav')
-            for region in regions:
-                # Bound even padded VAD regions and uninterrupted speech.
-                for start in range(region['start'], region['end'], limit):
-                    end = min(start + limit, region['end'])
-                    pcm = (np.clip(audio[start:end], -1, 1) * 32767).astype('<i2')
-                    if len(pcm) < MIN_DECODER_SAMPLES:
-                        pcm = np.pad(pcm, (0, MIN_DECODER_SAMPLES - len(pcm)))
-                    with wave.open(path, 'wb') as out:
-                        out.setnchannels(1)
-                        out.setsampwidth(2)
-                        out.setframerate(rate)
-                        out.writeframes(pcm.tobytes())
-                    text = str(self._model.transcribe(path) or '').strip()
+        def decode_segments():
+            if not vad_filter and speaker_turns is None:
+                try:
+                    text = str(self._model.transcribe(audio_path) or "").strip()
                     if text:
-                        segments.append(ParakeetSegment(start=start/rate, end=end/rate, text=text))
-        return segments, info
+                        yield ParakeetSegment(start=0.0, end=0.0, text=text)
+                    return
+                except ValueError as exc:
+                    if "Too long wav file" not in str(exc):
+                        raise
+
+            # GigaAM's short decoder is limited to 25 seconds. Use the existing
+            # local Silero frontend instead of requiring gated pyannote weights.
+            rate = 16000
+            limit = 20 * rate
+            audio = decode_audio(audio_path, sampling_rate=rate)
+            if speaker_turns is not None:
+                # Decode each exclusive speaker turn separately: GigaAM has no word
+                # timestamps, so tagging a whole VAD region would mix speakers.
+                regions = [{'start': max(0, int(turn['start'] * rate)),
+                            'end': min(len(audio), int(turn['end'] * rate))}
+                           for turn in speaker_turns]
+            elif vad_filter:
+                options = dict(vad_parameters or {})
+                options['max_speech_duration_s'] = 20
+                regions = get_speech_timestamps(audio, VadOptions(**options))
+            else:
+                regions = [{'start': 0, 'end': len(audio)}]
+            with tempfile.TemporaryDirectory(prefix='gigaam-chunks-') as directory:
+                path = str(Path(directory) / 'chunk.wav')
+                for region in regions:
+                    # Bound even padded VAD regions and uninterrupted speech.
+                    for start in range(region['start'], region['end'], limit):
+                        end = min(start + limit, region['end'])
+                        pcm = (np.clip(audio[start:end], -1, 1) * 32767).astype('<i2')
+                        if len(pcm) < MIN_DECODER_SAMPLES:
+                            pcm = np.pad(pcm, (0, MIN_DECODER_SAMPLES - len(pcm)))
+                        with wave.open(path, 'wb') as out:
+                            out.setnchannels(1)
+                            out.setsampwidth(2)
+                            out.setframerate(rate)
+                            out.writeframes(pcm.tobytes())
+                        text = str(self._model.transcribe(path) or '').strip()
+                        if text:
+                            yield ParakeetSegment(start=start/rate, end=end/rate, text=text)
+
+        return decode_segments(), info

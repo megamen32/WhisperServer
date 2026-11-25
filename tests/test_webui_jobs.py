@@ -42,6 +42,7 @@ def test_owner_checked_for_every_operation(store):
     operations = [lambda: store.get('bob', job_id), lambda: store.enqueue('bob', job_id, 1),
                   lambda: store.start('bob', job_id, 1), lambda: store.request_cancel('bob', job_id, 1),
                   lambda: store.finish_cancel('bob', job_id, 1), lambda: store.complete('bob', job_id, 1, {}),
+                  lambda: store.update_progress('bob', job_id, 1, {}),
                   lambda: store.fail('bob', job_id, 1, 'x'), lambda: store.retry('bob', job_id, {}),
                   lambda: store.put_summary('bob', job_id, 1, 'a', {}), lambda: store.delete('bob', job_id)]
     for operation in operations:
@@ -134,3 +135,29 @@ def test_capacity_is_atomic_across_instances(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(create, stores))
     assert sum(result is not None for result in results) == 1
+
+
+def test_progress_is_durable_and_stale_attempt_cannot_overwrite(tmp_path):
+    path = tmp_path / "jobs.sqlite"
+    store = JobStore(path)
+    settings = {"filename": "voice.wav", "size": 3, "model": "small", "diarize": False}
+    job = store.create("owner", settings)
+    job_id = job["id"]
+    store.enqueue("owner", job_id, 1)
+    store.start("owner", job_id, 1)
+    partial = {"text": "partial", "segments": [{"start": 0, "end": 5, "text": "partial"}],
+               "progress": {"phase": "transcribing", "percent": 50}}
+    store.update_progress("owner", job_id, 1, partial)
+    assert JobStore(path).get("owner", job_id)["result"] == partial
+    store.request_cancel("owner", job_id, 1)
+    with pytest.raises(InvalidTransition):
+        store.update_progress("owner", job_id, 1, partial)
+    store.finish_cancel("owner", job_id, 1)
+    assert store.get("owner", job_id)["result"] is None
+    store.retry("owner", job_id, settings)
+    store.start("owner", job_id, 2)
+    with pytest.raises(InvalidTransition):
+        store.update_progress("owner", job_id, 1, partial)
+    store.update_progress("owner", job_id, 2, partial)
+    recovered = store.recover_interrupted()[0]
+    assert recovered["attempt"] == 3 and recovered["result"] is None

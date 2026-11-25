@@ -849,6 +849,7 @@ request_queue = None
 response_queue = None
 pending_results = {}
 pending_streams = {}
+pending_progress = {}
 model_usage = None
 
 TEMPLATE_PATH = _web_asset("webui.html", template=True)
@@ -996,6 +997,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 beam_size = request.get("beam_size", 5)
                 temperature = request.get("temperature", 0.0)
                 stream = request.get("stream")
+                report_progress = request.get("progress", False)
                 vad_filter = request.get("vad_filter", WHISPER_VAD_ENABLED)
                 model_name = requested_model_name
                 model_substituted = False
@@ -1020,8 +1022,14 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                     if job_key is not None and cancel_flags is not None and cancel_flags.get(job_key, False):
                         raise WebJobCancelled('Web job cancelled')
 
+                def publish_progress(phase, **extra):
+                    if report_progress:
+                        response_queue.put({'request_id': request_id, 'progress': {
+                            'phase': phase, 'total_seconds': audio_seconds, **extra}})
+
                 try:
                     check_cancel()
+                    publish_progress('preparing')
                     with tempfile.NamedTemporaryFile(delete=False) as temp:
                         temp.write(audio_bytes)
                         temp.flush()
@@ -1029,6 +1037,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                     audio_seconds = audio_duration_seconds(temp_path)
                     diarize = request.get("diarize", False)
                     check_cancel()
+                    if diarize:
+                        publish_progress('diarizing')
                     speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter, model_provider=_diarization_model_session) if diarize else []
                     check_cancel()
 
@@ -1054,6 +1064,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                                 model_name,
                             )
 
+                    publish_progress('loading')
                     reset_cuda_peak_memory()
                     cold_load = model_name not in model_cache
                     load_started = time.perf_counter()
@@ -1082,6 +1093,9 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                     def _decode(current_beam: int):
                         """Decode the whole recording; faster-whisper decodes lazily."""
                         check_cancel()
+                        # A non-streaming web job retains the normal OOM retry.
+                        # Clear its previous attempt's partial decode on retry.
+                        publish_progress('transcribing', processed_seconds=0.0, reset=True)
                         segments, info = model.transcribe(
                             temp_path,
                             beam_size=current_beam,
@@ -1125,7 +1139,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                             attributed = attribute_segment(seg_data, words, speaker_turns) if diarize else [seg_data]
                             decoded_segments.extend(attributed)
                             decoded_words.extend(words)
-                            if stream:
+                            if stream or report_progress:
                                 for part in attributed:
                                     payload = {"request_id": request_id, "segment": part}
                                     if request.get("words", False):
@@ -1306,6 +1320,14 @@ async def response_listener(stop_event, response_queue, retire_event=None):
                     break
                 logger.info(f'response_listener get from queue result {result}')
                 request_id = result["request_id"]
+                progress_callback = pending_progress.get(request_id)
+                if progress_callback is not None and ("progress" in result or "segment" in result):
+                    try:
+                        progress_callback(result)
+                    except (InvalidTransition, JobNotFound):
+                        pass  # A cancellation or newer attempt owns this job.
+                    except Exception:
+                        logger.exception("Failed to publish web job progress")
                 if request_id in pending_results:
                     # A segment is not a terminal response for a non-stream request.
                     if "result" not in result and "error" not in result:
@@ -1569,6 +1591,7 @@ async def _transcribe_impl(
     comment: Optional[str] = None,
     *, wait_for_terminal: bool = False,
     web_job_key=None,
+    progress_callback=None,
 ):
     diarize = diarize is True
     client_comment = normalize_comment(comment)
@@ -1640,23 +1663,35 @@ async def _transcribe_impl(
             return JSONResponse({'error': 'Model worker stopped before responding',
                                  'code': 'worker_stopped'}, status_code=503)
 
-    app.state.request_queue.put({
-        "request_id": request_id,
-        "audio_bytes": audio_bytes,
-        "model": actual_model,
-        "requested_model": model,
-        "language": language,
-        "cache_key": cache_key,
-        "beam_size": beam_size,
-        "temperature": temperature,
-        "stream": stream,
-        "words": words,
-        "vad_filter": vad_filter,
-        "diarize": diarize,
-        "client_comment": client_comment,
-        "queued_at": time.perf_counter(),
-        "web_job_key": web_job_key,
-    })
+    if progress_callback is not None:
+        pending_progress[request_id] = progress_callback
+    try:
+        app.state.request_queue.put({
+            "request_id": request_id,
+            "audio_bytes": audio_bytes,
+            "model": actual_model,
+            "requested_model": model,
+            "language": language,
+            "cache_key": cache_key,
+            "beam_size": beam_size,
+            "temperature": temperature,
+            "stream": stream,
+            "progress": progress_callback is not None,
+            "words": words,
+            "vad_filter": vad_filter,
+            "diarize": diarize,
+            "client_comment": client_comment,
+            "queued_at": time.perf_counter(),
+            "web_job_key": web_job_key,
+        })
+    except BaseException:
+        pending_progress.pop(request_id, None)
+        pending_streams.pop(request_id, None)
+        if not stream:
+            pending_results.pop(request_id, None)
+            future.cancel()
+        raise
+
 
     if stream:
         async def generator():
@@ -1676,6 +1711,7 @@ async def _transcribe_impl(
                     yield json.dumps(item) + "\n"
             finally:
                 pending_streams.pop(request_id, None)
+                pending_progress.pop(request_id, None)
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -1753,6 +1789,8 @@ async def _transcribe_impl(
                     headers={"Retry-After": "30"},
                 )
             return JSONResponse({"error": str(e)}, status_code=500)
+        finally:
+            pending_progress.pop(request_id, None)
 
 
 @app.post("/transcribe")
@@ -1804,8 +1842,20 @@ def _job_get(owner, job_id):
 
 def _job_view(job):
     settings = job['diarization']
+    result = job.get('result') or {}
+    progress = result.get('progress') if isinstance(result, dict) else None
+    if job['status'] == 'done':
+        segments = result.get('segments', [])
+        duration = result.get('duration')
+        progress = {'phase': 'done', 'percent': 100.0, 'total_seconds': duration,
+                    'processed_seconds': duration or max((s.get('end', 0) for s in segments), default=0),
+                    'segments': len(segments)}
+    elif progress is None:
+        progress = {'phase': 'queued' if job['status'] == 'processing' else job['status'],
+                    'percent': None, 'processed_seconds': 0.0, 'total_seconds': None, 'segments': 0}
     return {**job, **{k: settings[k] for k in ('filename', 'size', 'model')},
             'diarize': settings.get('desired_diarize', settings['diarize']),
+            'progress': progress,
             'offset': _job_spool().offset(job['id']), 'transcript_id': job['id'] if job['status'] == 'done' else None}
 
 
@@ -1863,11 +1913,35 @@ async def _execute_web_job(owner, job_id, attempt):
     try:
         job = store.start(owner, job_id, attempt)
         settings = job['diarization']
+        partial = {'text': '', 'segments': [], 'progress': {
+            'phase': 'queued', 'percent': None, 'processed_seconds': 0.0,
+            'total_seconds': None, 'segments': 0}}
+
+        def publish_progress(event):
+            progress = partial['progress']
+            update = event.get('progress', {})
+            if update.get('reset'):
+                partial['segments'] = []
+                partial['text'] = ''
+            progress.update({key: value for key, value in update.items() if key != 'reset'})
+            if 'segment' in event:
+                segment = event['segment']
+                partial['segments'].append(segment)
+                partial['text'] = ' '.join(s['text'] for s in partial['segments'])
+                progress['processed_seconds'] = max(progress['processed_seconds'], segment.get('end', 0))
+                progress['phase'] = 'transcribing'
+            total = progress.get('total_seconds')
+            progress['percent'] = (min(99.0, round(100 * progress['processed_seconds'] / total, 2))
+                                   if progress['phase'] == 'transcribing' and total and total > 0 else None)
+            progress['segments'] = len(partial['segments'])
+            store.update_progress(owner, job_id, attempt, partial)
+
+        store.update_progress(owner, job_id, attempt, partial)
         with (_job_spool().root / job_id).open('rb') as source:
             result = await _transcribe_impl(UploadFile(file=source, filename=settings['filename']),
                                             settings['model'], None, 5, 0.0, False, False, True,
                                             settings['diarize'], wait_for_terminal=True,
-                                            web_job_key=(job_id, attempt))
+                                            web_job_key=(job_id, attempt), progress_callback=publish_progress)
         if isinstance(result, JSONResponse):
             if result.status_code == 504:
                 unknown_completion = True
@@ -1946,6 +2020,40 @@ async def web_jobs_create(request: Request):
 @app.get('/web/jobs/{job_id}')
 async def web_jobs_get(job_id: str, request: Request):
     return _job_view(_job_get(_job_owner(request), job_id))
+
+
+@app.get('/web/jobs/{job_id}/events')
+async def web_jobs_events(job_id: str, request: Request):
+    """Stream owner-scoped durable snapshots; reconnect starts from current state."""
+    owner = _job_owner(request)
+    first = _job_get(owner, job_id)
+
+    async def events():
+        job, previous = first, None
+        heartbeat = time.monotonic()
+        while True:
+            view = _job_view(job)
+            revision = (job['attempt'], job['status'], job['updated_at'], view['offset'])
+            if revision != previous:
+                yield f"id: {job['attempt']}:{job['updated_at']}\ndata: {json.dumps(view, ensure_ascii=False)}\n\n"
+                previous = revision
+                heartbeat = time.monotonic()
+            elif time.monotonic() - heartbeat >= 15:
+                yield ': keepalive\n\n'
+                heartbeat = time.monotonic()
+            if job['status'] in ('done', 'error', 'cancelled'):
+                return
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(.4)
+            try:
+                job = _job_get(owner, job_id)
+            except HTTPException:
+                return  # Removed or no longer owned while the stream was open.
+
+    return StreamingResponse(events(), media_type='text/event-stream', headers={
+        'Cache-Control': 'no-cache, no-store', 'X-Accel-Buffering': 'no',
+        'X-Content-Type-Options': 'nosniff'})
 
 
 @app.put('/web/jobs/{job_id}/upload')

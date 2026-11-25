@@ -109,3 +109,19 @@ Use `diarize=true` to add Community-1 speaker labels. Native endpoints accept a
 query parameter; `/v1/audio/transcriptions` accepts a multipart form field.
 `speaker_text` contains labelled dialogue; `response_format=verbose_json` also
 includes `segments[].speaker` and `speaker_turns`. See [setup and limits](diarization.md).
+
+
+### Live Web UI job progress
+
+`GET /web/jobs/{id}/events` is a cookie-authenticated SSE endpoint for the
+current Web UI session. Each ordinary `message` event contains a full job
+snapshot, matching `GET /web/jobs/{id}`. Other sessions cannot subscribe.
+
+While a job is processing, `result.segments` and `result.text` contain the
+available partial transcript. `progress` reports `phase`, `percent`,
+`processed_seconds`, `total_seconds`, and `segments`. An unknown numeric
+percentage is `null`; the client displays the current phase until measured
+audio progress is available. Clients reconcile snapshots by job and attempt,
+so reconnecting does not duplicate segments. The terminal snapshot contains
+the final result, and the server closes the stream. Normal GET polling remains
+available when SSE is interrupted.

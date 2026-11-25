@@ -1,0 +1,35 @@
+name: Whisper checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: whisper-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  web-jobs-and-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Install CPU test runner
+        run: python -m pip install pytest
+      - name: Require a real browser
+        run: python -c "import shutil; assert shutil.which('google-chrome') or shutil.which('chromium'), 'Chrome is required for the streaming regression'"
+      - name: Compile tracked Python
+        run: |
+          python - <<'PY'
+          import py_compile
+          import subprocess
+          for name in subprocess.check_output(["git", "ls-files", "*.py"], text=True).splitlines():
+              py_compile.compile(name, doraise=True)
+          PY
+      - name: Test persistent jobs, resumable uploads and streaming UI
+        run: python -m pytest -q tests/test_webui_jobs.py tests/test_webui_uploads.py tests/test_webui_streaming_browser.py

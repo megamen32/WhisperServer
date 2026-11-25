@@ -70,3 +70,33 @@ docs/                           maintained documentation
 - Для тестов используйте фиктивные значения вроде `WHISPER_TEST_API_KEY`.
 - `.env`, cache, venv, dist и egg-info должны оставаться untracked.
 - При изменении API обновляйте `docs/api.md` и README examples.
+
+
+## Streaming jobs and production deployment
+
+The Web UI subscribes to `GET /web/jobs/{id}/events` while a job is queued or
+processing. The SSE stream carries the same session-owned snapshot as
+`GET /web/jobs/{id}`, including partial `result.segments` and `progress`.
+The browser reconnects after a connection loss and uses ordinary GET requests
+as a fallback. Upload byte progress is independent of transcription progress.
+A completed job replaces the partial transcript with its final result.
+
+Production on server 88 runs the canonical checkout
+`/home/roomhacker/PycharmProjects/WhisperServer` on `main` using its
+`.venv-new/bin/python`. `deploy/whisperserver.service` is the source for the
+service command. Release directories and stacked `ExecStart` overrides must
+not select a second application version. Keep runtime settings and stored jobs
+outside Git. Before restarting, check for active jobs and preserve the job store.
+
+The `Whisper checks` GitHub workflow runs CPU-only persistence/upload tests
+and the streaming UI regression in real headless Chrome. Chrome is required;
+a missing browser fails the workflow. Model loading, the API dispatcher,
+cancellation, and actual GPU transcription are verified in the existing server
+environment:
+
+```bash
+.venv-new/bin/python -m pytest -q -m "not integration"
+```
+
+After deployment, test an uncached audio job through the public Web UI and
+confirm that partial text and progress arrive before the terminal result.

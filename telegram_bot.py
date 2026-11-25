@@ -49,7 +49,8 @@ class BotSettings:
     def __init__(self) -> None:
         self.token = os.getenv("TG_BOT_TOKEN", "")
         self.api_key = os.getenv("TG_BOT_API_KEY", os.getenv("API_KEY", "bad-key"))
-        self.http_proxy = os.getenv("TG_BOT_HTTP_PROXY", "http://192.168.2.1:3128")
+        configured_proxy = os.getenv("TG_BOT_HTTP_PROXY", "").strip()
+        self.http_proxy = configured_proxy if configured_proxy and configured_proxy != "http://192.168.2.1:3128" else None
         self.server_url = os.getenv(
             "TG_BOT_SERVER_URL",
             os.getenv("WHISPER_URL", "http://127.0.0.1:7653/transcribe"),

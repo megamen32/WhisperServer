@@ -387,6 +387,12 @@
         .progress-bar, .upload-bar { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #69d6c1, #77bfff); transition: width .3s ease; }
         .upload-track { height: 4px; margin-top: 8px; }
         .upload-track.hidden { display: none; }
+        .progress-bar.indeterminate { animation: processing-scan 1.6s ease-in-out infinite; }
+        @keyframes processing-scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(340%); } }
+        @media (prefers-reduced-motion: reduce) {
+            .progress-bar, .upload-bar { transition: none; }
+            .progress-bar.indeterminate { animation: none; width: 100% !important; opacity: .45; }
+        }
         .progress-meta { display: none; justify-content: space-between; gap: 12px; margin-top: 8px; color: #879ab2; font-size: .78rem; }
         .progress-meta.visible { display: flex; }
         .output { width: 100%; max-height: none; overflow: visible; margin-top: 28px; padding: 0; border: 0; border-radius: 0; background: transparent; }
@@ -489,7 +495,7 @@
             <div id="diarize-status" class="status-bar" aria-live="polite"></div>
             <div id="storage-warning" class="error-output" role="status"></div>
             <div class="upload-track hidden"><div class="upload-bar" id="upload-bar"></div></div>
-            <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
+            <div class="progress-track" role="progressbar" aria-label="Распознавание аудио" aria-valuemin="0" aria-valuemax="100"><div class="progress-bar" id="progress-bar"></div></div>
             <div class="progress-meta"><span id="speed-label">Скорость: —</span><span id="estimate-label">Ожидание: —</span></div>
             <div class="status-bar" id="status-bar">Готово</div>
         </section>
@@ -635,6 +641,7 @@
         let currentFile = null;
         let pendingReprocess = false;
         let uploadStartTime = 0;
+        let uploadStartOffset = 0;
         let currentUploadTotal = 0;
         let matchingSegments = [];
         let activeMatchIndex = -1;
@@ -771,7 +778,7 @@
             uploadBar.style.width = `${Math.floor(ratio * 100)}%`;
             const totalBytes = total > 0 ? total : currentUploadTotal;
             const elapsedSeconds = Math.max(0.001, (Date.now() - uploadStartTime) / 1000);
-            const bytesPerSecond = Math.max(0, loaded / elapsedSeconds);
+            const bytesPerSecond = Math.max(0, (loaded - uploadStartOffset) / elapsedSeconds);
             const speedText = bytesPerSecond > 0 ? `${formatBytes(bytesPerSecond)}/с` : '—';
             speedLabel.textContent = `${UPLOAD_SPEED_PREFIX} ${speedText}`;
             if (total > 0 && bytesPerSecond > 0 && !done) {
@@ -789,13 +796,14 @@
             }
         }
 
-        function showUploadProgress(totalBytes = 0) {
+        function showUploadProgress(totalBytes = 0, initialOffset = 0) {
             uploadTrack.classList.remove('hidden');
             uploadBar.style.width = '0%';
             speedLabel.textContent = `${UPLOAD_SPEED_PREFIX} —`;
             const totalText = totalBytes ? formatBytes(totalBytes) : '—';
             estimateLabel.textContent = `${UPLOAD_ESTIMATE_PREFIX} — · 0 / ${totalText}`;
             uploadStartTime = Date.now();
+            uploadStartOffset = Math.max(0, Number(initialOffset) || 0);
             currentUploadTotal = totalBytes;
             progressMeta?.classList.add('visible');
         }
@@ -877,7 +885,6 @@
             }
             documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
             updateMatchCount();
-            updateProgress();
         }
 
         function renderHighlightedBody(segment, query) {
@@ -1066,6 +1073,11 @@
         let selectedJob = null;
         let generation = 0;
         let pollTimer = null;
+        let jobEvents = null;
+        let eventJobId = '';
+        let eventGeneration = -1;
+        let renderedAttempt = '';
+        let renderedSegmentKeys = [];
         let needsFile = false;
         let cancelling = false;
         let uploadingId = '';
@@ -1085,11 +1097,39 @@
                     webuiCsrfToken = JSON.parse(match[1]);
                 };
                 if (options.refreshToken) await refresh();
-                const { refreshToken, retryCsrf, ...requestOptions } = options;
+                const { refreshToken, retryCsrf, onUploadProgress, ...requestOptions } = options;
                 const send = async () => {
                     const headers = new Headers(requestOptions.headers || {});
                     if (requestOptions.method && requestOptions.method !== 'GET') headers.set('X-Whisper-CSRF', webuiCsrfToken);
-                    const response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...requestOptions, headers });
+                    let response;
+                    if (onUploadProgress) {
+                        // Keep upload requests in the same token queue as all mutations.
+                        // Browser byte progress is independent of the resumable chunk offset.
+                        response = await new Promise((resolve, reject) => {
+                            const request = new XMLHttpRequest();
+                            activeXhr = request;
+                            request.open(requestOptions.method || 'GET', path);
+                            request.withCredentials = true;
+                            for (const [name, value] of headers) request.setRequestHeader(name, value);
+                            request.upload.onprogress = onUploadProgress;
+                            const cleanup = () => { if (activeXhr === request) activeXhr = null; };
+                            request.onload = () => {
+                                cleanup();
+                                resolve({
+                                    ok: request.status >= 200 && request.status < 300,
+                                    status: request.status,
+                                    headers: { get: name => request.getResponseHeader(name) },
+                                    json: async () => JSON.parse(request.responseText || '{}')
+                                });
+                            };
+                            request.onerror = () => { cleanup(); reject(new Error('Не удалось передать файл')); };
+                            request.onabort = () => { cleanup(); reject(new Error('Загрузка прервана')); };
+                            request.ontimeout = () => { cleanup(); reject(new Error('Сервер не ответил при загрузке файла')); };
+                            request.send(requestOptions.body);
+                        });
+                    } else {
+                        response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...requestOptions, headers });
+                    }
                     const token = response.headers.get('X-Whisper-Next-CSRF');
                     if (token) webuiCsrfToken = token;
                     const payload = await response.json().catch(() => ({}));
@@ -1186,7 +1226,7 @@
             const id = String(job.id);
             if (durable) { await pendingTransaction(pending, id); try { rememberPending(pending.settings.client_request_id, false); } catch (_) {} }
             volatileJobId = durable ? '' : id;
-            ++generation; const version = generation; clearTimeout(pollTimer);
+            ++generation; const version = generation; clearTimeout(pollTimer); closeJobEvents();
             selectedJobId = id; selectedJob = job; currentFile = pending.file; clearResult();
             if (!Array.from(historySelect.options).some(option => option.value === id)) {
                 historySelect.add(new Option(pending.settings.filename, id));
@@ -1196,6 +1236,9 @@
             await refreshJob(id, version, true);
         }
         function clearResult() {
+            renderedAttempt = ''; renderedSegmentKeys = [];
+            progressBar.classList.remove('indeterminate');
+            progressBar.parentElement.removeAttribute('aria-valuenow');
             segmentsProcessed = 0; matchingSegments = []; activeMatchIndex = -1;
             transcriptContainer.replaceChildren(); finalOutput.textContent = ''; documentMeta.textContent = 'Выберите задание или загрузите аудио';
             transcriptId = ''; summarizeButton.disabled = true; hideCopyButton();
@@ -1220,14 +1263,86 @@
             }
             historySelect.value = selectedJobId;
         }
+        function closeJobEvents() {
+            if (jobEvents) jobEvents.close();
+            jobEvents = null; eventJobId = ''; eventGeneration = -1;
+        }
+        function watchJob(id, version) {
+            if (!window.EventSource || !isCurrent(id, version)) return;
+            if (jobEvents && eventJobId === id && eventGeneration === version && jobEvents.readyState !== 2) return;
+            closeJobEvents();
+            const source = new EventSource(`${jobUrl(id)}/events`, { withCredentials: true });
+            jobEvents = source; eventJobId = id; eventGeneration = version;
+            source.onmessage = (event) => {
+                if (!isCurrent(id, version) || jobEvents !== source) return;
+                try {
+                    const data = JSON.parse(event.data), job = unpackJob(data);
+                    if (String(job.id) !== id || !renderJob(job, data.offset ?? job.offset)) return;
+                    if (['done', 'completed'].includes(job.status)) restoreSummary(id, version, job);
+                    else if (['queued', 'processing', 'cancel_requested'].includes(job.status)) watchJob(id, version);
+                } catch (_) {
+                    // Polling keeps the page useful while the stream reconnects.
+                    clearTimeout(pollTimer);
+                    pollTimer = setTimeout(() => refreshJob(id, version), 1000);
+                }
+            };
+            source.onerror = () => {
+                if (!isCurrent(id, version) || jobEvents !== source) return;
+                clearTimeout(pollTimer);
+                pollTimer = setTimeout(() => refreshJob(id, version), 1000);
+            };
+        }
+        function renderJobProgress(job, status) {
+            const progress = job.progress || job.result?.progress || {};
+            const done = ['done', 'completed'].includes(status);
+            const active = ['queued', 'processing', 'cancel_requested'].includes(status);
+            const track = progressBar.parentElement;
+            const percent = done ? 100 : typeof progress.percent === 'number' && Number.isFinite(progress.percent)
+                ? Math.max(0, Math.min(99, progress.percent)) : null;
+            progressBar.classList.toggle('indeterminate', active && percent === null);
+            if (percent !== null) {
+                progressBar.style.width = `${percent}%`;
+                track.setAttribute('aria-valuenow', String(Math.round(percent)));
+            } else {
+                progressBar.style.width = active ? '30%' : '0%';
+                track.removeAttribute('aria-valuenow');
+            }
+            if (!active && !done) return;
+            progressMeta?.classList.add('visible');
+            const processed = Number(progress.processed_seconds) || 0;
+            const total = Number(progress.total_seconds) || 0;
+            const phases = { queued: 'Ожидаем свободную модель', preparing: 'Подготавливаем аудио',
+                diarizing: 'Определяем говорящих', loading: 'Загружаем модель',
+                transcribing: 'Распознаём речь', done: 'Распознавание завершено' };
+            speedLabel.textContent = total > 0
+                ? `Аудио: ${formatTime(Math.min(processed, total))} / ${formatTime(total)}`
+                : phases[progress.phase] || (done ? phases.done : 'Подготавливаем распознавание');
+            estimateLabel.textContent = `${percent === null ? '' : `${Math.floor(percent)}% · `}${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
+        }
         function renderJob(job, offset) {
+            // A delayed poll or a reconnect must never replace a newer attempt or its final result.
+            const terminal = value => ['done', 'completed', 'cancelled', 'canceled', 'error', 'failed'].includes(value);
+            if (selectedJob && String(selectedJob.id) === String(job.id)) {
+                if (Number(job.attempt) < Number(selectedJob.attempt)) return false;
+                if (job.attempt === selectedJob.attempt && terminal(selectedJob.status) && !terminal(job.status)) return false;
+                if (job.attempt === selectedJob.attempt && job.updated_at && selectedJob.updated_at && job.updated_at < selectedJob.updated_at) return false;
+            }
+            const attempt = `${job.id}:${job.attempt}`;
+            if (renderedAttempt !== attempt) {
+                if (renderedAttempt) closeJobEvents();
+                clearResult(); renderedAttempt = attempt;
+            }
             selectedJob = job;
             const status = job.status || 'unknown';
+            const progress = job.progress || job.result?.progress || {};
             const labels = { uploading: 'Загрузка файла', queued: 'В очереди', processing: 'Обработка',
                 cancel_requested: 'Отмена запрошена', cancelled: 'Отменено', canceled: 'Отменено',
                 done: 'Готово', completed: 'Готово', error: 'Ошибка обработки', failed: 'Ошибка обработки' };
-            setStatus(`${labels[status] || `Статус сервера: ${status}`} · попытка ${job.attempt ?? '—'}`);
-            if (job.error) errorOutput.textContent = typeof job.error === 'string' ? job.error : JSON.stringify(job.error);
+            const phases = { preparing: 'Подготавливаем аудио', diarizing: 'Определяем говорящих',
+                loading: 'Загружаем модель', transcribing: 'Распознаём речь' };
+            const label = status === 'processing' ? phases[progress.phase] || labels.processing : labels[status];
+            setStatus(`${label || `Статус сервера: ${status}`} · попытка ${job.attempt ?? '?'}`);
+            errorOutput.textContent = job.error ? (typeof job.error === 'string' ? job.error : JSON.stringify(job.error)) : '';
             const active = ['uploading', 'queued', 'processing', 'cancel_requested'].includes(status);
             isProcessing = active;
             cancelButton.hidden = !active;
@@ -1239,22 +1354,32 @@
                 const size = Number(job.size || currentFile?.size || 0);
                 if (size) updateUploadProgress(offset, size, offset === size);
             } else hideUploadProgress();
-            if (status === 'done' || status === 'completed') {
-                const result = job.result || job;
-                clearResult();
-                for (const segment of (Array.isArray(result.segments) ? result.segments : [])) appendSegment(segment);
-                finalOutput.textContent = result.speaker_text || result.text || '';
-                transcriptId = result.transcript_id || job.transcript_id || '';
-                summarizeButton.disabled = !transcriptId;
-                if (segmentsProcessed || finalOutput.textContent) showCopyButton();
-                toggleTimes.hidden = !segmentsProcessed;
-                documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${job.filename || 'аудиофайл'}`;
-                progressBar.style.width = '100%';
-                if (!segmentsProcessed && !finalOutput.textContent) setStatus('Задание готово, но сервер не вернул текст');
+            const done = ['done', 'completed'].includes(status);
+            const result = job.result || (done ? job : {});
+            const segments = Array.isArray(result.segments) ? result.segments : [];
+            const keys = segments.map(segment => JSON.stringify([segment.start, segment.end, segment.text, segment.speaker]));
+            // Append to stable nodes during streaming so search and selection stay in place.
+            // Rebuild only when the final result actually corrects an earlier segment.
+            if (keys.length < renderedSegmentKeys.length || renderedSegmentKeys.some((key, index) => keys[index] !== key)) {
+                transcriptContainer.replaceChildren(); segmentsProcessed = 0;
+                matchingSegments = []; activeMatchIndex = -1; renderedSegmentKeys = [];
             }
+            for (let index = renderedSegmentKeys.length; index < segments.length; index++) appendSegment(segments[index]);
+            renderedSegmentKeys = keys;
+            finalOutput.textContent = result.speaker_text || result.text || '';
+            transcriptId = done ? result.transcript_id || job.transcript_id || '' : '';
+            summarizeButton.disabled = !done || !transcriptId;
+            if (segmentsProcessed || finalOutput.textContent) showCopyButton();
+            else hideCopyButton();
+            toggleTimes.hidden = !segmentsProcessed;
+            documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${job.filename || 'аудиофайл'}`;
+            if (status !== 'uploading') renderJobProgress(job, status);
+            if (done && !segmentsProcessed && !finalOutput.textContent) setStatus('Задание готово, но сервер не вернул текст');
+            if (!active) { clearTimeout(pollTimer); closeJobEvents(); }
             const setting = typeof job.diarize === 'boolean' ? job.diarize :
                 typeof job.diarization === 'boolean' ? job.diarization : job.diarization?.diarize;
             if (typeof setting === 'boolean' && !diarizeInput.disabled) diarizeInput.checked = setting;
+            return true;
         }
         function displaySummary(text, html) {
             rawSummary = text || '';
@@ -1291,7 +1416,13 @@
                 const job = unpackJob(data);
                 if (String(job.id) !== id) throw new Error('Сервер вернул другое задание');
                 const offset = data.offset ?? job.offset;
-                renderJob(job, offset);
+                if (!renderJob(job, offset)) {
+                    if (['queued', 'processing', 'cancel_requested'].includes(selectedJob?.status)) {
+                        clearTimeout(pollTimer);
+                        pollTimer = setTimeout(() => refreshJob(id, version), 1800);
+                    }
+                    return;
+                }
                 if (job.status === 'uploading' && resume && uploadingId !== id) {
                     let file;
                     if (volatileJobId === id) file = currentFile;
@@ -1309,7 +1440,9 @@
                 if (['done', 'completed'].includes(job.status)) await restoreSummary(id, version, job);
                 if (['uploading', 'queued', 'processing', 'cancel_requested'].includes(job.status) && uploadingId !== id) {
                     clearTimeout(pollTimer);
-                    pollTimer = setTimeout(() => refreshJob(id, version, job.status === 'uploading'), 1800);
+                    if (job.status !== 'uploading') watchJob(id, version);
+                    pollTimer = setTimeout(() => refreshJob(id, version, job.status === 'uploading'),
+                        jobEvents?.readyState === 1 ? 5000 : 1800);
                 }
             } catch (error) {
                 if (!isCurrent(id, version)) return;
@@ -1321,14 +1454,18 @@
         async function uploadJob(id, version, file, offset) {
             if (uploadingId === id) return;
             uploadingId = id;
-            showUploadProgress(file.size);
+            showUploadProgress(file.size, offset);
             try {
                 if (!Number.isSafeInteger(offset) || offset < 0 || offset > file.size) throw new Error('Сервер вернул некорректное смещение загрузки');
                 while (offset < file.size && isCurrent(id, version) && !cancelling) {
                     updateUploadProgress(offset, file.size);
                     const end = Math.min(offset + CHUNK_SIZE, file.size);
                     const response = await api(`${jobUrl(id)}/upload?offset=${offset}`, {
-                        method: 'PUT', retryCsrf: true, headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(offset, end)
+                        method: 'PUT', retryCsrf: true, headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(offset, end),
+                        onUploadProgress: (event) => {
+                            if (isCurrent(id, version) && !cancelling) updateUploadProgress(
+                                Math.min(end, offset + event.loaded), file.size);
+                        }
                     });
                     if (!isCurrent(id, version) || cancelling) return;
                     if (!Number.isSafeInteger(response.offset) || response.offset !== end) throw new Error('Сервер вернул неожиданное смещение загрузки');
@@ -1351,7 +1488,7 @@
         }
         async function selectJob(id) {
             ++generation; const version = generation;
-            clearTimeout(pollTimer); selectedJobId = String(id || ''); selectedJob = null;
+            clearTimeout(pollTimer); closeJobEvents(); selectedJobId = String(id || ''); selectedJob = null;
             needsFile = false; cancelling = false; currentFile = null; isProcessing = false;
             volatileJobId = ''; storageWarning.textContent = '';
             errorOutput.textContent = ''; diarizeStatus.textContent = ''; clearResult(); hideUploadProgress();
@@ -1425,7 +1562,7 @@
         cancelButton.addEventListener('click', async () => {
             const id = selectedJobId, version = generation;
             if (!id || cancelling) return;
-            cancelling = true; cancelButton.disabled = true; clearTimeout(pollTimer);
+            cancelling = true; cancelButton.disabled = true; clearTimeout(pollTimer); closeJobEvents();
             cancelButton.textContent = 'Отменяем…';
             setStatus('Отправляем запрос на отмену…');
             try {
@@ -1676,6 +1813,7 @@
             setStatus('Модель будет применена к следующему заданию');
         });
 
+        window.addEventListener('pagehide', closeJobEvents);
         loadModels();
         initializationPromise = initializeJobs();
     </script>

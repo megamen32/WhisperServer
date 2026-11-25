@@ -150,6 +150,17 @@ class JobStore:
     def finish_cancel(self, owner, job_id, attempt):
         return self._transition(owner, job_id, attempt, ('cancel_requested',), 'cancelled')
 
+    def update_progress(self, owner, job_id, attempt, result):
+        """Publish a bounded partial snapshot without changing the job state."""
+        payload = self._json(result)
+        with self._transaction() as db:
+            row = self._owned(db, owner, job_id)
+            if row['attempt'] != attempt or row['status'] != 'processing':
+                raise InvalidTransition('stale attempt or invalid state')
+            db.execute('UPDATE jobs SET result=?, updated_at=? WHERE id=?',
+                       (payload, _now(), job_id))
+            return self._record(db, self._owned(db, owner, job_id))
+
     def complete(self, owner, job_id, attempt, result):
         payload = self._json(result)
         with self._transaction() as db:
@@ -204,7 +215,7 @@ class JobStore:
                 if row['status'] == 'error' and settings.get('desired_diarize', settings.get('diarize')) == settings.get('diarize'):
                     continue
                 settings['diarize'] = settings.get('desired_diarize', settings.get('diarize'))
-                db.execute("UPDATE jobs SET status='queued', attempt=attempt+1, diarization=?, updated_at=? WHERE id=?",
+                db.execute("UPDATE jobs SET status='queued', attempt=attempt+1, diarization=?, result=NULL, error=NULL, updated_at=? WHERE id=?",
                            (self._json(settings), _now(), row['id']))
                 result.append(self._record(db, self._owned(db, row['owner'], row['id'])))
             return result
