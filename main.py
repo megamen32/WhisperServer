@@ -3128,6 +3128,34 @@ async def web_jobs_start(job_id: str, request: Request):
     return _job_view(job)
 
 
+
+@app.post('/web/jobs/{job_id}/retry')
+async def web_jobs_retry(job_id: str, request: Request):
+    _consume_webui_token(request)
+    owner = _job_owner(request)
+    async with _job_state_lock(job_id):
+        job = await asyncio.to_thread(_job_get, owner, job_id)
+        # A repeated click or HTTP retry must not create another active attempt.
+        if job['status'] in ('queued', 'processing'):
+            return _job_view(job)
+        if job['status'] not in ('done', 'error', 'cancelled'):
+            raise HTTPException(status_code=409, detail='Only terminal jobs can be retried')
+        settings = dict(job['diarization'])
+        if settings.get('source_removed') or await asyncio.to_thread(
+                _job_spool().offset, job_id) != settings['size']:
+            raise HTTPException(status_code=409, detail='Source audio is unavailable; upload the file again to reprocess')
+        if not _worker_accepts_requests():
+            raise HTTPException(status_code=503, detail='Model worker unavailable')
+        settings['diarize'] = settings.get('desired_diarize', settings['diarize'])
+        try:
+            job = await _web_job_store_operation(_job_store().retry, owner, job_id, settings)
+        except InvalidTransition as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        _launch_job(owner, job)
+    _notify_job(job_id)
+    return _job_view(job)
+
+
 @app.post('/web/jobs/{job_id}/cancel')
 async def web_jobs_cancel(job_id: str, request: Request):
     _consume_webui_token(request)

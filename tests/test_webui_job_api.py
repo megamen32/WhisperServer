@@ -992,3 +992,124 @@ async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, p
         current.cancel()
         await asyncio.gather(current, return_exceptions=True)
         executor.shutdown(wait=True)
+
+
+async def _quarantined_web_job(client):
+    """Keep the real upload, ownership and durable recovery state for retry checks."""
+    token = (await client.post('/web/session', headers={'origin': 'http://testserver'})).json()['token']
+
+    async def mutate(method, path, **kwargs):
+        nonlocal token
+        response = await client.request(method, path, headers={
+            'origin': 'http://testserver', 'x-whisper-csrf': token}, **kwargs)
+        token = response.headers.get('x-whisper-next-csrf', token)
+        return response
+
+    created = await mutate('POST', '/web/jobs', json={
+        'filename': 'retry.wav', 'size': 6, 'model': 'gigaam-v3', 'diarize': False})
+    assert created.status_code == 200
+    job = created.json()
+    uploaded = await mutate('PUT', f"/web/jobs/{job['id']}/upload?offset=0", content=b'abcdef')
+    assert uploaded.status_code == 200
+    owner = main._load_webui_session(client.cookies[main.WEBUI_SESSION_COOKIE])['owner_id']
+    store = main._job_store()
+    job = store.enqueue(owner, job['id'], job['attempt'])
+    for _ in range(3):
+        store.start(owner, job['id'], job['attempt'])
+        job = store.interrupt_for_retry(owner, job['id'], job['attempt'], failure={
+            'job_key': [job['id'], job['attempt']], 'phase': 'inference',
+            'unit': 'chunk:1', 'checkpoint': 1, 'reason': 'phase_timeout'})
+    assert job['status'] == 'error' and job['recovery']['quarantined']
+    return mutate, owner, job
+
+
+@pytest.mark.asyncio
+async def test_quarantined_job_manual_retry_keeps_source_and_checkpoints(monkeypatch):
+    # Real HTTP retry with only ASR substituted. The completed audio unit must
+    # remain reusable, and a duplicate click cannot create another attempt.
+    checkpoint = main.AudioCheckpoints(main.WEBUI_JOB_DIR / 'audio-checkpoints.sqlite')
+    signature = main.computation_key('audio-hash', 'gigaam-v3', 'revision', {'diarize': False})
+    saved = {'text': 'saved words', 'segments': [{'start': 0, 'end': 1, 'text': 'saved words'}]}
+    checkpoint.put(signature, 0, saved)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def transcribe(file, model, language, beam, temperature, stream, words, vad, diarize, **kwargs):
+        assert await file.read() == b'abcdef'
+        assert model == 'gigaam-v3' and diarize is False
+        calls.append(kwargs['web_job_key'])
+        assert checkpoint.get(signature, 0) == saved
+        entered.set()
+        await release.wait()
+        return saved
+
+    monkeypatch.setattr(main, '_transcribe_impl', transcribe)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
+        mutate, owner, stopped = await _quarantined_web_job(client)
+        response = await mutate('POST', f"/web/jobs/{stopped['id']}/retry")
+        assert response.status_code == 200
+        retry = response.json()
+        assert retry['status'] == 'queued' and retry['attempt'] == stopped['attempt'] + 1
+        assert retry['error'] is None and not retry.get('recovery')
+        assert retry['source_available'] and retry['diarization'] == stopped['diarization']
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            duplicate = await mutate('POST', f"/web/jobs/{stopped['id']}/retry")
+            assert duplicate.status_code == 200
+            assert duplicate.json()['attempt'] == retry['attempt']
+            assert len(calls) == 1
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 2)
+        done = (await client.get(f"/web/jobs/{stopped['id']}")).json()
+        assert done['status'] == 'done' and done['attempt'] == retry['attempt']
+        assert done['result']['text'] == saved['text']
+        assert checkpoint.get(signature, 0) == saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('blocker,expected', [
+    ('missing_source', 409), ('worker_unavailable', 503),
+    ('foreign_owner', 404), ('missing_csrf', 403),
+])
+async def test_manual_retry_rejection_keeps_quarantine(monkeypatch, blocker, expected):
+    # Rejected retries must preserve the attempt, reason and retained transcript.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
+        mutate, owner, stopped = await _quarantined_web_job(client)
+        job_id = stopped['id']
+        if blocker == 'missing_source':
+            main._job_spool().remove(job_id)
+        elif blocker == 'worker_unavailable':
+            monkeypatch.setattr(main.app.state, 'worker_accepting', False)
+        if blocker == 'foreign_owner':
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as foreign:
+                token = (await foreign.post('/web/session', headers={'origin': 'http://testserver'})).json()['token']
+                response = await foreign.post(f'/web/jobs/{job_id}/retry', headers={
+                    'origin': 'http://testserver', 'x-whisper-csrf': token})
+        elif blocker == 'missing_csrf':
+            response = await client.post(f'/web/jobs/{job_id}/retry', headers={'origin': 'http://testserver'})
+        else:
+            response = await mutate('POST', f'/web/jobs/{job_id}/retry')
+        assert response.status_code == expected
+        current = main._job_store().get(owner, job_id)
+        assert current['attempt'] == stopped['attempt']
+        assert current['status'] == 'error' and current['recovery']['quarantined']
+        assert current['error'] == stopped['error']
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_rejects_completed_job_without_source():
+    # Source deletion is a completed-job action; retained text must remain intact.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url='http://testserver') as client:
+        mutate, owner, stopped = await _quarantined_web_job(client)
+        store = main._job_store()
+        job = store.retry(owner, stopped['id'], stopped['diarization'])
+        store.start(owner, job['id'], job['attempt'])
+        store.complete(owner, job['id'], job['attempt'], {'text': 'retained text', 'segments': []})
+        assert (await mutate('DELETE', f"/web/jobs/{job['id']}/source")).status_code == 200
+        response = await mutate('POST', f"/web/jobs/{job['id']}/retry")
+        assert response.status_code == 409
+        current = store.get(owner, job['id'])
+        assert current['status'] == 'done' and current['attempt'] == job['attempt']
+        assert current['result']['text'] == 'retained text'
+        assert current['diarization']['source_removed'] is True

@@ -76,6 +76,15 @@ remain available. Queued neighbours can run after worker recovery. The UI error
 explains that a manual retry is available.
 
 An explicit retry or an explicit changed diarization setting clears quarantine.
+The Web UI action sends an owner-scoped, CSRF-protected
+`POST /web/jobs/{job_id}/retry`. It accepts a terminal job only while the complete
+source audio is retained and the worker can accept work. A successful response
+is the new queued attempt with the recovery counter and error cleared. Repeated
+requests while that attempt is queued or processing return the existing attempt.
+The upload `/start` route remains idempotent and does not release quarantine.
+Completed audio checkpoints retain their content/configuration keys across the
+manual retry, so unchanged work can be reused.
+
 Automatic settings reconciliation and application startup recovery do not revive
 a quarantined job. Cancellation wins over charging a failure and completes the
 existing cancellation cleanup. Deleting the terminal job cascades its recovery
