@@ -2790,11 +2790,11 @@ def _drain_deferred_web_jobs():
 async def _run_web_job(owner, job_id, attempt, generation=None):
     if generation is not None and generation != getattr(app.state, 'worker_generation', None):
         try:
-            interrupted = _job_store().interrupt_for_retry(owner, job_id, attempt)
+            interrupted = await _web_job_store_operation(_job_store().interrupt_for_retry, owner, job_id, attempt)
             if interrupted['status'] == 'queued':
                 _defer_or_launch_web_job(owner, interrupted)
             elif interrupted['status'] == 'cancelled':
-                _job_spool().remove(job_id)
+                await asyncio.to_thread(_job_spool().remove, job_id)
         except (InvalidTransition, JobNotFound):
             pass
         return

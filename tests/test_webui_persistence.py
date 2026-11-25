@@ -12,7 +12,7 @@ from webui_uploads import UploadSpool
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["queued", "quarantined", "cancelled", "shutdown_retry", "shutdown_failure"])
+@pytest.mark.parametrize("outcome", ["queued", "quarantined", "cancelled", "shutdown_retry", "shutdown_failure", "stale_generation"])
 async def test_worker_retry_survives_sqlite_writer_without_blocking_loop(tmp_path, monkeypatch, outcome):
     monkeypatch.setenv("WHISPER_JOB_CRASH_LIMIT", "1" if outcome == "quarantined" else "3")
     store = JobStore(tmp_path / "jobs.sqlite", timeout=.08)
@@ -62,7 +62,14 @@ async def test_worker_retry_survives_sqlite_writer_without_blocking_loop(tmp_pat
             loop_delays.append(time.monotonic() - started)
 
     heart = asyncio.create_task(heartbeat())
-    execution = asyncio.create_task(main._execute_web_job("owner", job_id, 1))
+    if outcome == "stale_generation":
+        thread = threading.Thread(target=hold_writer)
+        thread.start()
+        assert await asyncio.to_thread(held.wait, 1)
+        worker_returned.set()
+        execution = asyncio.create_task(main._run_web_job("owner", job_id, 1, generation=-1))
+    else:
+        execution = asyncio.create_task(main._execute_web_job("owner", job_id, 1))
     errors = []
     try:
         await asyncio.wait_for(worker_returned.wait(), 1)
@@ -96,6 +103,12 @@ async def test_worker_retry_survives_sqlite_writer_without_blocking_loop(tmp_pat
         assert "recovery" not in saved
         assert not main.app.state.deferred_web_jobs
         assert spool.offset(job_id) == 0
+        return
+    if outcome == "stale_generation":
+        assert saved["status"] == "queued" and saved["attempt"] == 2
+        assert "recovery" not in saved
+        assert ("owner", job_id, 2) in main.app.state.deferred_web_jobs
+        assert spool.offset(job_id) == 3
         return
     quarantined = outcome == "quarantined"
     assert saved["status"] == ("error" if quarantined else "queued")
