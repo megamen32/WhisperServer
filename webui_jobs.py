@@ -46,6 +46,13 @@ class JobStore:
         self.max_payload_bytes = max_payload_bytes
         self.max_summaries = max_summaries
         self.timeout = timeout
+        # WAL lets readers retain a consistent snapshot while the stream writer commits.
+        db = sqlite3.connect(self.path, timeout=self.timeout, isolation_level=None)
+        try:
+            if db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower() != 'wal':
+                raise RuntimeError('Job registry requires SQLite WAL mode')
+        finally:
+            db.close()
         with self._transaction() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL, status TEXT NOT NULL,
@@ -75,6 +82,8 @@ class JobStore:
         db.row_factory = sqlite3.Row
         try:
             db.execute('PRAGMA foreign_keys = ON')
+            db.execute('PRAGMA wal_autocheckpoint = 256')
+            db.execute('PRAGMA journal_size_limit = 16777216')
             db.execute('BEGIN' if readonly else 'BEGIN IMMEDIATE')
             yield db
             db.commit()
@@ -103,26 +112,40 @@ class JobStore:
         return row
 
     @staticmethod
-    def _record(db, row, *, include_result=True, include_segments=True, include_summaries=True):
+    def _raw_record(db, row, *, include_result=True, include_segments=True, include_summaries=True):
+        """Copy a consistent raw snapshot; decode JSON after releasing read locks."""
         data = dict(row)
+        stream_row = db.execute('SELECT * FROM job_streams WHERE job_id=? AND attempt=?',
+                                (row['id'], row['attempt'])).fetchone()
+        stream = dict(stream_row) if stream_row else None
+        segments = []
+        raw = data.get('result')
+        if include_result and include_segments and stream and raw and '"_streamed"' in raw:
+            segments = [item[0] for item in db.execute(
+                'SELECT value FROM job_segments WHERE job_id=? AND attempt=? AND epoch=? ORDER BY seq',
+                (row['id'], row['attempt'], stream['epoch']))]
+        summaries = ([(item['name'], item['value']) for item in db.execute(
+            'SELECT name,value FROM summaries WHERE job_id=? ORDER BY name', (row['id'],))]
+            if include_summaries else [])
+        return data, stream, segments, summaries, include_result, include_segments, include_summaries
+
+    @staticmethod
+    def _decode_record(snapshot):
+        data, stream, encoded_segments, summaries, include_result, include_segments, include_summaries = snapshot
         data['diarization'] = json.loads(data['diarization'])
         raw = data.pop('result', None)
-        stream = db.execute('SELECT * FROM job_streams WHERE job_id=? AND attempt=?',
-                            (row['id'], row['attempt'])).fetchone()
         epoch, count = (stream['epoch'], stream['segment_count']) if stream else (0, 0)
-        data['stream_cursor'] = f"{row['attempt']}:{epoch}:{count}"
+        data['stream_cursor'] = f"{data['attempt']}:{epoch}:{count}"
         data['segment_count'] = count
         if include_result:
             result = json.loads(raw) if raw is not None else None
             if not stream and isinstance(result, dict):
                 count = len(result.get('segments', []))
-                data['stream_cursor'] = f"{row['attempt']}:0:{count}"
+                data['stream_cursor'] = f"{data['attempt']}:0:{count}"
                 data['segment_count'] = count
             if isinstance(result, dict) and result.pop('_streamed', False):
                 if include_segments and stream:
-                    segments = [json.loads(item[0]) for item in db.execute(
-                        'SELECT value FROM job_segments WHERE job_id=? AND attempt=? AND epoch=? ORDER BY seq',
-                        (row['id'], row['attempt'], epoch))]
+                    segments = [json.loads(value) for value in encoded_segments]
                     result['segments'] = segments
                     result['text'] = ' '.join(segment.get('text', '') for segment in segments)
             elif isinstance(result, dict) and not include_segments:
@@ -130,9 +153,13 @@ class JobStore:
                           if key not in ('segments', 'text', 'speaker_text', 'words')}
             data['result'] = result
         if include_summaries:
-            data['summaries'] = {r['name']: json.loads(r['value']) for r in db.execute(
-                'SELECT name, value FROM summaries WHERE job_id = ? ORDER BY name', (row['id'],))}
+            data['summaries'] = {name: json.loads(value) for name, value in summaries}
         return data
+
+    @classmethod
+    def _record(cls, db, row, **options):
+        # Write transactions keep their existing atomic readback.
+        return cls._decode_record(cls._raw_record(db, row, **options))
 
     def _stream(self, db, row, *, reset=False):
         stream = db.execute('SELECT * FROM job_streams WHERE job_id=?', (row['id'],)).fetchone()
@@ -215,46 +242,48 @@ class JobStore:
         """Read one bounded page after a durable attempt/epoch/segment cursor."""
         requested = self.parse_cursor(cursor) if cursor is not None else None
         with self._transaction(readonly=True) as db:
-            # Existing stream metadata lets SQLite avoid loading a large final result.
             row = db.execute('''SELECT id,owner,status,attempt,diarization,
                 CASE WHEN EXISTS (SELECT 1 FROM job_streams s WHERE s.job_id=jobs.id AND s.attempt=jobs.attempt)
                      THEN NULL ELSE result END AS result,error,created_at,updated_at
                 FROM jobs WHERE id=? AND owner=?''', (job_id, owner)).fetchone()
             if row is None:
                 raise JobNotFound(job_id)
-            job = self._record(db, row, include_segments=False, include_summaries=False)
-            stream = db.execute('SELECT progress FROM job_streams WHERE job_id=? AND attempt=?',
-                                (job_id, row['attempt'])).fetchone()
-            if stream:
-                job['result'] = {'progress': json.loads(stream['progress'])}
-            attempt, epoch, count = self.parse_cursor(job['stream_cursor'])
+            snapshot = self._raw_record(db, row, include_segments=False, include_summaries=False)
+            stream = snapshot[1]
+            attempt = row['attempt']
+            epoch, count = (stream['epoch'], stream['segment_count']) if stream else (0, 0)
             reset = requested is None or requested[:2] != (attempt, epoch) or requested[2] > count
             after = 0 if reset else requested[2]
             rows = db.execute("""SELECT seq, value FROM job_segments
                                 WHERE job_id=? AND attempt=? AND epoch=? AND seq>?
                                 ORDER BY seq LIMIT ?""", (job_id, attempt, epoch, after, limit)).fetchall()
-            if not stream and row['result']:
-                legacy = json.loads(row['result'])
-                legacy_segments = legacy.get('segments', []) if isinstance(legacy, dict) else []
-                count = len(legacy_segments)
-                if requested is not None and requested[:2] == (attempt, epoch) and requested[2] <= count:
-                    after, reset = requested[2], False
-                segments = legacy_segments[after:after + limit]
-                end = after + len(segments)
-                job['segment_count'] = count
-                job['stream_cursor'] = f'{attempt}:{epoch}:{count}'
-            else:
-                segments = [json.loads(item['value']) for item in rows]
-                end = rows[-1]['seq'] if rows else after
-            return {'type': 'delta', 'job': job, 'segments': segments, 'reset': reset,
-                    'cursor': f'{attempt}:{epoch}:{end}', 'has_more': end < count}
+            legacy_raw = row['result'] if not stream else None
+        job = self._decode_record(snapshot)
+        if stream:
+            job['result'] = {'progress': json.loads(stream['progress'])}
+        if legacy_raw:
+            legacy = json.loads(legacy_raw)
+            legacy_segments = legacy.get('segments', []) if isinstance(legacy, dict) else []
+            count = len(legacy_segments)
+            if requested is not None and requested[:2] == (attempt, epoch) and requested[2] <= count:
+                after, reset = requested[2], False
+            segments = legacy_segments[after:after + limit]
+            end = after + len(segments)
+            job['segment_count'] = count
+            job['stream_cursor'] = f'{attempt}:{epoch}:{count}'
+        else:
+            segments = [json.loads(item['value']) for item in rows]
+            end = rows[-1]['seq'] if rows else after
+        return {'type': 'delta', 'job': job, 'segments': segments, 'reset': reset,
+                'cursor': f'{attempt}:{epoch}:{end}', 'has_more': end < count}
 
     def list_metadata(self, owner):
         self._identity(owner, 'owner')
         with self._transaction(readonly=True) as db:
             rows = db.execute("""SELECT id,owner,status,attempt,diarization,error,created_at,updated_at
                                  FROM jobs WHERE owner=? ORDER BY created_at,id""", (owner,)).fetchall()
-            return [self._record(db, row, include_result=False, include_summaries=False) for row in rows]
+            snapshots = [self._raw_record(db, row, include_result=False, include_summaries=False) for row in rows]
+        return [self._decode_record(snapshot) for snapshot in snapshots]
 
     def create(self, owner, diarization):
         self._identity(owner, 'owner')
@@ -270,13 +299,15 @@ class JobStore:
 
     def get(self, owner, job_id):
         with self._transaction(readonly=True) as db:
-            return self._record(db, self._owned(db, owner, job_id))
+            snapshot = self._raw_record(db, self._owned(db, owner, job_id))
+        return self._decode_record(snapshot)
 
     def list(self, owner):
         self._identity(owner, 'owner')
         with self._transaction(readonly=True) as db:
             rows = db.execute('SELECT * FROM jobs WHERE owner = ? ORDER BY created_at, id', (owner,)).fetchall()
-            return [self._record(db, row) for row in rows]
+            snapshots = [self._raw_record(db, row) for row in rows]
+        return [self._decode_record(snapshot) for snapshot in snapshots]
 
     def _transition(self, owner, job_id, attempt, allowed, status, *, result=None, error=None):
         with self._transaction() as db:
