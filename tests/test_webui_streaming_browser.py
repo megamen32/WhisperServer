@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -177,13 +176,11 @@ def test_webui_streams_partial_jobs_and_upload_bytes(tmp_path):
     template = template.replace("</body>", "<script>" + scenario + "</script></body>")
     page = tmp_path / "streaming.html"
     page.write_text(template)
-    result = subprocess.run([chrome, "--headless=new", "--no-sandbox", "--disable-gpu",
-        "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check",
-        f"--user-data-dir={tmp_path / 'chrome'}", "--virtual-time-budget=3000", "--dump-dom", page.as_uri()],
-        capture_output=True, text=True, timeout=25)
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for Chrome CDP")
+    result = subprocess.run([node, str(Path(__file__).with_name("browser_document.mjs")),
+        chrome, str(page), str(tmp_path / "chrome")], capture_output=True, text=True, timeout=35)
     assert result.returncode == 0, result.stderr[-2000:]
-    match = re.search(r'data-test-result="([^"]*)"', result.stdout)
-    assert match, "browser scenario did not finish: " + result.stdout[result.stdout.find("<body"):result.stdout.find("<body")+500]
-    import html
-    failures = json.loads(html.unescape(match.group(1)))
+    failures = json.loads(result.stdout.strip())
     assert not failures, failures

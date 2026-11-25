@@ -423,7 +423,7 @@
         .summary-text th, .summary-text td { padding: 6px 10px; border: 1px solid #354458; }
         .summary-text blockquote { margin-left: 0; padding-left: 1em; border-left: 3px solid #526781; color: #b9c9dc; }
         .summary-status { margin-top: 12px; color: #a8bad0; font-size: .86rem; }
-        .document { padding: 0 clamp(2px, 3vw, 32px) 30px; max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
+        .document { padding: 0 clamp(2px, 3vw, 32px) 30px; max-height: min(74vh, 940px); overflow-y: auto; overscroll-behavior: contain; scroll-behavior: auto; }
         .document-heading { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 30px 0 17px; background: #121924; border-bottom: 1px solid #25303e; }
         .document-heading h2 { margin: 0; font-size: 1.2rem; font-weight: 650; }
         .document-meta { color: #8190a3; font-size: .82rem; }
@@ -433,6 +433,8 @@
         .transcript-container.show-times .segment { grid-template-columns: 92px minmax(0, 1fr); column-gap: 14px; }
         .segment.current-match { background: #293244; box-shadow: inset 3px 0 #77c9ff; }
         .segment.filtered-out { display: none; }
+        .transcript-spacer { flex: 0 0 auto; pointer-events: none; overflow-anchor: none; }
+        .transcript-container { overflow-anchor: none; }
         .timecode { display: none; color: #7f95ad; font-size: .78rem; font-variant-numeric: tabular-nums; padding-top: 3px; white-space: nowrap; }
         .show-times .timecode { display: block; }
         .speaker { display: inline; color: #8ccfff; font-size: .86em; font-weight: 700; }
@@ -843,58 +845,80 @@
             }
         }
 
+
+        const transcriptScroller = transcriptContainer.closest('.document');
+        const TRANSCRIPT_DOM_LIMIT = 160;
+        let transcriptRows = [];
+        let transcriptIndices = [];
+        let transcriptNodes = new Map();
+        let transcriptOffsets = [0];
+        let transcriptLayoutDirty = true;
+        let transcriptQuery = '';
+        let transcriptSearchTimer = null;
+        let transcriptFrame = null;
+        let transcriptWidth = 0;
+        const transcriptBefore = document.createElement('div');
+        const transcriptAfter = document.createElement('div');
+        for (const spacer of [transcriptBefore, transcriptAfter]) {
+            spacer.className = 'transcript-spacer';
+            spacer.setAttribute('aria-hidden', 'true');
+        }
+
+        function resetTranscriptWindow() {
+            transcriptRows = []; transcriptIndices = []; transcriptNodes.clear();
+            transcriptOffsets = [0]; transcriptLayoutDirty = true;
+            transcriptQuery = transcriptSearch.value.trim();
+            transcriptContainer.replaceChildren();
+            transcriptScroller.scrollTop = 0;
+        }
+
+        function speakerLabel(segment) {
+            if (!Object.hasOwn(segment, 'speaker')) return '';
+            return segment.speaker
+                ? `Спикер ${Number(segment.speaker.split('_').pop()) + 1}: `
+                : 'Неизвестный спикер: ';
+        }
+
         function appendSegment(segment) {
-            if (!segment) {
-                return;
+            if (!segment) return;
+            const index = transcriptRows.length;
+            transcriptRows.push({segment, folded: (segment.text || '').toLocaleLowerCase(), height: 0});
+            if (!transcriptQuery || transcriptRows[index].folded.includes(transcriptQuery.toLocaleLowerCase())) {
+                transcriptIndices.push(index);
+                if (!transcriptLayoutDirty) transcriptOffsets.push(transcriptOffsets.at(-1) + estimateTranscriptHeight(transcriptRows[index]));
+                if (transcriptQuery) matchingSegments.push(index);
             }
-            segmentsProcessed += 1;
+            segmentsProcessed = transcriptRows.length;
+        }
+
+        function createSegmentNode(index) {
+            const segment = transcriptRows[index].segment;
             const wrapper = document.createElement('div');
             wrapper.className = 'segment';
+            wrapper.dataset.segmentIndex = index;
             wrapper.dataset.searchText = segment.text || '';
             const timestamp = document.createElement('span');
             timestamp.className = 'timecode';
             timestamp.textContent = `${formatTime(segment.start)} → ${formatTime(segment.end)}`;
             const text = document.createElement('div');
             text.className = 'segment-text';
-            if (segment.speaker || Object.hasOwn(segment, 'speaker')) {
+            const label = speakerLabel(segment);
+            if (label) {
                 const speaker = document.createElement('span');
-                speaker.className = 'speaker';
-                speaker.textContent = segment.speaker
-                    ? `Спикер ${Number(segment.speaker.split('_').pop()) + 1}: `
-                    : 'Неизвестный спикер: ';
+                speaker.className = 'speaker'; speaker.textContent = label;
                 text.appendChild(speaker);
             }
             const body = document.createElement('span');
-            body.className = 'body-copy';
-            body.textContent = segment.text || '';
-            text.appendChild(body);
-            wrapper.appendChild(timestamp);
-            wrapper.appendChild(text);
-            transcriptContainer.appendChild(wrapper);
-            // The copy button stays reachable from the first segment on.
-            showCopyButton();
-            if (transcriptSearch.value.trim()) {
-                const query = transcriptSearch.value.trim();
-                if ((segment.text || '').toLocaleLowerCase().includes(query.toLocaleLowerCase())) {
-                    matchingSegments.push(wrapper);
-                    renderHighlightedBody(wrapper, query);
-                    updateMatchCount();
-                } else {
-                    wrapper.classList.add('filtered-out');
-                }
-            }
-            documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
-            updateMatchCount();
+            body.className = 'body-copy'; text.appendChild(body);
+            wrapper.append(timestamp, text);
+            return wrapper;
         }
 
         function renderHighlightedBody(segment, query) {
             const body = segment.querySelector('.body-copy');
             const original = segment.dataset.searchText || '';
             body.replaceChildren();
-            if (!query) {
-                body.textContent = original;
-                return;
-            }
+            if (!query) { body.textContent = original; return; }
             const folded = original.toLocaleLowerCase();
             const foldedQuery = query.toLocaleLowerCase();
             let cursor = 0;
@@ -903,46 +927,169 @@
                 body.append(document.createTextNode(original.slice(cursor, found)));
                 const mark = document.createElement('mark');
                 mark.textContent = original.slice(found, found + query.length);
-                body.append(mark);
-                cursor = found + query.length;
+                body.append(mark); cursor = found + query.length;
                 found = folded.indexOf(foldedQuery, cursor);
             }
             body.append(document.createTextNode(original.slice(cursor)));
         }
 
+        function estimateTranscriptHeight(row) {
+            const width = Math.max(120, transcriptScroller.clientWidth - (showTimecodes ? 142 : 36));
+            const charsPerLine = Math.max(12, Math.floor(width / 8.5));
+            return row.height || 22 + Math.max(1, Math.ceil(((row.segment.text || '').length + 18) / charsPerLine)) * 28;
+        }
+
+        function buildTranscriptOffsets() {
+            if (!transcriptLayoutDirty) return;
+            transcriptOffsets = [0];
+            for (const index of transcriptIndices) {
+                transcriptOffsets.push(transcriptOffsets.at(-1) + estimateTranscriptHeight(transcriptRows[index]));
+            }
+            transcriptLayoutDirty = false;
+        }
+
+        function transcriptPosition(top) {
+            let low = 0, high = transcriptIndices.length;
+            while (low < high) {
+                const middle = (low + high) >> 1;
+                if (transcriptOffsets[middle + 1] <= top) low = middle + 1;
+                else high = middle;
+            }
+            return Math.min(low, Math.max(0, transcriptIndices.length - 1));
+        }
+
+        function transcriptOrigin() {
+            return transcriptContainer.getBoundingClientRect().top -
+                transcriptScroller.getBoundingClientRect().top + transcriptScroller.scrollTop;
+        }
+
+        function renderTranscriptWindow(forceIndex = null) {
+            const virtual = transcriptRows.length > TRANSCRIPT_DOM_LIMIT;
+            const current = matchingSegments[activeMatchIndex];
+            let start = 0, end = transcriptRows.length, localTop = 0, anchor = 0, origin = 0;
+            let indices;
+            if (virtual) {
+                buildTranscriptOffsets();
+                origin = transcriptOrigin();
+                localTop = Math.max(0, transcriptScroller.scrollTop - origin);
+                anchor = transcriptPosition(localTop);
+                start = Math.max(0, anchor - 8);
+                end = Math.min(transcriptIndices.length,
+                    transcriptPosition(localTop + transcriptScroller.clientHeight) + 10);
+                if (forceIndex !== null) {
+                    const position = transcriptIndices.indexOf(forceIndex);
+                    if (position >= 0 && (position < start || position >= end)) {
+                        start = Math.max(0, position - 8);
+                        end = Math.min(transcriptIndices.length, position + 10);
+                    }
+                }
+                end = Math.min(end, start + TRANSCRIPT_DOM_LIMIT);
+                indices = transcriptIndices.slice(start, end);
+            } else indices = transcriptRows.map((_, index) => index);
+
+            const keep = new Set(indices);
+            for (const [index, node] of transcriptNodes) {
+                if (!keep.has(index)) { node.remove(); transcriptNodes.delete(index); }
+            }
+            const wanted = [];
+            if (virtual) wanted.push(transcriptBefore);
+            for (const index of indices) {
+                let node = transcriptNodes.get(index);
+                if (!node) { node = createSegmentNode(index); transcriptNodes.set(index, node); }
+                const matches = !transcriptQuery || transcriptRows[index].folded.includes(transcriptQuery.toLocaleLowerCase());
+                node.classList.toggle('filtered-out', !matches);
+                node.classList.toggle('current-match', index === current);
+                if (node.dataset.query !== transcriptQuery) {
+                    renderHighlightedBody(node, transcriptQuery); node.dataset.query = transcriptQuery;
+                }
+                wanted.push(node);
+            }
+            if (virtual) wanted.push(transcriptAfter);
+            let cursor = transcriptContainer.firstChild;
+            for (const node of wanted) {
+                if (node === cursor) cursor = cursor.nextSibling;
+                else transcriptContainer.insertBefore(node, cursor);
+            }
+            while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+
+            if (virtual) {
+                const beforeAnchor = transcriptOffsets[anchor] || 0;
+                let measured = false;
+                for (const index of indices) {
+                    const height = transcriptNodes.get(index).getBoundingClientRect().height;
+                    if (height && Math.abs(transcriptRows[index].height - height) > .5) {
+                        transcriptRows[index].height = height; measured = true;
+                    }
+                }
+                if (measured) { transcriptLayoutDirty = true; buildTranscriptOffsets(); }
+                transcriptBefore.style.height = `${transcriptOffsets[start] || 0}px`;
+                transcriptAfter.style.height = `${Math.max(0, transcriptOffsets.at(-1) - (transcriptOffsets[end] || 0))}px`;
+                const adjustment = (transcriptOffsets[anchor] || 0) - beforeAnchor;
+                if (Math.abs(adjustment) > .5 && localTop > 0) transcriptScroller.scrollTop += adjustment;
+            }
+            updateMatchCount();
+        }
+
+        function scheduleTranscriptWindow() {
+            if (transcriptFrame !== null) return;
+            transcriptFrame = requestAnimationFrame(() => {
+                transcriptFrame = null; renderTranscriptWindow();
+            });
+        }
+
+        function invalidateTranscriptLayout() {
+            for (const row of transcriptRows) row.height = 0;
+            transcriptLayoutDirty = true;
+            renderTranscriptWindow();
+        }
+
+        transcriptScroller.addEventListener('scroll', scheduleTranscriptWindow, {passive: true});
+        if (typeof ResizeObserver !== 'undefined') new ResizeObserver(entries => {
+            const width = entries[0]?.contentRect.width || 0;
+            if (Math.abs(width - transcriptWidth) < 1) return;
+            transcriptWidth = width; invalidateTranscriptLayout();
+        }).observe(transcriptScroller);
+
         function updateMatchCount() {
-            const query = transcriptSearch.value.trim();
-            if (!query) {
-                // Without a query the counter shows the size of the transcript.
+            if (!transcriptQuery) {
                 const total = segmentsProcessed;
                 matchCount.textContent = `${total.toLocaleString('ru-RU')} ${total === 1 ? 'фрагмент' : 'фрагментов'}`;
-                return;
+            } else {
+                const count = matchingSegments.length;
+                matchCount.textContent = `${count.toLocaleString('ru-RU')} ${count === 1 ? 'совпадение' : 'совпадений'}`;
             }
-            const count = matchingSegments.length;
-            matchCount.textContent = `${count.toLocaleString('ru-RU')} ${count === 1 ? 'совпадение' : 'совпадений'}`;
-            matchingSegments.forEach((segment, index) => segment.classList.toggle('current-match', index === activeMatchIndex));
         }
 
         function refreshSearch() {
-            const query = transcriptSearch.value.trim();
-            const segments = Array.from(transcriptContainer.querySelectorAll('.segment'));
+            clearTimeout(transcriptSearchTimer); transcriptSearchTimer = null;
+            transcriptQuery = transcriptSearch.value.trim();
+            const folded = transcriptQuery.toLocaleLowerCase();
             matchingSegments = [];
-            activeMatchIndex = -1;
-            for (const segment of segments) {
-                const matches = query && (segment.dataset.searchText || '').toLocaleLowerCase().includes(query.toLocaleLowerCase());
-                segment.classList.toggle('filtered-out', Boolean(query) && !matches);
-                renderHighlightedBody(segment, query);
-                if (matches) matchingSegments.push(segment);
+            transcriptIndices = [];
+            for (let index = 0; index < transcriptRows.length; index++) {
+                if (!folded || transcriptRows[index].folded.includes(folded)) {
+                    transcriptIndices.push(index);
+                    if (folded) matchingSegments.push(index);
+                }
             }
-            if (matchingSegments.length) activeMatchIndex = 0;
-            updateMatchCount();
+            activeMatchIndex = matchingSegments.length ? 0 : -1;
+            transcriptLayoutDirty = true; transcriptScroller.scrollTop = 0;
+            renderTranscriptWindow();
         }
 
         function moveToMatch(direction) {
+            if (transcriptSearchTimer !== null) refreshSearch();
             if (!matchingSegments.length) return;
+            transcriptNodes.get(matchingSegments[activeMatchIndex])?.classList.remove('current-match');
             activeMatchIndex = (activeMatchIndex + direction + matchingSegments.length) % matchingSegments.length;
-            updateMatchCount();
-            matchingSegments[activeMatchIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const index = matchingSegments[activeMatchIndex];
+            if (transcriptRows.length > TRANSCRIPT_DOM_LIMIT) {
+                buildTranscriptOffsets();
+                transcriptScroller.scrollTop = transcriptOrigin() + transcriptOffsets[activeMatchIndex] -
+                    transcriptScroller.clientHeight / 2;
+            }
+            renderTranscriptWindow(index);
+            transcriptNodes.get(index)?.scrollIntoView({behavior: 'auto', block: 'center'});
         }
 
         function cleanupProcessing({ finalMessage, success = true } = {}) {
@@ -1248,7 +1395,7 @@
             progressBar.classList.remove('indeterminate');
             progressBar.parentElement.removeAttribute('aria-valuenow');
             segmentsProcessed = 0; matchingSegments = []; activeMatchIndex = -1;
-            transcriptContainer.replaceChildren(); finalOutput.textContent = ''; documentMeta.textContent = 'Выберите задание или загрузите аудио';
+            resetTranscriptWindow(); finalOutput.textContent = ''; documentMeta.textContent = 'Выберите задание или загрузите аудио';
             transcriptId = ''; summarizeButton.disabled = true; hideCopyButton();
             summaryPanel.hidden = true; summaryText.textContent = ''; rawSummary = ''; summarySearch.value = ''; refreshSummarySearch();
             summaryMeta.textContent = ''; summaryStatus.textContent = '';
@@ -1366,7 +1513,9 @@
                 cancel_requested: 'Отмена запрошена', cancelled: 'Отменено', canceled: 'Отменено',
                 done: 'Готово', completed: 'Готово', error: 'Ошибка обработки', failed: 'Ошибка обработки' };
             const phases = { preparing: 'Подготавливаем аудио', diarizing: diarizationLabel(progress),
-                loading: 'Загружаем модель', transcribing: 'Распознаём речь' };
+                loading: 'Загружаем модель', preparing_cpu: 'Подготавливаем модель',
+                waiting_gpu: 'Ожидаем ресурсы для модели', loading_gpu: 'Загружаем модель',
+                preliminary: 'Распознаём начало записи', transcribing: 'Распознаём речь' };
             const label = status === 'processing' ? phases[progress.phase] || labels.processing : labels[status];
             setStatus(`${label || `Статус сервера: ${status}`} · попытка ${job.attempt ?? '?'}`);
             errorOutput.textContent = job.error ? (typeof job.error === 'string' ? job.error : JSON.stringify(job.error)) : '';
@@ -1399,7 +1548,7 @@
                 const segments = Array.isArray(result.segments) ? result.segments : [];
                 const keys = segments.map(segment => JSON.stringify([segment.start, segment.end, segment.text, segment.speaker]));
                 if (keys.length < renderedSegmentKeys.length || renderedSegmentKeys.some((key, index) => keys[index] !== key)) {
-                    transcriptContainer.replaceChildren(); segmentsProcessed = 0;
+                    resetTranscriptWindow(); segmentsProcessed = 0;
                     matchingSegments = []; activeMatchIndex = -1; renderedSegmentKeys = [];
                 }
                 for (let index = renderedSegmentKeys.length; index < segments.length; index++) appendSegment(segments[index]);
@@ -1407,7 +1556,8 @@
                 liveSegments = segments.slice();
                 streamCursor = job.stream_cursor || `${job.attempt}:0:${segments.length}`;
             }
-            // The visible segment nodes are the live transcript. Build the full plain text once at completion.
+            renderTranscriptWindow();
+            // Copying and search use all segment data, independently of the visible window.
             if (done) finalOutput.textContent = result.speaker_text || result.text || liveSegments.map(segment => segment.text || '').join(' ');
             else if (!delta) finalOutput.textContent = result.speaker_text || result.text || '';
             transcriptId = done ? result.transcript_id || job.transcript_id || '' : '';
@@ -1415,7 +1565,8 @@
             if (segmentsProcessed || finalOutput.textContent) showCopyButton();
             else hideCopyButton();
             toggleTimes.hidden = !segmentsProcessed;
-            documentMeta.textContent = `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${job.filename || 'аудиофайл'}`;
+            documentMeta.textContent = (progress.provisional ? 'Предварительный текст · ' : '') +
+                `${segmentsProcessed.toLocaleString('ru-RU')} фрагм. · ${job.filename || 'аудиофайл'}`;
             if (status !== 'uploading') renderJobProgress(job, status);
             if (done && !segmentsProcessed && !finalOutput.textContent) setStatus('Задание готово, но сервер не вернул текст');
             if (!active) { clearTimeout(pollTimer); closeJobEvents(); }
@@ -1749,15 +1900,19 @@
             showTimecodes = !showTimecodes;
             transcriptContainer.classList.toggle('show-times', showTimecodes);
             toggleTimes.textContent = showTimecodes ? 'Скрыть таймкоды' : 'Показать таймкоды';
+            invalidateTranscriptLayout();
         });
 
-        transcriptSearch.addEventListener('input', refreshSearch);
+        transcriptSearch.addEventListener('input', () => {
+            clearTimeout(transcriptSearchTimer);
+            transcriptSearchTimer = setTimeout(refreshSearch, 100);
+        });
         previousMatchButton.addEventListener('click', () => moveToMatch(-1));
         nextMatchButton.addEventListener('click', () => moveToMatch(1));
 
         copyResultButton.addEventListener('click', async () => {
-            const transcriptText = Array.from(transcriptContainer.querySelectorAll('.segment'))
-                .map((segment) => `${segment.querySelector('.speaker')?.textContent || ''}${segment.dataset.searchText || ''}`)
+            const transcriptText = liveSegments
+                .map(segment => speakerLabel(segment) + (segment.text || ''))
                 .join('\n');
             const text = transcriptText || finalOutput.textContent.trim();
             await copyTextToClipboard(text, 'Результат скопирован');
