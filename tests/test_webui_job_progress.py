@@ -80,13 +80,13 @@ async def test_job_exposes_segments_before_worker_finishes(monkeypatch):
             stream = await main.web_jobs_events(job_id, request)
             assert stream.headers["x-accel-buffering"] == "no"
             event = await anext(stream.body_iterator)
-            assert json.loads(event.split("data: ", 1)[1])["result"]["segments"] == [segment]
+            assert json.loads(event.split("data: ", 1)[1])["segments"] == [segment]
             responses.put({"request_id": worker_request["request_id"], "result": {
                 "text": "first fragment final", "segments": [segment]}, "final": True})
             worker_request = None
             await asyncio.wait_for(asyncio.gather(*list(main._job_tasks)), 2)
             event = await asyncio.wait_for(anext(stream.body_iterator), 2)
-            done = json.loads(event.split("data: ", 1)[1])
+            done = json.loads(event.split("data: ", 1)[1])["job"]
             assert done["status"] == "done" and done["progress"]["percent"] == 100
             with pytest.raises(StopAsyncIteration):
                 await anext(stream.body_iterator)

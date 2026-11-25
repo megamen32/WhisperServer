@@ -30,6 +30,7 @@ def test_webui_streams_partial_jobs_and_upload_bytes(tmp_path):
         let value = {};
         if (url === '/models') value = {models:['gigaam-v3']};
         else if (url === '/web/byok/presets') value = [];
+        else if (url === '/web/session') value = {token:'control-test-token'};
         else if (url === '/web/jobs') value = {jobs:[]};
         else if (url.startsWith('/web/jobs/')) value = testJob;
         return new Response(JSON.stringify(value), {status:200,headers:{'Content-Type':'application/json'}});
@@ -45,7 +46,7 @@ def test_webui_streams_partial_jobs_and_upload_bytes(tmp_path):
         open(method,url) { this.url=url; }
         setRequestHeader() {}
         getResponseHeader(name) { return name === 'X-Whisper-Next-CSRF' ? 'rotated-test-csrf' : null; }
-        send() { this.upload.onprogress?.({loaded:100,total:200,lengthComputable:true});
+        send() { if(window.holdUpload) { window.heldUpload=this; return; } this.upload.onprogress?.({loaded:100,total:200,lengthComputable:true});
                  this.upload.onprogress?.({loaded:200,total:200,lengthComputable:true});
                  this.onload?.(); }
     };
@@ -90,6 +91,19 @@ def test_webui_streams_partial_jobs_and_upload_bytes(tmp_path):
           onUploadProgress:(event)=>testUploadSamples.push(event.loaded)});
         check(testUploadSamples.join(',') === '100,200', 'upload bytes are only shown after each chunk');
         check(webuiCsrfToken === 'rotated-test-csrf', 'upload lost the rotated CSRF token');
+        window.holdUpload=true;
+        const held=api('/web/jobs/stream-test/upload?offset=0',{method:'PUT',
+          body:new Blob(['slow']),onUploadProgress:()=>{}});
+        await new Promise(resolve=>setTimeout(resolve,20));
+        let readDone=false,controlDone=false;
+        const independentRead=api('/web/jobs').then(()=>readDone=true);
+        const independentControl=api('/web/jobs/stream-test/cancel',{method:'POST',control:true}).then(()=>controlDone=true);
+        await new Promise(resolve=>setTimeout(resolve,50));
+        check(readDone,'safe reads wait behind a stalled upload');
+        check(controlDone,'cancellation waits behind a stalled upload');
+        window.holdUpload=false;window.heldUpload?.onload();
+        await Promise.all([held,independentRead,independentControl]);
+
         testJob={...testJob,id:'reconnect-test',status:'processing',attempt:1,
           result:{segments:[first],text:first.text},
           progress:{phase:'transcribing',percent:33,processed_seconds:20,total_seconds:60,segments:1}};
@@ -118,6 +132,42 @@ def test_webui_streams_partial_jobs_and_upload_bytes(tmp_path):
         retrySource?.onmessage?.({data:JSON.stringify({...previousJob,id:'other-test'})});
         check(selectedJob.attempt === 2 && document.querySelectorAll('#transcript .segment').length === 0,
           'late attempt restored stale text');
+
+        testJob={...testJob,id:'delta-test',attempt:1,status:'processing',stream_cursor:'1:0:0',
+          result:{segments:[],text:''},progress:{phase:'diarizing',step:'embeddings',completed:2,total:5,percent:null}};
+        await selectJob('delta-test');
+        check(statusBar.textContent.includes('2 / 5'), 'diarization work units are not visible');
+        check(progressBar.classList.contains('indeterminate'), 'diarization work units became an audio percent');
+        let deltaSource=testEvents.at(-1);
+        const packet=(segments,cursor,reset=false,has_more=false)=>({
+          type:'delta',job:{...testJob,result:{progress:testJob.progress},summaries:undefined},segments,cursor,reset,has_more});
+        testJob={...testJob,progress:{phase:'transcribing',percent:33,processed_seconds:20,total_seconds:60}};
+        deltaSource.emit(packet([first],'1:0:1'));
+        const deltaFirst=transcriptContainer.firstElementChild;
+        deltaSource.emit(packet([first],'1:0:1'));
+        deltaSource.emit(packet([second],'1:0:2'));
+        check(segmentsProcessed===2 && transcriptContainer.firstElementChild===deltaFirst,
+          'delta replay duplicated or replaced committed nodes');
+        deltaSource.emit(packet([first],'1:1:1',true));
+        check(deltaSource.closed && segmentsProcessed===1, 'epoch reset retained obsolete segments');
+        deltaSource=testEvents.at(-1);
+        check(deltaSource.url.includes('cursor=1%3A1%3A1'), 'new stream did not resume from rendered cursor');
+        deltaSource.emit(packet([second],'1:0:2'));
+        check(segmentsProcessed===1, 'stale epoch was appended after reset');
+        deltaSource.emit(packet([second],'1:1:2'));
+        const third={start:40,end:60,text:'Третий фрагмент',speaker:'SPEAKER_01'};
+        testJob={...testJob,status:'done',stream_cursor:'1:1:3',
+          result:{segments:[first,second,third],text:'Первый фрагмент Второй фрагмент Третий фрагмент',
+            speaker_text:'SPEAKER_00: Первый фрагмент Второй фрагмент\nSPEAKER_01: Третий фрагмент',
+            transcript_id:'delta-test'},transcript_id:'delta-test',
+          summaries:{latest:{summary:'Сохранённая выжимка',attempt:1}}};
+        deltaSource.emit(packet([third],'1:1:3',false,true));
+        check(!deltaSource.closed && summarizeButton.disabled, 'terminal replay closed before all pages arrived');
+        deltaSource.emit(packet([],'1:1:3'));
+        await new Promise(resolve=>setTimeout(resolve,30));
+        check(segmentsProcessed===3 && deltaSource.closed && !summarizeButton.disabled,
+          'final delta did not reconcile all segments');
+        check(finalOutput.textContent.includes('SPEAKER_01'), 'final transcript lost speaker labels');
         await selectJob('');
       } catch(error) { failures.push(error.stack || error.message); }
       document.body.dataset.testResult=JSON.stringify(failures);

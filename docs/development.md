@@ -74,10 +74,11 @@ docs/                           maintained documentation
 ## Streaming jobs and production deployment
 
 The Web UI subscribes to `GET /web/jobs/{id}/events` while a job is queued or
-processing. The SSE stream carries the same session-owned snapshot as
-`GET /web/jobs/{id}`, including partial `result.segments` and `progress`.
-The browser reconnects after a connection loss and uses ordinary GET requests
-as a fallback. Upload byte progress is independent of transcription progress.
+processing. The SSE stream carries bounded, durable segment deltas with a resume cursor.
+The browser reconnects after a connection loss and uses the full
+`GET /web/jobs/{id}` snapshot as a fallback. History requests carry metadata only.
+See [the job events contract](webui-job-events.md) for replay, upload durability
+and retention behavior. Upload byte progress is independent of transcription progress.
 A completed job replaces the partial transcript with its final result.
 
 Production on server 88 runs the canonical checkout

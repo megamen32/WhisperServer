@@ -1078,6 +1078,9 @@
         let eventGeneration = -1;
         let renderedAttempt = '';
         let renderedSegmentKeys = [];
+        let liveSegments = [];
+        let streamCursor = '';
+        let lastStreamMessageAt = 0;
         let needsFile = false;
         let cancelling = false;
         let uploadingId = '';
@@ -1085,26 +1088,28 @@
         let apiQueue = Promise.resolve();
         let initializationPromise;
 
-        // Serialize requests so rotated one-use tokens are used in response order.
+        // Ordinary mutations share one token lane. Reads and control requests are independent.
         function api(path, options = {}) {
+            const readOnly = !options.method || options.method === 'GET';
+            const control = options.control === true;
             const run = async () => {
+                let controlToken = '';
                 const refresh = async () => {
-                    const page = await fetch('/', { credentials: 'same-origin', cache: 'no-store' });
-                    if (!page.ok) throw new Error('Не удалось обновить токен текущей сессии');
-                    const html = await page.text();
-                    const match = html.match(/let webuiCsrfToken\s*=\s*("(?:[^"\\]|\\.)*")\s*;/);
-                    if (!match) throw new Error('Сервер не вернул токен текущей сессии');
-                    webuiCsrfToken = JSON.parse(match[1]);
+                    const response = await fetch('/web/session', {
+                        method: 'POST', credentials: 'same-origin', cache: 'no-store'
+                    });
+                    const payload = await response.json().catch(() => ({}));
+                    if (!response.ok || !payload.token) throw new Error('Не удалось обновить токен текущей сессии');
+                    if (control) controlToken = payload.token;
+                    else webuiCsrfToken = payload.token;
                 };
-                if (options.refreshToken) await refresh();
-                const { refreshToken, retryCsrf, onUploadProgress, ...requestOptions } = options;
+                if (control || options.refreshToken) await refresh();
+                const { refreshToken, retryCsrf, onUploadProgress, control: controlOption, ...requestOptions } = options;
                 const send = async () => {
                     const headers = new Headers(requestOptions.headers || {});
-                    if (requestOptions.method && requestOptions.method !== 'GET') headers.set('X-Whisper-CSRF', webuiCsrfToken);
+                    if (!readOnly) headers.set('X-Whisper-CSRF', control ? controlToken : webuiCsrfToken);
                     let response;
                     if (onUploadProgress) {
-                        // Keep upload requests in the same token queue as all mutations.
-                        // Browser byte progress is independent of the resumable chunk offset.
                         response = await new Promise((resolve, reject) => {
                             const request = new XMLHttpRequest();
                             activeXhr = request;
@@ -1130,10 +1135,12 @@
                     } else {
                         response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...requestOptions, headers });
                     }
-                    const token = response.headers.get('X-Whisper-Next-CSRF');
-                    if (token) webuiCsrfToken = token;
                     const payload = await response.json().catch(() => ({}));
-                    if (payload.csrf_token || payload.token) webuiCsrfToken = payload.csrf_token || payload.token;
+                    const token = response.headers.get('X-Whisper-Next-CSRF') || payload.csrf_token || payload.token;
+                    if (token && !readOnly) {
+                        if (control) controlToken = token;
+                        else webuiCsrfToken = token;
+                    }
                     return { response, payload };
                 };
                 let { response, payload } = await send();
@@ -1144,6 +1151,7 @@
                 if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : `Ошибка сервера: ${response.status}`);
                 return payload;
             };
+            if (readOnly || control) return run();
             const result = apiQueue.then(run);
             apiQueue = result.catch(() => {});
             return result;
@@ -1236,7 +1244,7 @@
             await refreshJob(id, version, true);
         }
         function clearResult() {
-            renderedAttempt = ''; renderedSegmentKeys = [];
+            renderedAttempt = ''; renderedSegmentKeys = []; liveSegments = []; streamCursor = '';
             progressBar.classList.remove('indeterminate');
             progressBar.parentElement.removeAttribute('aria-valuenow');
             segmentsProcessed = 0; matchingSegments = []; activeMatchIndex = -1;
@@ -1271,15 +1279,23 @@
             if (!window.EventSource || !isCurrent(id, version)) return;
             if (jobEvents && eventJobId === id && eventGeneration === version && jobEvents.readyState !== 2) return;
             closeJobEvents();
-            const source = new EventSource(`${jobUrl(id)}/events`, { withCredentials: true });
+            const source = new EventSource(`${jobUrl(id)}/events${streamCursor ? '?cursor=' + encodeURIComponent(streamCursor) : ''}`, { withCredentials: true });
+            source.onopen = () => { lastStreamMessageAt = Date.now(); };
             jobEvents = source; eventJobId = id; eventGeneration = version;
             source.onmessage = (event) => {
                 if (!isCurrent(id, version) || jobEvents !== source) return;
                 try {
-                    const data = JSON.parse(event.data), job = unpackJob(data);
-                    if (String(job.id) !== id || !renderJob(job, data.offset ?? job.offset)) return;
-                    if (['done', 'completed'].includes(job.status)) restoreSummary(id, version, job);
-                    else if (['queued', 'processing', 'cancel_requested'].includes(job.status)) watchJob(id, version);
+                    const data = JSON.parse(event.data);
+                    lastStreamMessageAt = Date.now();
+                    if (data.type === 'heartbeat') return;
+                    const job = unpackJob(data);
+                    const view = data.has_more && ['done', 'completed'].includes(job.status) ? { ...job, status: 'processing' } : job;
+                    if (String(job.id) !== id || !renderJob(view, data.offset ?? job.offset, data.type === 'delta' ? data : null)) return;
+                    if (!data.has_more && ['done', 'completed'].includes(job.status)) {
+                        if (data.type === 'delta') refreshJob(id, version);
+                        else restoreSummary(id, version, job);
+                    }
+                    else if (data.has_more || ['queued', 'processing', 'cancel_requested'].includes(job.status)) watchJob(id, version);
                 } catch (_) {
                     // Polling keeps the page useful while the stream reconnects.
                     clearTimeout(pollTimer);
@@ -1291,6 +1307,14 @@
                 clearTimeout(pollTimer);
                 pollTimer = setTimeout(() => refreshJob(id, version), 1000);
             };
+        }
+        function diarizationLabel(progress) {
+            const steps = { segmentation: 'Ищем участки речи', embeddings: 'Сравниваем голоса',
+                clustering: 'Группируем говорящих' };
+            const label = steps[progress.step] || 'Определяем говорящих';
+            const count = Number(progress.completed), total = Number(progress.total);
+            return Number.isFinite(count) && count >= 0 && Number.isFinite(total) && total > 0
+                ? `${label} · ${Math.min(count, total)} / ${total}` : label;
         }
         function renderJobProgress(job, status) {
             const progress = job.progress || job.result?.progress || {};
@@ -1312,14 +1336,14 @@
             const processed = Number(progress.processed_seconds) || 0;
             const total = Number(progress.total_seconds) || 0;
             const phases = { queued: 'Ожидаем свободную модель', preparing: 'Подготавливаем аудио',
-                diarizing: 'Определяем говорящих', loading: 'Загружаем модель',
+                diarizing: diarizationLabel(progress), loading: 'Загружаем модель',
                 transcribing: 'Распознаём речь', done: 'Распознавание завершено' };
             speedLabel.textContent = total > 0
                 ? `Аудио: ${formatTime(Math.min(processed, total))} / ${formatTime(total)}`
                 : phases[progress.phase] || (done ? phases.done : 'Подготавливаем распознавание');
             estimateLabel.textContent = `${percent === null ? '' : `${Math.floor(percent)}% · `}${segmentsProcessed.toLocaleString('ru-RU')} фрагм.`;
         }
-        function renderJob(job, offset) {
+        function renderJob(job, offset, delta = null) {
             // A delayed poll or a reconnect must never replace a newer attempt or its final result.
             const terminal = value => ['done', 'completed', 'cancelled', 'canceled', 'error', 'failed'].includes(value);
             if (selectedJob && String(selectedJob.id) === String(job.id)) {
@@ -1327,8 +1351,11 @@
                 if (job.attempt === selectedJob.attempt && terminal(selectedJob.status) && !terminal(job.status)) return false;
                 if (job.attempt === selectedJob.attempt && job.updated_at && selectedJob.updated_at && job.updated_at < selectedJob.updated_at) return false;
             }
-            const attempt = `${job.id}:${job.attempt}`;
-            if (renderedAttempt !== attempt) {
+            const epoch = (delta?.cursor || job.stream_cursor || '').split(':')[1] || '0';
+            const oldEpoch = streamCursor.split(':')[1] || '0';
+            if (selectedJob?.attempt === job.attempt && Number(epoch) < Number(oldEpoch)) return false;
+            const attempt = `${job.id}:${job.attempt}:${epoch}`;
+            if (renderedAttempt !== attempt || delta?.reset) {
                 if (renderedAttempt) closeJobEvents();
                 clearResult(); renderedAttempt = attempt;
             }
@@ -1338,7 +1365,7 @@
             const labels = { uploading: 'Загрузка файла', queued: 'В очереди', processing: 'Обработка',
                 cancel_requested: 'Отмена запрошена', cancelled: 'Отменено', canceled: 'Отменено',
                 done: 'Готово', completed: 'Готово', error: 'Ошибка обработки', failed: 'Ошибка обработки' };
-            const phases = { preparing: 'Подготавливаем аудио', diarizing: 'Определяем говорящих',
+            const phases = { preparing: 'Подготавливаем аудио', diarizing: diarizationLabel(progress),
                 loading: 'Загружаем модель', transcribing: 'Распознаём речь' };
             const label = status === 'processing' ? phases[progress.phase] || labels.processing : labels[status];
             setStatus(`${label || `Статус сервера: ${status}`} · попытка ${job.attempt ?? '?'}`);
@@ -1356,17 +1383,33 @@
             } else hideUploadProgress();
             const done = ['done', 'completed'].includes(status);
             const result = job.result || (done ? job : {});
-            const segments = Array.isArray(result.segments) ? result.segments : [];
-            const keys = segments.map(segment => JSON.stringify([segment.start, segment.end, segment.text, segment.speaker]));
-            // Append to stable nodes during streaming so search and selection stay in place.
-            // Rebuild only when the final result actually corrects an earlier segment.
-            if (keys.length < renderedSegmentKeys.length || renderedSegmentKeys.some((key, index) => keys[index] !== key)) {
-                transcriptContainer.replaceChildren(); segmentsProcessed = 0;
-                matchingSegments = []; activeMatchIndex = -1; renderedSegmentKeys = [];
+            if (delta) {
+                const incoming = Array.isArray(delta.segments) ? delta.segments : [];
+                const end = Number(delta.cursor.split(':')[2]);
+                const begin = end - incoming.length;
+                if (begin > liveSegments.length) throw new Error('В потоке пропущен фрагмент; восстанавливаем запись');
+                for (let index = Math.max(0, liveSegments.length - begin); index < incoming.length; index++) {
+                    const segment = incoming[index];
+                    liveSegments.push(segment);
+                    renderedSegmentKeys.push(JSON.stringify([segment.start, segment.end, segment.text, segment.speaker]));
+                    appendSegment(segment);
+                }
+                streamCursor = delta.cursor;
+            } else {
+                const segments = Array.isArray(result.segments) ? result.segments : [];
+                const keys = segments.map(segment => JSON.stringify([segment.start, segment.end, segment.text, segment.speaker]));
+                if (keys.length < renderedSegmentKeys.length || renderedSegmentKeys.some((key, index) => keys[index] !== key)) {
+                    transcriptContainer.replaceChildren(); segmentsProcessed = 0;
+                    matchingSegments = []; activeMatchIndex = -1; renderedSegmentKeys = [];
+                }
+                for (let index = renderedSegmentKeys.length; index < segments.length; index++) appendSegment(segments[index]);
+                renderedSegmentKeys = keys;
+                liveSegments = segments.slice();
+                streamCursor = job.stream_cursor || `${job.attempt}:0:${segments.length}`;
             }
-            for (let index = renderedSegmentKeys.length; index < segments.length; index++) appendSegment(segments[index]);
-            renderedSegmentKeys = keys;
-            finalOutput.textContent = result.speaker_text || result.text || '';
+            // The visible segment nodes are the live transcript. Build the full plain text once at completion.
+            if (done) finalOutput.textContent = result.speaker_text || result.text || liveSegments.map(segment => segment.text || '').join(' ');
+            else if (!delta) finalOutput.textContent = result.speaker_text || result.text || '';
             transcriptId = done ? result.transcript_id || job.transcript_id || '' : '';
             summarizeButton.disabled = !done || !transcriptId;
             if (segmentsProcessed || finalOutput.textContent) showCopyButton();
@@ -1441,8 +1484,13 @@
                 if (['uploading', 'queued', 'processing', 'cancel_requested'].includes(job.status) && uploadingId !== id) {
                     clearTimeout(pollTimer);
                     if (job.status !== 'uploading') watchJob(id, version);
-                    pollTimer = setTimeout(() => refreshJob(id, version, job.status === 'uploading'),
-                        jobEvents?.readyState === 1 ? 5000 : 1800);
+                    const check = () => {
+                        if (!isCurrent(id, version)) return;
+                        if (jobEvents?.readyState === 1 && Date.now() - lastStreamMessageAt < 25000) {
+                            pollTimer = setTimeout(check, 5000);
+                        } else refreshJob(id, version, job.status === 'uploading');
+                    };
+                    pollTimer = setTimeout(check, jobEvents?.readyState === 1 ? 5000 : 1800);
                 }
             } catch (error) {
                 if (!isCurrent(id, version)) return;
@@ -1507,7 +1555,7 @@
                 needsFile = false; cancelling = true; cancelButton.disabled = true;
                 setStatus('Исходная копия утрачена. Отменяем прежнее задание перед новой загрузкой…');
                 try {
-                    await api(`${jobUrl(oldId)}/cancel`, { method: 'POST', refreshToken: true, retryCsrf: true });
+                    await api(`${jobUrl(oldId)}/cancel`, { method: 'POST', control: true, refreshToken: true, retryCsrf: true });
                     const data = await api(jobUrl(oldId));
                     if (!isCurrent(oldId, version)) return;
                     const oldJob = unpackJob(data);
@@ -1566,7 +1614,7 @@
             cancelButton.textContent = 'Отменяем…';
             setStatus('Отправляем запрос на отмену…');
             try {
-                await api(`${jobUrl(id)}/cancel`, { method: 'POST', retryCsrf: true });
+                await api(`${jobUrl(id)}/cancel`, { method: 'POST', control: true, retryCsrf: true });
                 if (!isCurrent(id, version)) return;
                 cancelling = false; await refreshJob(id, version);
             } catch (error) {

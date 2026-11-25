@@ -1,3 +1,4 @@
+from functools import lru_cache
 import asyncio
 import importlib.util
 import inspect
@@ -272,14 +273,49 @@ _job_tasks_by_attempt = {}
 _job_lock = asyncio.Lock()
 
 
+@lru_cache(maxsize=16)
+def _open_job_store(path):
+    return JobStore(path, max_payload_bytes=8_000_000)
+
+
 def _job_store():
     WEBUI_JOB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return JobStore(WEBUI_JOB_DIR / "jobs.sqlite", max_payload_bytes=8_000_000)
+    return _open_job_store(str(WEBUI_JOB_DIR / "jobs.sqlite"))
+
+
+@lru_cache(maxsize=16)
+def _open_job_spool(path, max_file, max_chunk, max_total):
+    return UploadSpool(path, max_file, max_chunk, max_total)
 
 
 def _job_spool():
-    return UploadSpool(WEBUI_JOB_DIR / "uploads", WEBUI_MAX_FILE_BYTES,
-                       WEBUI_MAX_CHUNK_BYTES, WEBUI_MAX_SPOOL_BYTES)
+    return _open_job_spool(str(WEBUI_JOB_DIR / "uploads"), WEBUI_MAX_FILE_BYTES,
+                           WEBUI_MAX_CHUNK_BYTES, WEBUI_MAX_SPOOL_BYTES)
+
+
+_job_watchers = {}
+_job_state_locks = {}
+_upload_inflight = {}
+_upload_tasks = set()
+_job_cleanup_tasks = set()
+
+
+def _job_state_lock(job_id):
+    return _job_state_locks.setdefault(job_id, asyncio.Lock())
+
+
+def _notify_job(job_id):
+    for event in tuple(_job_watchers.get(job_id, ())):
+        event.set()
+
+
+def _schedule_upload_cleanup(job_id):
+    async def cleanup():
+        await asyncio.to_thread(_job_spool().remove, job_id)
+        _notify_job(job_id)
+    task = asyncio.create_task(cleanup())
+    _job_cleanup_tasks.add(task)
+    task.add_done_callback(_job_cleanup_tasks.discard)
 
 
 def _session_db():
@@ -2183,23 +2219,23 @@ def _job_get(owner, job_id):
         raise HTTPException(status_code=404, detail="Unknown job")
 
 
-def _job_view(job):
+def _job_view(job, *, include_offset=True):
     settings = job['diarization']
     result = job.get('result') or {}
     progress = result.get('progress') if isinstance(result, dict) else None
     if job['status'] == 'done':
         segments = result.get('segments', [])
-        duration = result.get('duration')
+        duration = result.get('duration') or (progress or {}).get('total_seconds')
         progress = {'phase': 'done', 'percent': 100.0, 'total_seconds': duration,
                     'processed_seconds': duration or max((s.get('end', 0) for s in segments), default=0),
-                    'segments': len(segments)}
+                    'segments': job.get('segment_count', len(segments))}
     elif progress is None:
         progress = {'phase': 'queued' if job['status'] == 'processing' else job['status'],
                     'percent': None, 'processed_seconds': 0.0, 'total_seconds': None, 'segments': 0}
     return {**job, **{k: settings[k] for k in ('filename', 'size', 'model')},
             'diarize': settings.get('desired_diarize', settings['diarize']),
             'progress': progress,
-            'offset': _job_spool().offset(job['id']), 'transcript_id': job['id'] if job['status'] == 'done' else None}
+            'offset': _job_spool().offset(job['id']) if include_offset else None, 'transcript_id': job['id'] if job['status'] == 'done' else None}
 
 
 def _create_idempotent_job(store, owner, request_id, settings):
@@ -2302,30 +2338,33 @@ async def _execute_web_job(owner, job_id, attempt):
     try:
         job = store.start(owner, job_id, attempt)
         settings = job['diarization']
-        partial = {'text': '', 'segments': [], 'progress': {
-            'phase': 'queued', 'percent': None, 'processed_seconds': 0.0,
-            'total_seconds': None, 'segments': 0}}
+        progress = {'phase': 'queued', 'percent': None, 'processed_seconds': 0.0,
+                    'total_seconds': None, 'segments': 0}
 
         def publish_progress(event):
-            progress = partial['progress']
             update = event.get('progress', {})
-            if update.get('reset'):
-                partial['segments'] = []
-                partial['text'] = ''
-            progress.update({key: value for key, value in update.items() if key != 'reset'})
-            if 'segment' in event:
-                segment = event['segment']
-                partial['segments'].append(segment)
-                partial['text'] = ' '.join(s['text'] for s in partial['segments'])
+            reset = bool(update.get('reset'))
+            if reset:
+                progress.update(phase='queued', percent=None, processed_seconds=0.0,
+                                total_seconds=None, segments=0)
+            if reset or ('phase' in update and update['phase'] != progress.get('phase')):
+                for key in ('step', 'completed', 'total'):
+                    progress.pop(key, None)
+            progress.update({key: value for key, value in update.items()
+                             if key in ('phase', 'total_seconds', 'processed_seconds', 'step', 'completed', 'total')})
+            segment = event.get('segment')
+            if segment is not None:
+                progress['segments'] += 1
                 progress['processed_seconds'] = max(progress['processed_seconds'], segment.get('end', 0))
                 progress['phase'] = 'transcribing'
             total = progress.get('total_seconds')
             progress['percent'] = (min(99.0, round(100 * progress['processed_seconds'] / total, 2))
                                    if progress['phase'] == 'transcribing' and total and total > 0 else None)
-            progress['segments'] = len(partial['segments'])
-            store.update_progress(owner, job_id, attempt, partial)
+            store.append_progress(owner, job_id, attempt, segment=segment, progress=progress, reset=reset)
+            _notify_job(job_id)
 
-        store.update_progress(owner, job_id, attempt, partial)
+        store.append_progress(owner, job_id, attempt, progress=progress)
+        _notify_job(job_id)
         with (_job_spool().root / job_id).open('rb') as source:
             result = await _transcribe_impl(UploadFile(file=source, filename=settings['filename']),
                                             settings['model'], None, 5, 0.0, False, False, True,
@@ -2338,11 +2377,19 @@ async def _execute_web_job(owner, job_id, attempt):
                 return
             terminal_signal = True
             payload = json.loads(result.body)
+            if payload.get('code') == 'worker_stopped':
+                retry = store.interrupt_for_retry(owner, job_id, attempt)
+                if retry['status'] == 'queued':
+                    _defer_or_launch_web_job(owner, retry)
+                elif retry['status'] == 'cancelled':
+                    await asyncio.to_thread(_job_spool().remove, job_id)
+                return
             raise RuntimeError(payload.get('error', 'Transcription failed'))
         terminal_signal = True
         result = dict(result)
         result['transcript_id'] = job_id
         store.complete(owner, job_id, attempt, result)
+        _notify_job(job_id)
     except asyncio.CancelledError:
         interrupted = True
         raise
@@ -2351,7 +2398,7 @@ async def _execute_web_job(owner, job_id, attempt):
             job = store.get(owner, job_id)
             if terminal_signal and job['attempt'] == attempt and job['status'] == 'cancel_requested':
                 store.finish_cancel(owner, job_id, attempt)
-                _job_spool().remove(job_id)
+                await asyncio.to_thread(_job_spool().remove, job_id)
         except (InvalidTransition, JobNotFound):
             pass
     except Exception as error:
@@ -2360,12 +2407,13 @@ async def _execute_web_job(owner, job_id, attempt):
             job = store.get(owner, job_id)
             if job['status'] == 'cancel_requested' and terminal_signal:
                 store.finish_cancel(owner, job_id, attempt)
-                _job_spool().remove(job_id)
+                await asyncio.to_thread(_job_spool().remove, job_id)
             elif job['status'] != 'cancel_requested':
                 store.fail(owner, job_id, attempt, str(error)[:4000])
         except (InvalidTransition, JobNotFound):
             pass
     finally:
+        _notify_job(job_id)
         flags = getattr(app.state, 'job_cancel_flags', None)
         if flags is not None and not unknown_completion:
             flags.pop((job_id, attempt), None)
@@ -2381,7 +2429,7 @@ async def _execute_web_job(owner, job_id, attempt):
 @app.get('/web/jobs')
 async def web_jobs_list(request: Request):
     owner = _job_owner(request)
-    return {'jobs': [_job_view(job) for job in _job_store().list(owner)]}
+    return {'jobs': [_job_view(job, include_offset=False) for job in await asyncio.to_thread(_job_store().list_metadata, owner)]}
 
 
 @app.post('/web/jobs')
@@ -2408,41 +2456,104 @@ async def web_jobs_create(request: Request):
 
 @app.get('/web/jobs/{job_id}')
 async def web_jobs_get(job_id: str, request: Request):
-    return _job_view(_job_get(_job_owner(request), job_id))
+    job = await asyncio.to_thread(_job_get, _job_owner(request), job_id)
+    return await asyncio.to_thread(_job_view, job)
 
 
 @app.get('/web/jobs/{job_id}/events')
-async def web_jobs_events(job_id: str, request: Request):
-    """Stream owner-scoped durable snapshots; reconnect starts from current state."""
+async def web_jobs_events(job_id: str, request: Request, cursor: Optional[str] = None):
+    """Deliver bounded durable deltas; browser reconnect resumes its segment cursor."""
     owner = _job_owner(request)
-    first = _job_get(owner, job_id)
+    store = _job_store()
+    cursor = request.headers.get('last-event-id') or cursor
+    try:
+        if cursor is not None:
+            store.parse_cursor(cursor)
+        await asyncio.to_thread(store.stream_delta, owner, job_id, cursor)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except JobNotFound:
+        raise HTTPException(status_code=404, detail='Unknown job')
 
     async def events():
-        job, previous = first, None
+        position = cursor
+        previous = None
+        packet = None
+        changed = asyncio.Event()
+        _job_watchers.setdefault(job_id, set()).add(changed)
         heartbeat = time.monotonic()
-        while True:
-            view = _job_view(job)
-            revision = (job['attempt'], job['status'], job['updated_at'], view['offset'])
-            if revision != previous:
-                yield f"id: {job['attempt']}:{job['updated_at']}\ndata: {json.dumps(view, ensure_ascii=False)}\n\n"
-                previous = revision
-                heartbeat = time.monotonic()
-            elif time.monotonic() - heartbeat >= 15:
-                yield ': keepalive\n\n'
-                heartbeat = time.monotonic()
-            if job['status'] in ('done', 'error', 'cancelled'):
-                return
-            if await request.is_disconnected():
-                return
-            await asyncio.sleep(.4)
-            try:
-                job = _job_get(owner, job_id)
-            except HTTPException:
-                return  # Removed or no longer owned while the stream was open.
+        try:
+            while True:
+                changed.clear()
+                if packet is None:
+                    try:
+                        packet = await asyncio.to_thread(store.stream_delta, owner, job_id, position)
+                    except JobNotFound:
+                        return
+                job = packet['job']
+                packet['job'] = await asyncio.to_thread(_job_view, job)
+                revision = (job['attempt'], job['status'], job['updated_at'], packet['cursor'])
+                if revision != previous or packet['segments'] or packet['reset']:
+                    yield f"id: {packet['cursor']}\ndata: {json.dumps(packet, ensure_ascii=False)}\n\n"
+                    previous = revision
+                    heartbeat = time.monotonic()
+                elif time.monotonic() - heartbeat >= 15:
+                    yield 'data: ' + json.dumps({'type': 'heartbeat', 'cursor': position}) + '\n\n'
+                    heartbeat = time.monotonic()
+                position = packet['cursor']
+                more = packet['has_more']
+                packet = None
+                if more:
+                    continue
+                if job['status'] in ('done', 'error', 'cancelled'):
+                    return
+                if await request.is_disconnected():
+                    return
+                try:
+                    # Notifications make the live path immediate; this cheap fallback
+                    # observes changes made by another process and emits heartbeats.
+                    await asyncio.wait_for(changed.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            watchers = _job_watchers.get(job_id)
+            if watchers is not None:
+                watchers.discard(changed)
+                if not watchers:
+                    _job_watchers.pop(job_id, None)
 
     return StreamingResponse(events(), media_type='text/event-stream', headers={
         'Cache-Control': 'no-cache, no-store', 'X-Accel-Buffering': 'no',
         'X-Content-Type-Options': 'nosniff'})
+
+
+def _append_web_upload(owner, job_id, offset, data, total):
+    """A detached HTTP request must still finish its disk write and cancellation cleanup."""
+    spool, store = _job_spool(), _job_store()
+    try:
+        return spool.append(job_id, offset, data, total)
+    finally:
+        try:
+            current = store.get(owner, job_id)
+            cancelled = current['status'] == 'cancelled'
+        except JobNotFound:
+            cancelled = True
+        if cancelled:
+            spool.remove(job_id)
+
+
+def _upload_finished(job_id, task):
+    _upload_tasks.discard(task)
+    remaining = _upload_inflight.get(job_id, 1) - 1
+    if remaining:
+        _upload_inflight[job_id] = remaining
+    else:
+        _upload_inflight.pop(job_id, None)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logger.warning('Upload write for %s failed: %s', job_id, error)
+    _notify_job(job_id)
 
 
 @app.put('/web/jobs/{job_id}/upload')
@@ -2454,16 +2565,28 @@ async def web_jobs_upload(job_id: str, request: Request, offset: int = Query(...
         data.extend(chunk)
         if len(data) > WEBUI_MAX_CHUNK_BYTES:
             raise HTTPException(status_code=413, detail='Upload chunk too large')
-    async with _job_lock:
+    async with _job_state_lock(job_id):
         job = _job_get(owner, job_id)
         if job['status'] != 'uploading':
             raise HTTPException(status_code=409, detail='Job is not uploading')
-        try:
-            new_offset = _job_spool().append(job_id, offset, bytes(data), job['diarization']['size'])
-        except UploadConflict as error:
-            raise HTTPException(status_code=409, detail=str(error))
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error))
+        _upload_inflight[job_id] = _upload_inflight.get(job_id, 0) + 1
+        write = asyncio.create_task(asyncio.to_thread(
+            _append_web_upload, owner, job_id, offset, bytes(data), job['diarization']['size']))
+        _upload_tasks.add(write)
+        write.add_done_callback(lambda task: _upload_finished(job_id, task))
+    try:
+        new_offset = await asyncio.shield(write)
+    except UploadConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    async with _job_state_lock(job_id):
+        current = _job_get(owner, job_id)
+        if current['status'] != 'uploading':
+            if current['status'] == 'cancelled':
+                _schedule_upload_cleanup(job_id)
+            raise HTTPException(status_code=409, detail='Job is no longer uploading')
+    _notify_job(job_id)
     return {'offset': new_offset}
 
 
@@ -2471,7 +2594,7 @@ async def web_jobs_upload(job_id: str, request: Request, offset: int = Query(...
 async def web_jobs_start(job_id: str, request: Request):
     _consume_webui_token(request)
     owner = _job_owner(request)
-    async with _job_lock:
+    async with _job_state_lock(job_id):
         job = _job_get(owner, job_id)
         if job['status'] != 'uploading':
             return _job_view(job)
@@ -2484,6 +2607,7 @@ async def web_jobs_start(job_id: str, request: Request):
         except InvalidTransition as error:
             raise HTTPException(status_code=409, detail=str(error))
         _launch_job(owner, job)
+    _notify_job(job_id)
     return _job_view(job)
 
 
@@ -2491,7 +2615,7 @@ async def web_jobs_start(job_id: str, request: Request):
 async def web_jobs_cancel(job_id: str, request: Request):
     _consume_webui_token(request)
     owner = _job_owner(request)
-    async with _job_lock:
+    async with _job_state_lock(job_id):
         job = _job_get(owner, job_id)
         try:
             flags = getattr(app.state, 'job_cancel_flags', None)
@@ -2499,7 +2623,10 @@ async def web_jobs_cancel(job_id: str, request: Request):
                 raise HTTPException(status_code=503, detail='Worker cancellation channel unavailable')
             job = _job_store().request_cancel(owner, job_id, job['attempt'])
             if job['status'] == 'cancelled':
-                _job_spool().remove(job_id)
+                if job_id in _upload_inflight:
+                    _schedule_upload_cleanup(job_id)
+                else:
+                    await asyncio.to_thread(_job_spool().remove, job_id)
             elif job['status'] == 'cancel_requested':
                 try:
                     flags[(job_id, job['attempt'])] = True
@@ -2507,6 +2634,7 @@ async def web_jobs_cancel(job_id: str, request: Request):
                     raise HTTPException(status_code=503, detail='Worker cancellation channel unavailable')
         except InvalidTransition as error:
             raise HTTPException(status_code=409, detail=str(error))
+    _notify_job(job_id)
     return _job_view(job)
 
 
@@ -2514,11 +2642,11 @@ async def web_jobs_cancel(job_id: str, request: Request):
 async def web_jobs_delete(job_id: str, request: Request):
     _consume_webui_token(request)
     owner = _job_owner(request)
-    async with _job_lock:
+    async with _job_state_lock(job_id):
         job = _job_get(owner, job_id)
         if job['status'] not in ('done', 'error', 'cancelled'):
             raise HTTPException(status_code=409, detail='Only terminal jobs can be deleted')
-        _job_spool().remove(job_id)
+        await asyncio.to_thread(_job_spool().remove, job_id)
         try:
             _job_store().delete(owner, job_id)
         except InvalidTransition as error:
@@ -2536,7 +2664,7 @@ async def web_jobs_patch(job_id: str, request: Request):
             raise ValueError('Expected boolean diarize')
     except (ValueError, TypeError) as error:
         raise HTTPException(status_code=400, detail=str(error))
-    async with _job_lock:
+    async with _job_state_lock(job_id):
         job = _job_get(owner, job_id)
         settings = {**job['diarization'], 'desired_diarize': data['diarize']}
         if job['status'] == 'uploading':
@@ -2551,6 +2679,7 @@ async def web_jobs_patch(job_id: str, request: Request):
             raise HTTPException(status_code=409, detail=str(error))
         if job['status'] == 'queued' and job['attempt'] != previous_attempt:
             _launch_job(owner, job)
+    _notify_job(job_id)
     return _job_view(job)
 
 

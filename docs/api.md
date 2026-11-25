@@ -113,15 +113,27 @@ includes `segments[].speaker` and `speaker_turns`. See [setup and limits](diariz
 
 ### Live Web UI job progress
 
-`GET /web/jobs/{id}/events` is a cookie-authenticated SSE endpoint for the
-current Web UI session. Each ordinary `message` event contains a full job
-snapshot, matching `GET /web/jobs/{id}`. Other sessions cannot subscribe.
+`GET /web/jobs` returns history metadata without transcript or summary payloads.
+`GET /web/jobs/{id}` returns the full current snapshot, including partial
+`result.segments` and `result.text` while processing.
 
-While a job is processing, `result.segments` and `result.text` contain the
-available partial transcript. `progress` reports `phase`, `percent`,
-`processed_seconds`, `total_seconds`, and `segments`. An unknown numeric
-percentage is `null`; the client displays the current phase until measured
-audio progress is available. Clients reconcile snapshots by job and attempt,
-so reconnecting does not duplicate segments. The terminal snapshot contains
-the final result, and the server closes the stream. Normal GET polling remains
-available when SSE is interrupted.
+`GET /web/jobs/{id}/events?cursor=attempt:epoch:sequence` is a cookie-authenticated
+SSE endpoint for the current Web UI session. Each ordinary message contains
+`type: "delta"`, lightweight `job` metadata, new `segments`, `cursor`, `reset`
+and `has_more`. The event ID has the same cursor. `Last-Event-ID` on reconnect
+takes precedence over the query parameter. An obsolete generation resets the
+client transcript; a matching cursor replays only later segments.
+
+A packet contains at most 128 segments. Terminal jobs close the stream only
+after all replay pages have been sent. Clients perform a final full GET for
+speaker text, metrics and saved summaries. Small JSON heartbeats are emitted
+when an active job is unchanged. Other sessions cannot read or subscribe to
+the job; both unknown and foreign jobs return 404.
+
+`progress` reports `phase`, `percent`, `processed_seconds`, `total_seconds`,
+and `segments`. Unknown numeric progress is `null`. Diarization can additionally
+report `step`, `completed` and `total` for its current operation; those counts
+are not an audio completion percentage.
+
+See [durable job events](webui-job-events.md) for upload acknowledgement,
+concurrent cancellation, migration and retention guarantees.
