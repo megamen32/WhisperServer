@@ -303,3 +303,31 @@ async def test_failed_source_unlink_can_be_retried_without_losing_text(monkeypat
         retried = await mutate(client, "DELETE", f"/web/jobs/{job['id']}/source")
         assert retried.status_code == 200 and retried.json()["source_removal_pending"] is False
         assert spool.offset(job["id"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_source_removal_also_evicts_unborrowed_prepared_audio(tmp_path, monkeypatch):
+    import hashlib
+    import numpy as np
+    from prepared_audio import PreparedAudioCache
+
+    pcm_root = tmp_path / "pcm"
+    monkeypatch.setenv("WHISPER_PCM_DIR", str(pcm_root))
+    cache = PreparedAudioCache(pcm_root / "cache-v1", min_free_bytes=0)
+    audio_hash = hashlib.sha256(b"abc").hexdigest()
+    idle = cache.borrow(audio_hash, {"decoder": "idle"}, lambda: np.zeros(20, dtype=np.float32))
+    idle_path = idle.path
+    idle.close()
+    active = cache.borrow(audio_hash, {"decoder": "active"}, lambda: np.zeros(20, dtype=np.float32))
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://testserver") as client:
+            job = await complete_job(client)
+            removed = await mutate(client, "DELETE", f"/web/jobs/{job['id']}/source")
+            assert removed.status_code == 200
+            assert not idle_path.exists(), "deleted source left an unused decoded audio copy"
+            assert active.path.exists(), "source deletion invalidated another active audio borrower"
+            saved = (await client.get(f"/web/jobs/{job['id']}")).json()
+            assert saved["result"]["text"] == "saved text"
+            assert saved["summaries"]["latest"]["summary"] == "saved summary"
+    finally:
+        active.close()

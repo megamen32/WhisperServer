@@ -89,3 +89,5 @@ job then fails without clearing existing text or summaries.
 There is no automatic expiration or deletion of user audio. This action removes
 the original upload for that job. It does not remove the job from history or
 erase unrelated reusable transcription cache entries.
+
+Explicit source deletion also evicts idle prepared-audio cache entries for that source hash. A source currently borrowed by another running job keeps its shared lease and follows normal cache retention after release. Transcripts, checkpoints containing text, and summaries are not removed.

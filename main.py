@@ -2609,6 +2609,30 @@ async def web_identity_recover(request: Request):
     return response
 
 
+def _remove_source_and_idle_preparation(job_id):
+    """Remove the explicit source and unborrowed derived audio without touching text."""
+    spool = _job_spool()
+    source_hash = None
+    try:
+        digest = hashlib.sha256()
+        with (spool.root / job_id).open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(block)
+        source_hash = digest.hexdigest()
+    except FileNotFoundError:
+        pass  # An interrupted prior deletion may already have unlinked the source.
+    spool.remove(job_id)
+    if source_hash is not None:
+        try:
+            from prepared_audio import PreparedAudioCache
+            root = Path(os.getenv('WHISPER_PCM_DIR', str(WEBUI_JOB_DIR / 'pcm'))) / 'cache-v1'
+            PreparedAudioCache(root).evict_source(source_hash)
+        except OSError:
+            # Active borrowers keep their lease; ordinary cache retention also
+            # cleans any derived data that cannot be reclaimed immediately.
+            logger.warning('Could not evict idle preparation for a removed source', exc_info=True)
+
+
 @app.delete('/web/jobs/{job_id}/source')
 async def web_jobs_remove_source(job_id: str, request: Request):
     _consume_webui_token(request)
@@ -2620,7 +2644,7 @@ async def web_jobs_remove_source(job_id: str, request: Request):
         except InvalidTransition as error:
             raise HTTPException(status_code=409, detail=str(error))
         try:
-            await asyncio.to_thread(_job_spool().remove, job_id)
+            await asyncio.to_thread(_remove_source_and_idle_preparation, job_id)
         except OSError:
             _notify_job(job_id)
             raise HTTPException(status_code=503, detail="Не удалось удалить аудио. Повторите удаление в меню записи.")
