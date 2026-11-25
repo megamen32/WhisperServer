@@ -1063,17 +1063,19 @@
             });
         }
 
-        function invalidateTranscriptLayout() {
+        function invalidateTranscriptLayout(deferred = false) {
             for (const row of transcriptRows) row.height = 0;
             transcriptLayoutDirty = true;
-            renderTranscriptWindow();
+            if (deferred) scheduleTranscriptWindow();
+            else renderTranscriptWindow();
         }
 
         transcriptScroller.addEventListener('scroll', scheduleTranscriptWindow, {passive: true});
         if (typeof ResizeObserver !== 'undefined') new ResizeObserver(entries => {
             const width = entries[0]?.contentRect.width || 0;
             if (Math.abs(width - transcriptWidth) < 1) return;
-            transcriptWidth = width; invalidateTranscriptLayout();
+            // ResizeObserver delivery must not synchronously change the observed layout.
+            transcriptWidth = width; invalidateTranscriptLayout(true);
         }).observe(transcriptScroller);
 
         function updateMatchCount() {

@@ -52,6 +52,12 @@ def test_long_transcript_keeps_bounded_dom_and_full_search_copy(tmp_path):
         check(transcriptContainer.textContent.includes('НАЧАЛЬНЫЙ'),'initial window lost beginning');
         const scroller=transcriptContainer.closest('.document');
         scroller.style.scrollBehavior='auto';
+        for (const width of [600, 900]) {
+          scroller.style.width=width+'px';
+          await new Promise(resolve=>setTimeout(resolve,100));
+          check(count()<=160,'resizing expanded the transcript DOM');
+          check(segmentsProcessed===4000,'resizing lost transcript data');
+        }
         scroller.scrollTop=scroller.scrollHeight;
         scroller.dispatchEvent(new Event('scroll'));
         await new Promise(resolve=>setTimeout(resolve,100));
