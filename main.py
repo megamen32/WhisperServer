@@ -1132,11 +1132,19 @@ class WorkerStopped(Exception):
 
 
 def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_flags=None, execution_state=None):
+    from runtime_support import WorkerExecution
+    from prepared_audio import PreparedAudioCache
+    execution = WorkerExecution(execution_state)
     model_cache = {}
     ready = CooperativeQueue()
     from gigaam_backend import cleanup_stale_chunk_plans
     pcm_root = Path(os.getenv('WHISPER_PCM_DIR', str(WEBUI_JOB_DIR / 'pcm')))
     cleanup_stale_chunk_plans(pcm_root)
+    pcm_cache = PreparedAudioCache(
+        pcm_root / 'cache-v1',
+        ttl_seconds=float(os.getenv('WHISPER_PCM_CACHE_TTL_SECONDS', '86400')))
+    pcm_cache.prune()
+    next_pcm_prune = time.monotonic() + 60
     try:
         checkpoint_store = AudioCheckpoints(os.getenv(
             'WHISPER_CHECKPOINT_DB', str(WEBUI_JOB_DIR / 'audio-checkpoints.sqlite')))
@@ -1182,6 +1190,12 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
         temp_path = None
         owns_temp = False
         chunk_plan = None
+        preview_plan = None
+        provisional = False
+        preliminary_segments = 0
+        preliminary_inference_ms = 0.0
+        durable_checkpoint = 0
+        current_unit = 'source'
         reused_chunks = 0
         computed_chunks = 0
         diarization_reused = False
@@ -1207,11 +1221,77 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
         def publish_progress(phase, **extra):
             if report_progress:
                 response_queue.put({'request_id': request_id, 'progress': {
-                    'phase': phase, 'total_seconds': audio_seconds, **extra}})
+                    'phase': phase, 'total_seconds': audio_seconds,
+                    'provisional': provisional, **extra}})
+
+        def execution_phase(phase):
+            execution.enter(request_id, job_key, phase, unit=current_unit,
+                            checkpoint=durable_checkpoint)
+
+        def borrow_model(scope):
+            nonlocal load_ms, cold_load
+            check_cancel()
+            began = time.perf_counter()
+            created = model_name not in model_cache
+            if created:
+                cold_load = True
+                execution_phase('preparing_cpu')
+                ensure_vram_for_model(model_name, model_cache)
+                check_cancel()
+                entry = _create_model_entry(model_name)
+                try:
+                    check_cancel()
+                except BaseException:
+                    cleanup = getattr(entry, 'release', None) or getattr(entry, 'unload', None)
+                    if cleanup is not None:
+                        cleanup()
+                    raise
+                model_cache[model_name] = entry
+            entry = model_cache[model_name]
+            check_cancel()
+            if ManagedModel is not None and isinstance(entry, ManagedModel):
+                execution_phase('waiting_gpu')
+                if getattr(entry, 'supports_preparation_hooks', False):
+                    entry.acquire(cancel_check=check_cancel, phase_hook=execution_phase)
+                else:
+                    entry.acquire()
+                    try:
+                        check_cancel()
+                    except BaseException:
+                        entry.release()
+                        raise
+                loaded = scope.enter_context(entry.inference())
+                entry.touch(active=True)
+            else:
+                loaded = entry
+            check_cancel()
+            load_ms += (time.perf_counter() - began) * 1000
+            return entry, loaded
+
+        @contextmanager
+        def diarization_model_provider():
+            check_cancel()
+            parameters = inspect.signature(_diarization_model_session).parameters
+            accepts_hooks = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            hooks = {}
+            if accepts_hooks or 'cancel_check' in parameters:
+                hooks['cancel_check'] = check_cancel
+            if accepts_hooks or 'phase_hook' in parameters:
+                hooks['phase_hook'] = execution_phase
+            borrowed = None
+            with _diarization_model_session(**hooks) as borrowed:
+                try:
+                    check_cancel()
+                    execution_phase('diarization')
+                    yield borrowed
+                finally:
+                    borrowed = None
 
         try:
+            execution_phase('preparing')
             check_cancel()
             publish_progress('preparing')
+            reset_cuda_peak_memory()
             if request.get('audio_path'):
                 temp_path = request['audio_path']
                 audio_hash = request['audio_hash']
@@ -1231,7 +1311,6 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
             check_cancel()
             speaker_turns = []
             if diarize:
-                publish_progress('diarizing')
                 import diarization_backend as diarization_contract
                 revision = getattr(diarization_contract, 'DIARIZATION_MODEL_REVISION', None)
                 diarization_key = (computation_key(audio_hash, 'community-1', revision, {
@@ -1240,9 +1319,68 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 }) if revision else None)
                 saved_turns = checkpoint_get(diarization_key, 'turns') if diarization_key else None
                 if saved_turns is None:
+                    # A single bounded preview helps the web user before global
+                    # speaker clustering. It never becomes a final ASR unit.
+                    preview_enabled = (report_progress and job_key is not None
+                                       and model_name == 'gigaam-v3'
+                                       and _is_truthy(os.getenv('WHISPER_EARLY_TEXT_ENABLED', '1')))
+                    if preview_enabled:
+                        current_unit = 'preliminary'
+                        scope = ExitStack()
+                        try:
+                            execution_phase('preparing')
+                            publish_progress('preliminary')
+                            from gigaam_backend import GigaAMChunkPlan
+                            preview_plan = GigaAMChunkPlan(
+                                temp_path, vad_filter=vad_filter,
+                                vad_parameters=build_vad_transcribe_options(vad_filter).get('vad_parameters'),
+                                spool_dir=pcm_root, expected_seconds=audio_seconds,
+                                source_hash=audio_hash, cancel_check=check_cancel,
+                                preview_seconds=60, max_chunks=1)
+                            if preview_plan.durable:
+                                durable_checkpoint = max(durable_checkpoint, 1)
+                                execution.advance(checkpoint=durable_checkpoint)
+                            if preview_plan.chunks:
+                                publish_progress('loading')
+                                model_entry, model = borrow_model(scope)
+                                if getattr(model, 'supports_audio_chunks', False):
+                                    check_cancel()
+                                    execution_phase('inference')
+                                    began = time.perf_counter()
+                                    preview, _ = model.decode_chunk(preview_plan, 0, language=lang, beam_size=beam_size)
+                                    preliminary_inference_ms += (time.perf_counter() - began) * 1000
+                                    check_cancel()
+                                    # Publish only after releasing the inference pin.
+                                    model = None
+                                    scope.close()
+                                    for segment in preview:
+                                        text = (segment.text or '').strip()
+                                        if text:
+                                            provisional = True
+                                            preliminary_segments += 1
+                                            publish_progress('preliminary', processed_seconds=segment.end)
+                                            response_queue.put({'request_id': request_id, 'segment': {
+                                                'start': segment.start, 'end': segment.end,
+                                                'text': text, 'provisional': True}})
+                        except WebJobCancelled:
+                            raise
+                        except Exception:
+                            logger.exception('Preliminary transcription unavailable; continuing final path')
+                        finally:
+                            model = None
+                            scope.close()
+                            if preview_plan is not None:
+                                preview_plan.close()
+                                preview_plan = None
+                        yield
+                    check_cancel()
+                    current_unit = 'global-diarization'
+                    execution_phase('preparing')
+                    publish_progress('diarizing')
                     last_hook = {'time': 0.0, 'step': None}
                     def diarization_progress(step_name, step_artifact=None, file=None, total=None, completed=None):
                         check_cancel()
+                        execution.advance(progress=f'{step_name}:{completed}:{total}')
                         now = time.monotonic()
                         if (step_name != last_hook['step'] or now - last_hook['time'] >= .25
                                 or (total is not None and completed == total)):
@@ -1251,17 +1389,28 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                                              total=int(total) if total is not None else None)
                             last_hook.update(time=now, step=step_name)
                     parameters = inspect.signature(diarize_audio).parameters
-                    hooks = ({'progress_hook': diarization_progress}
-                             if 'progress_hook' in parameters or any(
-                                 p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()) else {})
+                    accepts_hooks = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+                    hooks = {}
+                    if accepts_hooks or 'progress_hook' in parameters:
+                        hooks['progress_hook'] = diarization_progress
+                    if accepts_hooks or 'cancel_check' in parameters:
+                        hooks['cancel_check'] = check_cancel
                     speaker_turns = diarize_audio(temp_path, vad_filter=vad_filter,
-                                                 model_provider=_diarization_model_session, **hooks)
+                                                 model_provider=diarization_model_provider, **hooks)
+                    check_cancel()
                     if diarization_key:
                         speaker_turns = checkpoint_put(diarization_key, 'turns', {'turns': speaker_turns})['turns']
                 else:
                     speaker_turns = saved_turns['turns']
                     diarization_reused = True
+                if diarization_key and checkpoint_store is not None:
+                    durable_checkpoint = max(durable_checkpoint, 2)
+                    execution.advance(checkpoint=durable_checkpoint)
+                # Release the global pass before another request's quantum.
+                yield
             check_cancel()
+            current_unit = 'final-model'
+            execution_phase('preparing')
 
             if requested_model_name == OPENAI_WHISPER_INTERNAL_MODEL:
                 model_name = _select_openai_whisper_model(model_cache)
@@ -1286,21 +1435,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                     )
 
             publish_progress('loading')
-            reset_cuda_peak_memory()
-            cold_load = model_name not in model_cache
-            load_started = time.perf_counter()
-            if model_name not in model_cache:
-                ensure_vram_for_model(model_name, model_cache)
-                model_cache[model_name] = _create_model_entry(model_name)
-            check_cancel()
-
-            model_entry = model_cache[model_name]
-            if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                model_entry.acquire()
-                model = model_session.enter_context(model_entry.inference())
-            else:
-                model = model_entry
-            load_ms = (time.perf_counter() - load_started) * 1000 if cold_load else 0.0
+            model_entry, model = borrow_model(model_session)
             usage_dict[model_name] = usage_dict.get(model_name, 0) + 1
             if public_requested_model != model_name:
                 usage_dict[public_requested_model] = usage_dict.get(public_requested_model, 0) + 1
@@ -1313,7 +1448,10 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
 
             def _decode(current_beam: int):
                 """Decode the whole recording; faster-whisper decodes lazily."""
+                nonlocal provisional
                 check_cancel()
+                provisional = False
+                execution_phase('inference')
                 # A non-streaming web job retains the normal OOM retry.
                 # Clear its previous attempt's partial decode on retry.
                 publish_progress('transcribing', processed_seconds=0.0, reset=True)
@@ -1334,6 +1472,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 decoded_words = []
                 for seg in segments:
                     check_cancel()
+                    execution.advance(progress=len(decoded_segments) + 1)
                     if ManagedModel is not None and isinstance(model_entry, ManagedModel):
                         model_entry.touch(active=True)
                     seg_text = (seg.text or "").strip()
@@ -1377,10 +1516,17 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 model = None
                 model_session.close()
                 model_session = ExitStack()
+                current_unit = 'final-audio-plan'
+                execution_phase('preparing')
                 chunk_plan = GigaAMChunkPlan(temp_path, vad_filter=vad_filter,
                                             vad_parameters=build_vad_transcribe_options(vad_filter).get('vad_parameters'),
                                             speaker_turns=speaker_turns if diarize else None,
-                                            spool_dir=pcm_root, expected_seconds=audio_seconds)
+                                            spool_dir=pcm_root, expected_seconds=audio_seconds,
+                                            source_hash=audio_hash, cancel_check=check_cancel)
+                if chunk_plan.durable:
+                    durable_checkpoint = max(durable_checkpoint, 3)
+                    execution.advance(checkpoint=durable_checkpoint)
+                check_cancel()
                 signature = computation_key(audio_hash, model_name, model_revision, {
                     'adapter': GIGAAM_ADAPTER_VERSION, 'language': lang,
                     'beam_size': beam_size, 'retry_beam_size': RETRY_BEAM_SIZE, 'temperature': temperature,
@@ -1391,9 +1537,12 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 info = SimpleNamespace(language=lang or 'ru', language_probability=1.0 if lang else 0.0)
                 # Global diarization remains one quality-preserving pass. Its completed
                 # result and the bounded ASR units are independently reusable.
+                provisional = False
                 publish_progress('transcribing', processed_seconds=0.0, reset=True)
                 yield
                 for index, (chunk_start, chunk_end) in enumerate(chunk_plan.chunks):
+                    current_unit = f'asr:{index}'
+                    execution_phase('preparing')
                     check_cancel()
                     unit = checkpoint_get(signature, index)
                     if unit is None:
@@ -1401,19 +1550,14 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                         for current_beam in (beam_size, RETRY_BEAM_SIZE):
                             scope = ExitStack()
                             try:
-                                if model_name not in model_cache:
-                                    ensure_vram_for_model(model_name, model_cache)
-                                    model_cache[model_name] = _create_model_entry(model_name)
-                                model_entry = model_cache[model_name]
-                                if ManagedModel is not None and isinstance(model_entry, ManagedModel):
-                                    model_entry.acquire()
-                                    model = scope.enter_context(model_entry.inference())
-                                else:
-                                    model = model_entry
+                                model_entry, model = borrow_model(scope)
+                                check_cancel()
+                                execution_phase('inference')
                                 decode_started = time.perf_counter()
                                 chunk_segments, chunk_info = model.decode_chunk(
                                     chunk_plan, index, language=lang, beam_size=current_beam)
                                 inference_ms += (time.perf_counter() - decode_started) * 1000
+                                check_cancel()
                                 break
                             except Exception as exc:
                                 if not is_cuda_oom(exc):
@@ -1442,6 +1586,9 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                             'language_probability': chunk_info.language_probability})
                     else:
                         reused_chunks += 1
+                    if checkpoint_store is not None:
+                        durable_checkpoint = max(durable_checkpoint, 3 + index + 1)
+                        execution.advance(checkpoint=durable_checkpoint)
                     check_cancel()
                     info = SimpleNamespace(language=unit['language'], language_probability=unit['language_probability'])
                     all_segments.extend(unit['segments'])
@@ -1486,6 +1633,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                         ) from retry_exc
                 inference_ms = (time.perf_counter() - inference_started) * 1000
 
+            current_unit = 'finalizing'
+            execution_phase('preparing')
             check_cancel()
             result = {
                 "text": " ".join([s["text"] for s in all_segments]),
@@ -1502,6 +1651,11 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 result['resumed_chunks'] = reused_chunks
                 result['computed_chunks'] = computed_chunks
                 result['chunks_total'] = len(chunk_plan.chunks)
+                result['pcm_reused'] = chunk_plan.pcm_reused
+                result['audio_plan_reused'] = chunk_plan.plan_reused
+            if preliminary_segments:
+                result['preliminary_segments'] = preliminary_segments
+                result['preliminary_inference_ms'] = round(preliminary_inference_ms, 3)
             if diarize:
                 result['diarization_reused'] = diarization_reused
             client_comment = request.get("client_comment")
@@ -1549,10 +1703,17 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 model_session.close()
             except Exception:
                 logger.exception("Failed to mark model idle")
-            if chunk_plan is not None:
-                chunk_plan.close()
+            for plan in (preview_plan, chunk_plan):
+                if plan is not None:
+                    try:
+                        plan.close()
+                    except Exception:
+                        logger.exception('Failed to close audio plan')
             if temp_path and owns_temp:
-                Path(temp_path).unlink(missing_ok=True)
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except OSError:
+                    logger.exception('Failed to remove request audio')
             duration = audio_seconds or getattr(info, "duration", None)
             metric = {
                 "requested_model": public_requested_model,
@@ -1572,6 +1733,10 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 "computed_chunks": computed_chunks,
                 "chunks_total": len(chunk_plan.chunks) if chunk_plan is not None else 0,
                 "diarization_reused": diarization_reused,
+                "preliminary_segments": preliminary_segments,
+                "preliminary_inference_ms": round(preliminary_inference_ms, 3),
+                "pcm_reused": chunk_plan.pcm_reused if chunk_plan is not None else False,
+                "audio_plan_reused": chunk_plan.plan_reused if chunk_plan is not None else False,
             }
             if request.get("client_comment"):
                 metric["client_comment"] = request["client_comment"]
@@ -1594,9 +1759,16 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 break
             ready.add(execute_request(request))
 
+    execution.idle()
     response_queue.put({'__worker_ready__': True})
     try:
         while not stop_event.is_set():
+            if time.monotonic() >= next_pcm_prune:
+                try:
+                    pcm_cache.prune()
+                except OSError:
+                    logger.exception('Could not prune prepared audio')
+                next_pcm_prune = time.monotonic() + 60
             prune = globals().get('_prune_idle_diarizer')
             if prune is not None:
                 prune()
@@ -1613,6 +1785,8 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
             except Exception:
                 finished = True
                 logger.exception('Unexpected transcription task failure')
+            finally:
+                execution.idle()
             # Newly arrived work goes ahead of this continuation, while older
             # runnable continuations retain FIFO order and cannot be starved.
             admit()
@@ -1620,6 +1794,7 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 ready.add(steps)
     finally:
         ready.close()
+        execution.idle()
         clear = globals().get('_clear_idle_diarizer')
         if clear is not None:
             clear()

@@ -225,7 +225,7 @@ def test_global_diarization_is_reused_after_interruption(worker_runtime, monkeyp
     first["diarize"] = True
     requests = queue.Queue()
     requests.put(first)
-    run_worker(requests, on_event=lambda event, stop: stop.set() if "segment" in event else None)
+    run_worker(requests, on_event=lambda event, stop: stop.set() if "segment" in event and not event["segment"].get("provisional") else None)
     second = request("talk-new", 42, 6000, attempt=2)
     second["diarize"] = True
     requests = queue.Queue()
@@ -266,6 +266,7 @@ async def test_web_jobs_are_admitted_before_the_first_job_completes(worker_runti
         await asyncio.gather(*tasks)
 
 def test_diarization_hook_observes_cancel_inside_global_pass(worker_runtime, monkeypatch):
+    monkeypatch.setenv("WHISPER_EARLY_TEXT_ENABLED", "0")
     flags = {}
     phases = []
     def diarize(path, *, vad_filter, model_provider, progress_hook):

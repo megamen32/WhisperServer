@@ -59,3 +59,37 @@ def test_cancel_from_pipeline_hook_releases_provider(decoded_audio):
     with pytest.raises(asyncio.CancelledError):
         backend.diarize_audio('fixture.wav', model_provider=provider, progress_hook=cancel)
     assert released == [True]
+
+
+@pytest.mark.parametrize("cancel_stage", ["decode", "model", "inference"])
+def test_phase_cancel_gates_stop_before_next_expensive_step(decoded_audio, monkeypatch, cancel_stage):
+    cancelled, calls = [False], []
+    decode = backend.subprocess.run
+    def run(*args, **kwargs):
+        decode(*args, **kwargs)
+        calls.append("decode")
+        cancelled[0] = cancel_stage == "decode"
+    monkeypatch.setattr(backend.subprocess, "run", run)
+    class Model:
+        def diarize(self, samples):
+            calls.append("inference")
+            cancelled[0] = cancel_stage == "inference"
+            return [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
+    @contextmanager
+    def provider():
+        calls.append("model")
+        cancelled[0] = cancel_stage == "model"
+        try:
+            yield Model()
+        finally:
+            calls.append("released")
+    def check():
+        if cancelled[0]:
+            raise RuntimeError("cancelled")
+    with pytest.raises(RuntimeError, match="cancelled"):
+        backend.diarize_audio("fixture.wav", model_provider=provider, cancel_check=check)
+    assert calls == {
+        "decode": ["decode"],
+        "model": ["decode", "model", "released"],
+        "inference": ["decode", "model", "inference", "released"],
+    }[cancel_stage]

@@ -161,22 +161,26 @@ def _restore_turns(turns, mapping):
 
 
 def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None,
-                  progress_hook=None) -> list[dict]:
+                  progress_hook=None, cancel_check=None) -> list[dict]:
     """Decode/VAD first, then reserve GPU only for the global model pass."""
     import numpy as np
     import torch
     model = None
+    check = cancel_check or (lambda: None)
     previous_threads = torch.get_num_threads()
     try:
+        check()
         with tempfile.TemporaryDirectory(prefix="whisper-diarization-") as directory:
             if shutil.disk_usage(directory).free < 20 * 1024 ** 3 + 2 * MAX_PCM_BYTES:
                 raise RuntimeError("Недостаточно временного дискового пространства для диаризации")
             pcm = str(Path(directory) / "audio.pcm")
+            check()
             subprocess.run(
                 ["prlimit", f"--fsize={MAX_PCM_BYTES}", "--", "ffmpeg", "-nostdin", "-v", "error",
                  "-threads", "1", "-i", audio_path, "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
                  "-f", "f32le", pcm], capture_output=True, timeout=600, check=True,
             )
+            check()
             if not Path(pcm).stat().st_size:
                 return []
             samples = np.memmap(pcm, dtype="<f4", mode="c")
@@ -185,11 +189,14 @@ def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None,
                 samples, mapping = _compact_speech(samples, str(Path(directory) / "speech.pcm"))
                 if samples is None:
                     return []
+            check()
             torch.set_num_threads(min(previous_threads, 2))
             with (model_provider or _cpu_model)() as model:
                 try:
+                    check()
                     turns = (model.diarize(samples, hook=progress_hook)
                              if progress_hook is not None else model.diarize(samples))
+                    check()
                 except Exception as exc:
                     traceback.clear_frames(exc.__traceback__)
                     raise

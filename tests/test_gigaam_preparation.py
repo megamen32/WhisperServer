@@ -162,3 +162,28 @@ def test_prepared_subtype_uses_real_broker_inference_and_eviction_contract(prepa
     finally:
         entry.release()
     assert len(leases) == 2 and all(lease.released for lease in leases)
+
+
+@pytest.mark.parametrize("cancel_phase", ["before", "cpu", "gpu"])
+def test_cancel_gate_releases_preparation_and_does_not_keep_job_hooks(prepared_runtime, cancel_phase):
+    runtime = prepared_runtime
+    entry = main._create_model_entry("gigaam-v3")
+    phases = []
+    def check():
+        cancelled = (cancel_phase == "before" or
+                     (cancel_phase == "cpu" and bool(runtime.models)) or
+                     (cancel_phase == "gpu" and any(event[0] == "promote" for event in runtime.events)))
+        if cancelled:
+            raise RuntimeError("job cancelled")
+    with pytest.raises(RuntimeError, match="cancelled"):
+        entry.acquire(cancel_check=check, phase_hook=phases.append)
+    assert entry.model is None and entry.current_device == "unloaded"
+    assert entry._cancel_check is None and entry._phase_hook is None
+    if cancel_phase in {"before", "cpu"}:
+        assert ("acquire", None) not in runtime.events
+    if runtime.models:
+        assert all(model.unloaded for model in runtime.models)
+    if cancel_phase == "gpu":
+        assert phases == ["preparing_cpu", "waiting_gpu", "loading_gpu"]
+        assert runtime.events.index(("discard", None)) < runtime.events.index(("release", None))
+    assert entry.acquire().device == "cuda"

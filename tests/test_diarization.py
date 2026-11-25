@@ -73,7 +73,10 @@ def test_diarization_cache_is_separate_and_old_keys_stay_valid():
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_worker_returns_labelled_segments_and_words(monkeypatch, stream):
+def test_worker_returns_labelled_segments_and_words(monkeypatch, tmp_path, stream):
+    from threading import Event
+    monkeypatch.setenv('WHISPER_CHECKPOINT_DB', str(tmp_path / 'checkpoints.sqlite'))
+    monkeypatch.setenv('WHISPER_PCM_DIR', str(tmp_path / 'pcm'))
     options = []
     class ASR:
         def transcribe(self, *args, **kwargs):
@@ -88,10 +91,15 @@ def test_worker_returns_labelled_segments_and_words(monkeypatch, stream):
     monkeypatch.setattr(main, "append_metric", lambda m: None)
     monkeypatch.setattr(main, "reset_cuda_peak_memory", lambda: None)
     monkeypatch.setattr(main, "peak_vram_mb", lambda: 0)
-    requests, responses = Queue(), Queue()
+    stop = Event()
+    class Responses(Queue):
+        def put(self, event):
+            super().put(event)
+            if event.get('final') or event.get('error'):
+                stop.set()
+    requests, responses = Queue(), Responses()
     requests.put(dict(request_id="test", model="large-v3", audio_bytes=b"audio", diarize=True, words=True, stream=stream))
-    checks = iter([False, True])
-    main.model_worker(requests, responses, SimpleNamespace(is_set=lambda: next(checks)), {})
+    main.model_worker(requests, responses, stop, {})
     messages = []
     while not responses.empty():
         message = responses.get_nowait()

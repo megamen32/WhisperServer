@@ -44,9 +44,10 @@ def cleanup_stale_chunk_plans(root):
 
 
 class GigaAMChunkPlan:
-    """CPU-only immutable boundaries backed by disk, not one RAM array per job."""
+    """Original boundaries with optional reusable source PCM and context plans."""
     def __init__(self, audio_path, *, vad_filter, vad_parameters=None, speaker_turns=None,
-                 spool_dir=None, expected_seconds=None, max_active_bytes=MAX_ACTIVE_PCM_BYTES):
+                 spool_dir=None, expected_seconds=None, max_active_bytes=MAX_ACTIVE_PCM_BYTES,
+                 source_hash=None, cancel_check=None, preview_seconds=None, max_chunks=None):
         if expected_seconds and expected_seconds * SAMPLE_RATE * 4 > MAX_PCM_BYTES:
             raise ValueError("Audio exceeds the decoded-audio storage limit")
         if spool_dir is not None:
@@ -54,8 +55,45 @@ class GigaAMChunkPlan:
             spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory = tempfile.TemporaryDirectory(prefix=f"gigaam-plan-{os.getpid()}-", dir=spool_dir)
         self.samples = None
+        self._prepared = None
+        self.durable = False
+        self.pcm_reused = self.plan_reused = False
+        check = cancel_check or (lambda: None)
         try:
+            check()
+            if source_hash is not None and spool_dir is not None:
+                from importlib.metadata import version, PackageNotFoundError
+                from prepared_audio import PreparedAudioCache
+                versions = {}
+                for package in ("faster-whisper", "av"):
+                    try:
+                        versions[package] = version(package)
+                    except PackageNotFoundError:
+                        versions[package] = "unknown"
+                identity = {"format": "gigaam-f32-16000-v1", **versions}
+                cache = PreparedAudioCache(
+                    spool_dir / "cache-v1", max_bytes=max_active_bytes,
+                    ttl_seconds=float(os.getenv("WHISPER_PCM_CACHE_TTL_SECONDS", "86400")))
+                self._prepared = cache.borrow(
+                    source_hash, identity, lambda: decode_audio(audio_path, sampling_rate=SAMPLE_RATE),
+                    cancel_check=check)
+                self.total_samples = self._prepared.metadata["samples"]
+                if self.total_samples:
+                    self.samples = np.memmap(self._prepared.path, dtype="<f4", mode="r")
+                options = {"adapter": GIGAAM_ADAPTER_VERSION, "bounds": "gigaam-context-v1",
+                           "vad_filter": bool(vad_filter), "vad_parameters": vad_parameters,
+                           "speaker_turns": speaker_turns,
+                           "preview_seconds": preview_seconds, "max_chunks": max_chunks}
+                self.chunks, self.plan_reused = self._prepared.context(
+                    options, lambda: self._chunks(
+                        self.samples, self.total_samples, vad_filter, vad_parameters,
+                        speaker_turns, preview_seconds, max_chunks), check)
+                self.durable = True
+                self.pcm_reused = self._prepared.reused
+                check()
+                return
             audio = decode_audio(audio_path, sampling_rate=SAMPLE_RATE)
+            check()
             self.total_samples = len(audio)
             size = self.total_samples * 4
             if size > MAX_PCM_BYTES:
@@ -66,19 +104,9 @@ class GigaAMChunkPlan:
                     raise ValueError("Concurrent decoded-audio storage limit reached; retry after another job finishes")
             if shutil.disk_usage(self.directory.name).free < size + 1024 ** 3:
                 raise ValueError("Not enough temporary storage for audio decoding")
-            if speaker_turns is not None:
-                regions = [{"start": max(0, int(turn["start"] * SAMPLE_RATE)),
-                            "end": min(len(audio), int(turn["end"] * SAMPLE_RATE))}
-                           for turn in speaker_turns]
-            elif vad_filter:
-                options = dict(vad_parameters or {})
-                options["max_speech_duration_s"] = 20
-                regions = get_speech_timestamps(audio, VadOptions(**options))
-            else:
-                regions = [{"start": 0, "end": len(audio)}]
-            self.chunks = [(start, min(start + MAX_CHUNK_SAMPLES, region["end"]))
-                           for region in regions
-                           for start in range(region["start"], region["end"], MAX_CHUNK_SAMPLES)]
+            self.chunks = self._chunks(audio, len(audio), vad_filter, vad_parameters,
+                                       speaker_turns, preview_seconds, max_chunks)
+            check()
             pcm_path = Path(self.directory.name) / "audio.pcm"
             np.asarray(audio, dtype="<f4").tofile(pcm_path)
             del audio
@@ -87,6 +115,27 @@ class GigaAMChunkPlan:
         except BaseException:
             self.close()
             raise
+
+    @staticmethod
+    def _chunks(audio, total_samples, vad_filter, vad_parameters, speaker_turns,
+                preview_seconds, max_chunks):
+        limit = min(total_samples, int(preview_seconds * SAMPLE_RATE)) if preview_seconds else total_samples
+        if not limit:
+            return []
+        if speaker_turns is not None:
+            regions = [{"start": max(0, int(turn["start"] * SAMPLE_RATE)),
+                        "end": min(limit, int(turn["end"] * SAMPLE_RATE))}
+                       for turn in speaker_turns]
+        elif vad_filter:
+            options = dict(vad_parameters or {})
+            options["max_speech_duration_s"] = 20
+            regions = get_speech_timestamps(audio[:limit], VadOptions(**options))
+        else:
+            regions = [{"start": 0, "end": limit}]
+        chunks = [(start, min(start + MAX_CHUNK_SAMPLES, region["end"]))
+                  for region in regions
+                  for start in range(region["start"], region["end"], MAX_CHUNK_SAMPLES)]
+        return chunks[:max_chunks] if max_chunks is not None else chunks
 
     @property
     def duration(self):
@@ -107,9 +156,16 @@ class GigaAMChunkPlan:
 
     def close(self):
         samples, self.samples = self.samples, None
-        if samples is not None:
-            samples._mmap.close()
-        self.directory.cleanup()
+        try:
+            if samples is not None:
+                samples._mmap.close()
+        finally:
+            try:
+                self.directory.cleanup()
+            finally:
+                prepared, self._prepared = self._prepared, None
+                if prepared is not None:
+                    prepared.close()
 
 
 class GigaAMModel:

@@ -16,6 +16,8 @@
 | `WHISPER_VAD_MIN_SILENCE_MS` | `700` | пауза, после которой закрывается speech chunk |
 | `WHISPER_VAD_SPEECH_PAD_MS` | `200` | padding вокруг speech chunk |
 | `WEBUI_SESSION_TTL_SECONDS` | `7200` | срок жизни web UI session/csrf token |
+| `WHISPER_EARLY_TEXT_ENABLED` | `1` | предварительный текст одного короткого фрагмента перед диаризацией в заданиях GigaAM web UI |
+| `WHISPER_PCM_CACHE_TTL_SECONDS` | `86400` | срок хранения неиспользуемого PCM и контекстных планов; активные задания защищены от удаления |
 
 ## Telegram bot
 
