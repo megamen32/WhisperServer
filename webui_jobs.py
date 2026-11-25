@@ -120,6 +120,11 @@ class JobStore:
     def _raw_record(db, row, *, include_result=True, include_segments=True, include_summaries=True):
         """Copy a consistent raw snapshot; decode JSON after releasing read locks."""
         data = dict(row)
+        recovery = db.execute('SELECT failures,checkpoint,phase,unit,reason,quarantined FROM job_recovery WHERE job_id=?',
+                              (row['id'],)).fetchone()
+        if recovery is not None:
+            data['recovery'] = dict(recovery)
+            data['recovery']['quarantined'] = bool(recovery['quarantined'])
         stream_row = db.execute('SELECT * FROM job_streams WHERE job_id=? AND attempt=?',
                                 (row['id'], row['attempt'])).fetchone()
         stream = dict(stream_row) if stream_row else None
@@ -142,11 +147,6 @@ class JobStore:
         epoch, count = (stream['epoch'], stream['segment_count']) if stream else (0, 0)
         data['stream_cursor'] = f"{data['attempt']}:{epoch}:{count}"
         data['segment_count'] = count
-        recovery = db.execute('SELECT failures,checkpoint,phase,unit,reason,quarantined FROM job_recovery WHERE job_id=?',
-                              (row['id'],)).fetchone()
-        if recovery is not None:
-            data['recovery'] = dict(recovery)
-            data['recovery']['quarantined'] = bool(recovery['quarantined'])
         if include_result:
             result = json.loads(raw) if raw is not None else None
             if not stream and isinstance(result, dict):

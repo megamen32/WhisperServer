@@ -53,3 +53,36 @@ def test_listener_survives_stale_response_and_delivers_next_request(monkeypatch,
         if not stale.done():
             stale.cancel()
     asyncio.run(run())
+
+
+def test_slow_progress_persistence_keeps_event_loop_responsive(monkeypatch):
+    import threading
+    async def run():
+        entered, release = threading.Event(), threading.Event()
+        completed = []
+        def persist(event):
+            entered.set()
+            release.wait(.4)
+            completed.append(release.is_set())
+
+        loop = asyncio.get_running_loop()
+        final = loop.create_future()
+        monkeypatch.setattr(main, 'pending_progress', {'slow': persist})
+        monkeypatch.setattr(main, 'pending_results', {'slow': final})
+        monkeypatch.setattr(main, 'pending_streams', {})
+        monkeypatch.setattr(main.app.state, 'executor', None, raising=False)
+        responses = queue.Queue()
+        responses.put({'request_id': 'slow', 'segment': {'text': 'first'}})
+        responses.put({'request_id': 'slow', 'result': {'text': 'complete'}, 'final': True})
+        responses.put(None)
+
+        async def independent_request():
+            assert await asyncio.to_thread(entered.wait, 1)
+            release.set()
+
+        other = asyncio.create_task(independent_request())
+        await asyncio.wait_for(main.response_listener(None, responses), 2)
+        await other
+        assert completed == [True], 'progress persistence blocked independent API work'
+        assert final.result() == {'text': 'complete'}
+    asyncio.run(run())

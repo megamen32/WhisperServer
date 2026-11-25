@@ -7,3 +7,5 @@ Each connection requests an automatic checkpoint after 256 WAL pages and a 16 Mi
 Back up an active database with SQLite's online backup API. Copying only jobs.sqlite while a writer is running can omit data that is still in the WAL. A stopped service may also have WAL/SHM files until its final connection closes; use the backup API for deployment snapshots as well.
 
 The concurrency regression holds a reader while a real segment write commits. A second case pauses JSON decoding after the raw snapshot, writes a new segment, then completes a truncating checkpoint and verifies that the original reader still returns its consistent earlier text.
+
+The response listener persists progress outside the API event loop, awaiting each write before consuming the next worker response. Notifications return to the event loop through its thread-safe dispatch. A terminal response therefore cannot overtake its earlier segments.

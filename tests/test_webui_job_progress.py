@@ -54,13 +54,38 @@ async def test_job_exposes_segments_before_worker_finishes(monkeypatch):
                     break
                 await asyncio.sleep(.01)
             worker_request = requests.get_nowait()
+            # A preliminary block stays in the same job until the final epoch begins.
             responses.put({"request_id": worker_request["request_id"], "progress": {
-                "phase": "transcribing", "total_seconds": 40.0, "processed_seconds": 0}})
+                "phase": "preliminary", "provisional": True, "total_seconds": 40.0}})
+            responses.put({"request_id": worker_request["request_id"], "segment": {
+                "start": 0.0, "end": 20.0, "text": "temporary beginning", "provisional": True}})
+            for _ in range(100):
+                preview = (await client.get(f"/web/jobs/{job_id}")).json()
+                if (preview.get("result") or {}).get("segments"):
+                    break
+                await asyncio.sleep(.01)
+            assert preview["progress"].get("provisional") is True
+            assert preview["progress"]["phase"] == "preliminary"
+            assert preview["progress"]["percent"] is None
+            responses.put({"request_id": worker_request["request_id"], "progress": {
+                "phase": "diarizing", "provisional": True, "step": "embeddings"}})
+            for _ in range(100):
+                preview = (await client.get(f"/web/jobs/{job_id}")).json()
+                if preview.get("progress", {}).get("phase") == "diarizing":
+                    break
+                await asyncio.sleep(.01)
+            assert preview["result"]["segments"][0]["text"] == "temporary beginning"
+            assert preview["progress"]["provisional"] is True
+            responses.put({"request_id": worker_request["request_id"], "progress": {
+                "phase": "transcribing", "provisional": False, "reset": True,
+                "total_seconds": 40.0, "processed_seconds": 0}})
             segment = {"start": 0.0, "end": 20.0, "text": "first fragment"}
             responses.put({"request_id": worker_request["request_id"], "segment": segment})
             for _ in range(100):
                 view = (await client.get(f"/web/jobs/{job_id}")).json()
-                if (view.get("result") or {}).get("segments"):
+                if ((view.get("result") or {}).get("segments")
+                        and view.get("progress", {}).get("phase") == "transcribing"
+                        and not view.get("progress", {}).get("provisional")):
                     break
                 await asyncio.sleep(.01)
             assert view["status"] == "processing"

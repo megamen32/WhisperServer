@@ -1695,7 +1695,7 @@ async def response_listener(stop_event, response_queue, retire_event=None, *, ge
                 progress_callback = pending_progress.get(request_id)
                 if progress_callback is not None and ("progress" in result or "segment" in result):
                     try:
-                        progress_callback(result)
+                        await asyncio.to_thread(progress_callback, result)
                     except (InvalidTransition, JobNotFound):
                         pass  # A cancellation or newer attempt owns this job.
                     except Exception:
@@ -2466,6 +2466,7 @@ async def _run_web_job(owner, job_id, attempt, generation=None):
 
 async def _execute_web_job(owner, job_id, attempt):
     store = _job_store()
+    event_loop = asyncio.get_running_loop()
     terminal_signal = False
     unknown_completion = False
     interrupted = False
@@ -2480,22 +2481,24 @@ async def _execute_web_job(owner, job_id, attempt):
             reset = bool(update.get('reset'))
             if reset:
                 progress.update(phase='queued', percent=None, processed_seconds=0.0,
-                                total_seconds=None, segments=0)
+                                total_seconds=None, segments=0, provisional=False)
             if reset or ('phase' in update and update['phase'] != progress.get('phase')):
                 for key in ('step', 'completed', 'total'):
                     progress.pop(key, None)
             progress.update({key: value for key, value in update.items()
-                             if key in ('phase', 'total_seconds', 'processed_seconds', 'step', 'completed', 'total')})
+                             if key in ('phase', 'total_seconds', 'processed_seconds', 'step', 'completed', 'total', 'provisional')})
             segment = event.get('segment')
             if segment is not None:
                 progress['segments'] += 1
                 progress['processed_seconds'] = max(progress['processed_seconds'], segment.get('end', 0))
-                progress['phase'] = 'transcribing'
+                provisional = bool(segment.get('provisional'))
+                progress['provisional'] = provisional
+                progress['phase'] = 'preliminary' if provisional else 'transcribing'
             total = progress.get('total_seconds')
             progress['percent'] = (min(99.0, round(100 * progress['processed_seconds'] / total, 2))
                                    if progress['phase'] == 'transcribing' and total and total > 0 else None)
             store.append_progress(owner, job_id, attempt, segment=segment, progress=progress, reset=reset)
-            _notify_job(job_id)
+            event_loop.call_soon_threadsafe(_notify_job, job_id)
 
         store.append_progress(owner, job_id, attempt, progress=progress)
         _notify_job(job_id)
