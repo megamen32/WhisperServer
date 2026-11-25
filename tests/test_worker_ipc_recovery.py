@@ -53,7 +53,8 @@ async def test_partial_ipc_frame_retires_reader_and_restarts_worker(monkeypatch)
     for key, value in {
         "model_process": initial, "request_queue": request, "response_queue": response,
         "stop_event": stop, "lifecycle_stop": asyncio.Event(), "model_usage": {},
-        "job_cancel_flags": {}, "worker_generation": 0, "worker_restarts": 0,
+        "job_cancel_flags": {}, "worker_execution_state": {},
+        "worker_generation": 0, "worker_restarts": 0,
         "worker_accepting": True, "worker_ready": True, "worker_start_deadline": None,
         "worker_restart_policy": RestartBudget(limit=2, window=1, base_delay=0, max_delay=0),
         "response_listener_retire": asyncio.Event(), "deferred_web_jobs": {},

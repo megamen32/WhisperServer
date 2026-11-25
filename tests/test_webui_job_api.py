@@ -735,6 +735,7 @@ async def test_shutdown_clears_manager_proxy_after_job_cleanup(monkeypatch):
         def shutdown(self):
             assert finished.is_set() and not flags
             assert main.app.state.job_cancel_flags is None
+            assert main.app.state.worker_execution_state is None
             self.called = True
     class Process:
         def join(self, timeout): pass
@@ -758,6 +759,7 @@ async def test_shutdown_clears_manager_proxy_after_job_cleanup(monkeypatch):
     async def monitor(): await asyncio.Event().wait()
     monkeypatch.setattr(main, 'stop_bot_subprocess', no_bot)
     monkeypatch.setattr(main.app.state, 'job_cancel_flags', flags, raising=False)
+    monkeypatch.setattr(main.app.state, 'worker_execution_state', {'snapshot': {'generation': 0, 'phase': 'idle'}}, raising=False)
     manager = Manager()
     monkeypatch.setattr(main.app.state, 'manager', manager, raising=False)
     monkeypatch.setattr(main.app.state, 'model_process', Process(), raising=False)
@@ -772,6 +774,8 @@ async def test_shutdown_clears_manager_proxy_after_job_cleanup(monkeypatch):
     monkeypatch.setattr(main.app.state, 'executor', Executor(), raising=False)
     await asyncio.wait_for(main.shutdown_event(), 2)
     assert finished.is_set() and main.app.state.job_cancel_flags is None and manager.called
+    assert main.app.state.worker_execution_state is None
+    assert main._worker_execution_snapshot() is None
     assert full_queue.cancelled and full_queue.closed
     assert not hasattr(main.app.state, 'worker_accepting')
     main.app.state.worker_accepting = False  # allow the fixture to restore prior state

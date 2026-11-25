@@ -2278,6 +2278,7 @@ async def shutdown_event():
             pass
 
     app.state.job_cancel_flags = None
+    app.state.worker_execution_state = None
     app.state.model_process = None
     app.state.request_queue = None
     app.state.response_queue = None
