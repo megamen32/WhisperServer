@@ -160,7 +160,8 @@ def _restore_turns(turns, mapping):
     return restored
 
 
-def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None) -> list[dict]:
+def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None,
+                  progress_hook=None) -> list[dict]:
     """Decode/VAD first, then reserve GPU only for the global model pass."""
     import numpy as np
     import torch
@@ -187,7 +188,8 @@ def diarize_audio(audio_path: str, vad_filter: bool = True, model_provider=None)
             torch.set_num_threads(min(previous_threads, 2))
             with (model_provider or _cpu_model)() as model:
                 try:
-                    turns = model.diarize(samples)
+                    turns = (model.diarize(samples, hook=progress_hook)
+                             if progress_hook is not None else model.diarize(samples))
                 except Exception as exc:
                     traceback.clear_frames(exc.__traceback__)
                     raise
