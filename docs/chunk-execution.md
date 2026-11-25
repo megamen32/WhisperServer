@@ -90,3 +90,13 @@ the same database and assert that only unfinished units are decoded. Additional
 checks cover parameter/revision invalidation, cancellation before replay, model
 scope closure, persisted diarization reuse, bounded storage and concurrent Web
 UI admission.
+
+
+## Cold GigaAM preparation and broker leases
+
+GigaAM constructs its configuration and loads CPU weights before requesting a
+GPU lease. The broker-managed loader only moves that prepared model to CUDA.
+The same preparation runs again after an eviction or release; a still-cached
+CUDA model is reused directly. Failed admission or transfer discards the
+unpublished model and releases any granted lease. The broker heartbeat timeout
+and inference lease contract stay unchanged.

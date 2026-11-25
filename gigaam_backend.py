@@ -130,6 +130,16 @@ class GigaAMModel:
         model.eval()
         return cls(model)
 
+    def to_device(self, device: str) -> "GigaAMModel":
+        if self._model is None:
+            raise RuntimeError("GigaAM model is unloaded")
+        self._model = self._model.to(device)
+        return self
+
+    def unload(self) -> None:
+        """Drop an unpublished CPU preparation or a failed GPU transfer."""
+        self._model = None
+
     @property
     def checkpoint_revision(self):
         return str(getattr(getattr(self._model, "config", None), "_commit_hash", None) or GIGAAM_V3_REVISION)

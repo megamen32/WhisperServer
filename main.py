@@ -700,13 +700,8 @@ def _create_model_entry(model_name: str):
     """Create a broker-managed entry only when CUDA can actually be used."""
     cuda_available = torch.cuda.is_available()
     if ManagedModel is not None and cuda_available:
-        return ManagedModel(
+        options = dict(
             model_id=f"whisper-{model_name}",
-            loader=lambda mn=model_name: _load_model(
-                mn,
-                device="cuda",
-                compute_type="float16",
-            ),
             vram_mb=_broker_vram_mb(model_name),
             gpu_priority=MODEL_PRIORITY.get(model_name, 0),
             cpu_capable=_broker_cpu_capable(model_name),
@@ -715,6 +710,19 @@ def _create_model_entry(model_name: str):
                 lambda mn=model_name: _load_model(mn, device="cpu", compute_type="int8")
             ) if _broker_cpu_capable(model_name) else None,
             client_id=BROKER_CLIENT_ID,
+        )
+        if model_name == "gigaam-v3":
+            from prepared_models import cpu_prepared_managed_model
+            return cpu_prepared_managed_model(
+                ManagedModel,
+                prepare=lambda: _load_model("gigaam-v3", device="cpu", compute_type="float32"),
+                promote=lambda prepared: prepared.to_device("cuda"),
+                discard=lambda prepared: prepared.unload(),
+                **options,
+            )
+        return ManagedModel(
+            loader=lambda mn=model_name: _load_model(mn, device="cuda", compute_type="float16"),
+            **options,
         )
 
     if cuda_available:

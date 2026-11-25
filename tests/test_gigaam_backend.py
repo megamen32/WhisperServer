@@ -95,3 +95,21 @@ def test_stale_plan_cleanup_keeps_live_worker_storage(tmp_path):
     gigaam_backend.cleanup_stale_chunk_plans(tmp_path)
     assert not stale.exists()
     assert alive.exists()
+
+
+def test_gigaam_can_promote_prepared_cpu_weights_and_discard_them():
+    import pytest
+    from gigaam_backend import GigaAMModel
+    moves = []
+    class Weights:
+        def to(self, device):
+            moves.append(device)
+            return self
+    weights = Weights()
+    model = GigaAMModel(weights)
+    assert model.to_device("cuda") is model
+    assert model._model is weights and moves == ["cuda"]
+    model.unload()
+    assert model._model is None
+    with pytest.raises(RuntimeError, match="unloaded"):
+        model.to_device("cuda")
