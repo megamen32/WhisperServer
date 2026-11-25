@@ -33,7 +33,8 @@ import weakref
 from contextlib import asynccontextmanager, contextmanager, ExitStack
 from types import SimpleNamespace
 from audio_checkpoints import AudioCheckpoints, CooperativeQueue, computation_key
-from runtime_support import LazyImport, RestartBudget, IdleModelCache, cuda_device_visible
+from runtime_support import (LazyImport, RestartBudget, IdleModelCache, cuda_device_visible,
+                             PhaseWatchdog, PHASE_TIMEOUTS)
 WhisperModel = LazyImport("faster_whisper", "WhisperModel")
 GigaAMModel = LazyImport("gigaam_backend", "GigaAMModel")
 ParakeetModel = LazyImport("parakeet_backend", "ParakeetModel")
@@ -720,7 +721,9 @@ def _create_model_entry(model_name: str):
                 discard=lambda prepared: prepared.unload(),
                 **options,
             )
-        return ManagedModel(
+        from observed_models import observed_managed_model
+        return observed_managed_model(
+            ManagedModel,
             loader=lambda mn=model_name: _load_model(mn, device="cuda", compute_type="float16"),
             **options,
         )
@@ -766,7 +769,21 @@ def _load_diarization_model(device):
 
 
 
-def _create_diarization_entry():
+def _create_diarization_entry(*, cancel_check=None, phase_hook=None):
+    def prepare_cpu():
+        if cancel_check is not None:
+            cancel_check()
+        if phase_hook is not None:
+            phase_hook('preparing_cpu')
+        model = _load_diarization_model('cpu')
+        try:
+            if cancel_check is not None:
+                cancel_check()
+            return model
+        except BaseException:
+            model.unload()
+            raise
+
     device = DIARIZATION_DEVICE
     if device == "auto":
         # The diarization pipeline shares the card with the ASR model. Keep it on
@@ -774,20 +791,27 @@ def _create_diarization_entry():
         free = physical_free_vram_mb()
         device = "cuda" if (free is None or free >= DIARIZATION_VRAM_MB + VRAM_HEADROOM_MB) else "cpu"
     if device == "cpu":
-        return _load_diarization_model("cpu")
+        return prepare_cpu()
     if not torch.cuda.is_available():
-        return _load_diarization_model("cpu")
+        return prepare_cpu()
     if ManagedModel is None:
         raise RuntimeError("Community-1 GPU requires cudabroker_client")
     # Cold imports and CPU weight preparation can exceed the broker heartbeat
     # deadline. Reserve GPU only for the short transfer and actual inference.
-    prepared = [_load_diarization_model("cpu")]
+    prepared = [prepare_cpu()]
     def promote_prepared():
         if not prepared:
             raise RuntimeError("Prepared diarizer was already consumed")
         model = prepared.pop()
         try:
-            return model.to_device("cuda")
+            if cancel_check is not None:
+                cancel_check()
+            if phase_hook is not None:
+                phase_hook('loading_gpu')
+            model.to_device("cuda")
+            if cancel_check is not None:
+                cancel_check()
+            return model
         except BaseException:
             model.unload()
             raise
@@ -811,19 +835,28 @@ def _create_diarization_entry():
 
 
 @contextmanager
-def _diarization_model_session():
+def _diarization_model_session(*, cancel_check=None, phase_hook=None):
     """Cache only successful CPU weights; always release the GPU lease."""
-    entry = _create_diarization_entry()
+    entry = (_create_diarization_entry(cancel_check=cancel_check, phase_hook=phase_hook)
+             if cancel_check is not None or phase_hook is not None else _create_diarization_entry())
     model = None
     parked = None
     scope = ExitStack()
     succeeded = False
     try:
         if ManagedModel is not None and isinstance(entry, ManagedModel):
+            if cancel_check is not None:
+                cancel_check()
+            if phase_hook is not None:
+                phase_hook('waiting_gpu')
             entry.acquire()
             model = scope.enter_context(entry.inference())
         else:
             model = entry
+        if cancel_check is not None:
+            cancel_check()
+        if phase_hook is not None:
+            phase_hook('diarization')
         logger.info("Community-1 inference on %s", model.device)
         yield model
         succeeded = True
@@ -1083,10 +1116,13 @@ class WebJobCancelled(Exception):
 
 
 class WorkerStopped(Exception):
-    """The worker owning a request exited before responding."""
+    """The worker exited; failure identifies only the active request, if known."""
+    def __init__(self, message, *, failure=None):
+        super().__init__(message)
+        self.failure = dict(failure) if failure is not None else None
 
 
-def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_flags=None):
+def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_flags=None, execution_state=None):
     model_cache = {}
     ready = CooperativeQueue()
     from gigaam_backend import cleanup_stale_chunk_plans
@@ -1721,11 +1757,26 @@ def _runtime_version():
     }
 
 
+def _worker_execution_snapshot():
+    shared = getattr(app.state, 'worker_execution_state', None)
+    if shared is None:
+        return None
+    try:
+        snapshot = shared.get('snapshot')
+    except (BrokenPipeError, ConnectionError, EOFError, OSError):
+        logger.warning('Worker execution snapshot unavailable')
+        return None
+    if not isinstance(snapshot, dict) or snapshot.get('generation') != getattr(app.state, 'worker_generation', 0):
+        return None
+    return snapshot
+
+
 def _worker_health():
     process = getattr(app.state, 'model_process', None)
     running = bool(process is not None and process.is_alive())
     policy = getattr(app.state, 'worker_restart_policy', None)
     restart_at = getattr(app.state, 'worker_restart_at', None)
+    watchdog = getattr(app.state, 'worker_watchdog', None)
     return {
         'running': running,
         'pid': getattr(process, 'pid', None),
@@ -1736,6 +1787,8 @@ def _worker_health():
         'restarts_in_window': policy.count() if policy is not None else 0,
         'restart_in_seconds': max(0.0, round(restart_at - time.monotonic(), 2)) if restart_at else None,
         'reason': getattr(app.state, 'worker_failure_reason', None),
+        'execution': watchdog.view() if watchdog is not None else {
+            'phase': 'idle', 'stalled_seconds': None, 'timeout_seconds': None},
     }
 
 
@@ -1757,10 +1810,25 @@ async def _worker_supervisor(ctx):
     policy = getattr(app.state, 'worker_restart_policy', None)
     if policy is None:
         policy = app.state.worker_restart_policy = _new_restart_budget()
+    watchdog = app.state.worker_watchdog = PhaseWatchdog.from_environment()
+    stopped_failure = None
     while not app.state.lifecycle_stop.is_set():
         await asyncio.sleep(.2)
         process = app.state.model_process
         if process is not None and process.is_alive():
+            failure = watchdog.observe(_worker_execution_snapshot(), app.state.worker_generation)
+            if failure is not None:
+                stopped_failure = failure
+                app.state.worker_failure_reason = 'phase_timeout'
+                app.state.worker_accepting = False
+                app.state.worker_ready = False
+                logger.error('Worker stopped making progress in phase=%s unit=%s',
+                             failure.get('phase'), failure.get('unit'))
+                process.terminate()
+                process.join(timeout=.1)
+                if process.is_alive() and hasattr(process, 'kill'):
+                    process.kill()
+                continue
             deadline = getattr(app.state, 'worker_start_deadline', None)
             if not getattr(app.state, 'worker_ready', True) and deadline and time.monotonic() >= deadline:
                 app.state.worker_failure_reason = 'worker_start_timeout'
@@ -1773,7 +1841,10 @@ async def _worker_supervisor(ctx):
             continue
         app.state.worker_accepting = False
         app.state.worker_ready = False
-        app.state.worker_failure_reason = 'worker_exited'
+        snapshot = _worker_execution_snapshot()
+        if stopped_failure is None and snapshot and snapshot.get('phase') in PHASE_TIMEOUTS:
+            stopped_failure = dict(snapshot, reason='worker_exited')
+        app.state.worker_failure_reason = (stopped_failure or {}).get('reason', 'worker_exited')
         logger.error('Model worker exited; closing admission')
         # Drain complete terminal replies before the generation cutoff.
         # No parent writer may keep a truncated child frame waiting forever.
@@ -1797,7 +1868,10 @@ async def _worker_supervisor(ctx):
             pending_results.pop(request_id, None)
             pending_progress.pop(request_id, None)
             if not future.done():
-                future.set_exception(WorkerStopped('Model worker stopped before responding'))
+                # A deterministic crash belongs only to the quantum actually
+                # running, never to innocent requests waiting in the same queue.
+                failure = stopped_failure if (stopped_failure or {}).get('request_id') == request_id else None
+                future.set_exception(WorkerStopped('Model worker stopped before responding', failure=failure))
         for request_id, stream in list(pending_streams.items()):
             pending_streams.pop(request_id, None)
             pending_progress.pop(request_id, None)
@@ -1824,8 +1898,14 @@ async def _worker_supervisor(ctx):
         policy.record()
         app.state.worker_restarts += 1
         request_queue, response_queue = ctx.Queue(), ctx.Queue()
+        shared = getattr(app.state, 'worker_execution_state', None)
+        if shared is None:
+            shared = app.state.worker_execution_state = {}
+        shared['snapshot'] = {'generation': app.state.worker_generation, 'phase': 'idle'}
+        watchdog.observe(shared['snapshot'], app.state.worker_generation)
+        stopped_failure = None
         replacement = ctx.Process(target=model_worker, args=(request_queue, response_queue,
-                                  app.state.stop_event, app.state.model_usage, app.state.job_cancel_flags))
+                                  app.state.stop_event, app.state.model_usage, app.state.job_cancel_flags, shared))
         try:
             replacement.start()
             _close_parent_response_writer(response_queue)
@@ -1880,11 +1960,13 @@ async def startup_event():
     manager = ctx.Manager()
     model_usage = manager.dict()
     job_cancel_flags = manager.dict()
+    execution_state = manager.dict()
+    execution_state['snapshot'] = {'generation': 0, 'phase': 'idle'}
     request_queue = ctx.Queue()
     response_queue = ctx.Queue()
     process = ctx.Process(
         target=model_worker,
-        args=(request_queue, response_queue, stop_event, model_usage, job_cancel_flags),
+        args=(request_queue, response_queue, stop_event, model_usage, job_cancel_flags, execution_state),
     )
     process.start()
     _close_parent_response_writer(response_queue)
@@ -1896,6 +1978,7 @@ async def startup_event():
     app.state.response_queue = response_queue
     app.state.manager = manager
     app.state.job_cancel_flags = job_cancel_flags
+    app.state.worker_execution_state = execution_state
     app.state.worker_generation = 0
     app.state.worker_restarts = 0
     app.state.worker_restart_policy = _new_restart_budget()
@@ -2208,7 +2291,8 @@ async def _transcribe_impl(
                 if client_comment:
                     result['client_comment'] = client_comment
                 return result
-            return JSONResponse({'error': str(error), 'code': 'worker_stopped'}, status_code=503)
+            return JSONResponse({'error': str(error), 'code': 'worker_stopped',
+                                 'worker_failure': error.failure}, status_code=503)
         except Exception as e:
             pending_results.pop(request_id, None)
             if isinstance(e, GpuOutOfMemoryError):
@@ -2428,7 +2512,13 @@ async def _execute_web_job(owner, job_id, attempt):
             terminal_signal = True
             payload = json.loads(result.body)
             if payload.get('code') == 'worker_stopped':
-                retry = store.interrupt_for_retry(owner, job_id, attempt)
+                failure = payload.get('worker_failure')
+                if isinstance(failure, dict) and failure.get('job_key') == [job_id, attempt]:
+                    retry = store.interrupt_for_retry(
+                        owner, job_id, attempt, failure=failure,
+                        max_failures=int(os.getenv('WHISPER_JOB_CRASH_LIMIT', '3')))
+                else:
+                    retry = store.interrupt_for_retry(owner, job_id, attempt)
                 if retry['status'] == 'queued':
                     _defer_or_launch_web_job(owner, retry)
                 elif retry['status'] == 'cancelled':

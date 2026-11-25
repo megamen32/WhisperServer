@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 import importlib
 import logging
+import math
 import os
 from pathlib import Path
 import time
@@ -67,6 +68,116 @@ class RestartBudget:
     def count(self):
         self._prune()
         return len(self.attempts)
+
+
+# These budgets cover lack of real progress in one phase, not total job time.
+PHASE_TIMEOUTS = {
+    "preparing": 300.0,
+    "preparing_cpu": 900.0,
+    "waiting_gpu": 900.0,
+    "loading_gpu": 300.0,
+    "inference": 600.0,
+    "diarization": 3600.0,
+}
+
+
+class WorkerExecution:
+    """Publish one synchronous snapshot before entering crash-prone native code.
+
+    Queue.put uses a feeder thread and can lose the final active-task marker on
+    a crash. A Manager dict assignment returns only after the snapshot is stored.
+    Progress is work completed, never a clock/heartbeat. Checkpoint is a monotonic
+    durable watermark that can be compared across retries of the same job.
+    """
+    def __init__(self, shared=None):
+        self.shared = shared
+        initial = shared.get("snapshot", {}) if shared is not None else {}
+        self.generation = initial.get("generation", 0)
+        self.snapshot = {"generation": self.generation, "phase": "idle"}
+
+    def _publish(self, snapshot):
+        self.snapshot = snapshot
+        if self.shared is not None:
+            self.shared["snapshot"] = snapshot
+
+    def enter(self, request_id, job_key, phase, *, unit=None, progress=None, checkpoint=None):
+        if phase not in PHASE_TIMEOUTS:
+            raise ValueError(f"Unknown worker phase: {phase}")
+        self._publish({
+            "generation": self.generation, "request_id": request_id,
+            "job_key": list(job_key) if job_key is not None else None,
+            "phase": phase, "unit": str(unit) if unit is not None else None,
+            "progress": progress, "checkpoint": max(0, int(checkpoint or 0)),
+        })
+
+    def phase(self, phase):
+        if self.snapshot.get("phase") == "idle":
+            return
+        if phase not in PHASE_TIMEOUTS:
+            raise ValueError(f"Unknown worker phase: {phase}")
+        if phase != self.snapshot["phase"]:
+            self._publish(dict(self.snapshot, phase=phase, progress=None))
+
+    def advance(self, progress=None, *, checkpoint=None):
+        if self.snapshot.get("phase") == "idle":
+            return
+        snapshot = dict(self.snapshot)
+        if progress is not None:
+            snapshot["progress"] = progress
+        if checkpoint is not None:
+            snapshot["checkpoint"] = max(snapshot.get("checkpoint", 0), int(checkpoint))
+        if snapshot != self.snapshot:
+            self._publish(snapshot)
+
+    def idle(self):
+        self._publish({"generation": self.generation, "phase": "idle"})
+
+
+class PhaseWatchdog:
+    """Timeout one unchanged work boundary without treating liveness as progress."""
+    def __init__(self, budgets=None, *, clock=time.monotonic):
+        self.budgets = dict(PHASE_TIMEOUTS)
+        if budgets is not None:
+            self.budgets.update(budgets)
+        if any(not math.isfinite(float(value)) or float(value) <= 0 for value in self.budgets.values()):
+            raise ValueError("worker phase timeouts must be finite and positive")
+        self.clock = clock
+        self.snapshot = None
+        self.since = None
+        self._token = None
+
+    @classmethod
+    def from_environment(cls, **kwargs):
+        return cls({phase: float(os.getenv(f"WHISPER_WATCHDOG_{phase.upper()}_SECONDS", default))
+                    for phase, default in PHASE_TIMEOUTS.items()}, **kwargs)
+
+    def observe(self, snapshot, generation):
+        # Old-generation snapshots cannot revive attribution or its deadline.
+        if not isinstance(snapshot, dict) or snapshot.get("generation") != generation:
+            return None
+        phase = snapshot.get("phase")
+        if phase == "idle":
+            self.snapshot, self.since, self._token = None, None, None
+            return None
+        if phase not in self.budgets or not snapshot.get("request_id"):
+            return None
+        token = (generation, snapshot.get("request_id"), snapshot.get("job_key"),
+                 phase, snapshot.get("unit"), snapshot.get("progress"),
+                 snapshot.get("checkpoint", 0))
+        now = self.clock()
+        if token != self._token:
+            self._token, self.since = token, now
+        self.snapshot = dict(snapshot)
+        if now - self.since >= self.budgets[phase]:
+            return dict(snapshot, reason="phase_timeout")
+        return None
+
+    def view(self):
+        if self.snapshot is None:
+            return {"phase": "idle", "stalled_seconds": None, "timeout_seconds": None}
+        phase = self.snapshot["phase"]
+        return {"phase": phase, "stalled_seconds": max(0.0, round(self.clock() - self.since, 2)),
+                "timeout_seconds": self.budgets[phase]}
 
 
 class IdleModelCache:

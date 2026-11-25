@@ -129,3 +129,6 @@ activation, and compare `/status` revision/runtime identity to the candidate.
 
 Runtime model references are pinned in the GigaAM and diarization adapters.
 An intentional model or dependency update requires resealing and the GPU gate.
+
+See [worker progress deadlines and job quarantine](worker-recovery.md) for phased
+timeouts, fault attribution, retained inputs and explicit retry behavior.

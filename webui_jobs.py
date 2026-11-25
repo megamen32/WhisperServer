@@ -65,6 +65,11 @@ class JobStore:
                 PRIMARY KEY (job_id, name)
             )''')
             db.execute('CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created_at)')
+            db.execute("""CREATE TABLE IF NOT EXISTS job_recovery (
+                job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+                failures INTEGER NOT NULL, checkpoint INTEGER NOT NULL,
+                phase TEXT, unit TEXT, reason TEXT, quarantined INTEGER NOT NULL
+            )""")
             db.execute("""CREATE TABLE IF NOT EXISTS job_streams (
                 job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
                 attempt INTEGER NOT NULL, epoch INTEGER NOT NULL, segment_count INTEGER NOT NULL,
@@ -137,6 +142,11 @@ class JobStore:
         epoch, count = (stream['epoch'], stream['segment_count']) if stream else (0, 0)
         data['stream_cursor'] = f"{data['attempt']}:{epoch}:{count}"
         data['segment_count'] = count
+        recovery = db.execute('SELECT failures,checkpoint,phase,unit,reason,quarantined FROM job_recovery WHERE job_id=?',
+                              (row['id'],)).fetchone()
+        if recovery is not None:
+            data['recovery'] = dict(recovery)
+            data['recovery']['quarantined'] = bool(recovery['quarantined'])
         if include_result:
             result = json.loads(raw) if raw is not None else None
             if not stream and isinstance(result, dict):
@@ -382,8 +392,11 @@ class JobStore:
                 settings['diarize'] = desired
                 status, next_attempt = 'queued', attempt + 1
                 db.execute('DELETE FROM summaries WHERE job_id=?', (job_id,))
-            db.execute('UPDATE jobs SET diarization=?, status=?, attempt=?, result=?, error=NULL, updated_at=? WHERE id=?',
-                       (self._json(settings), status, next_attempt, row['result'] if status == 'done' else None, _now(), job_id))
+                db.execute('DELETE FROM job_recovery WHERE job_id=?', (job_id,))
+            db.execute('UPDATE jobs SET diarization=?, status=?, attempt=?, result=?, error=?, updated_at=? WHERE id=?',
+                       (self._json(settings), status, next_attempt,
+                        row['result'] if status in ('done', 'error') else None,
+                        row['error'] if status == 'error' else None, _now(), job_id))
             return self._record(db, self._owned(db, owner, job_id))
 
     def retry_if_diarization_changed(self, owner, job_id, attempt):
@@ -393,14 +406,20 @@ class JobStore:
             desired = settings.get('desired_diarize', settings.get('diarize'))
             if row['attempt'] != attempt or row['status'] not in ('processing', 'error', 'done') or desired == settings.get('diarize'):
                 return None
+            if db.execute('SELECT 1 FROM job_recovery WHERE job_id=? AND quarantined=1', (job_id,)).fetchone():
+                return None
             settings['diarize'] = desired
             db.execute('DELETE FROM summaries WHERE job_id=?', (job_id,))
             db.execute('UPDATE jobs SET status=?, attempt=?, diarization=?, result=NULL, error=NULL, updated_at=? WHERE id=?',
                        ('queued', attempt + 1, self._json(settings), _now(), job_id))
             return self._record(db, self._owned(db, owner, job_id))
 
-    def interrupt_for_retry(self, owner, job_id, attempt):
-        """Retry lost compute once per attempt; explicit cancellation always wins."""
+    def interrupt_for_retry(self, owner, job_id, attempt, *, failure=None, max_failures=3):
+        """Retry lost compute; quarantine only the active culprit without durable progress.
+
+        A queued neighbour gets no failure attribution. Counts survive server
+        restarts, and replaying old checkpoints cannot reset the budget.
+        """
         with self._transaction() as db:
             row = self._owned(db, owner, job_id)
             if row['attempt'] != attempt or row['status'] not in ('queued', 'processing', 'cancel_requested'):
@@ -409,10 +428,34 @@ class JobStore:
                 db.execute("UPDATE jobs SET status='cancelled',result=NULL,updated_at=? WHERE id=?",
                            (_now(), job_id))
             else:
-                settings = json.loads(row['diarization'])
-                settings['diarize'] = settings.get('desired_diarize', settings.get('diarize'))
-                db.execute("UPDATE jobs SET status='queued',attempt=attempt+1,diarization=?,result=NULL,error=NULL,updated_at=? WHERE id=?",
-                           (self._json(settings), _now(), job_id))
+                quarantined = False
+                if failure is not None and failure.get('job_key') == [job_id, attempt]:
+                    checkpoint = max(0, int(failure.get('checkpoint', 0)))
+                    previous = db.execute('SELECT failures,checkpoint FROM job_recovery WHERE job_id=?',
+                                          (job_id,)).fetchone()
+                    failures = (previous['failures'] + 1 if previous is not None
+                                and checkpoint <= previous['checkpoint'] else 1)
+                    checkpoint = max(checkpoint, previous['checkpoint'] if previous is not None else 0)
+                    quarantined = failures >= max(1, int(max_failures))
+                    db.execute("""INSERT INTO job_recovery VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(job_id) DO UPDATE SET failures=excluded.failures,
+                        checkpoint=excluded.checkpoint,phase=excluded.phase,unit=excluded.unit,
+                        reason=excluded.reason,quarantined=excluded.quarantined""",
+                        (job_id, failures, checkpoint, str(failure.get('phase', ''))[:64],
+                         str(failure.get('unit', ''))[:256], str(failure.get('reason', 'worker_exited'))[:80],
+                         int(quarantined)))
+                if quarantined:
+                    # Keep the last partial result, uploaded source and durable
+                    # audio checkpoints. Only an explicit retry releases this job.
+                    error = ('Автоматический повтор остановлен после сбоев без сохранённого продвижения. '
+                             'Аудио и сохранённые блоки доступны для ручного повтора.')
+                    db.execute("UPDATE jobs SET status='error',error=?,updated_at=? WHERE id=?",
+                               (error, _now(), job_id))
+                else:
+                    settings = json.loads(row['diarization'])
+                    settings['diarize'] = settings.get('desired_diarize', settings.get('diarize'))
+                    db.execute("UPDATE jobs SET status='queued',attempt=attempt+1,diarization=?,result=NULL,error=NULL,updated_at=? WHERE id=?",
+                               (self._json(settings), _now(), job_id))
             return self._record(db, self._owned(db, owner, job_id))
 
     def recover_interrupted(self):
@@ -422,6 +465,8 @@ class JobStore:
             for row in rows:
                 if row['status'] == 'cancel_requested':
                     db.execute("UPDATE jobs SET status='cancelled', updated_at=? WHERE id=?", (_now(), row['id']))
+                    continue
+                if db.execute('SELECT 1 FROM job_recovery WHERE job_id=? AND quarantined=1', (row['id'],)).fetchone():
                     continue
                 settings = json.loads(row['diarization'])
                 if row['status'] == 'error' and settings.get('desired_diarize', settings.get('diarize')) == settings.get('diarize'):
@@ -446,6 +491,7 @@ class JobStore:
             if row['status'] not in ('done', 'error', 'cancelled'):
                 raise InvalidTransition('only terminal jobs can be retried')
             db.execute('DELETE FROM summaries WHERE job_id=?', (job_id,))
+            db.execute('DELETE FROM job_recovery WHERE job_id=?', (job_id,))
             db.execute('''UPDATE jobs SET attempt=attempt+1, status='queued', diarization=?,
                           result=NULL, error=NULL, updated_at=? WHERE id=?''', (settings, _now(), job_id))
             return self._record(db, self._owned(db, owner, job_id))

@@ -51,7 +51,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend", "webui_jobs", "webui_uploads", "runtime_support", "transcription_types", "audio_checkpoints", "prepared_models"]
+py-modules = ["main", "telegram_bot", "gigaam_backend", "parakeet_backend", "vad_backend", "metrics", "model_registry", "diarization_backend", "webui_jobs", "webui_uploads", "runtime_support", "transcription_types", "audio_checkpoints", "prepared_models", "observed_models"]
 
 [tool.setuptools.data-files]
 "share/whisperserver" = ["byok_bridge.mjs", "package.json", "package-lock.json", "templates/byok-presets.json", "templates/webui.html"]
