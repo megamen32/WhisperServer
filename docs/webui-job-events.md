@@ -96,3 +96,20 @@ reset generations, SQLite read/write separation, quota races, cancellation
 during fsync, independent browser control requests, partial DOM reuse and final
 reconciliation. They do not load ASR models. Use an uncached public Web UI job
 for the separate deployed-model check.
+
+## Lifecycle writes under SQLite contention
+
+Job lifecycle operations run outside the API event loop. If SQLite reports a
+busy or locked writer, the coroutine retains that exact operation and its
+arguments, waits with a bounded 50 to 500 ms backoff, and retries after the
+previous threaded attempt has finished. Worker failure metadata stays attached
+to the same guarded attempt until retry or quarantine commits. Lock contention
+is not recorded as a transcription failure.
+
+SQLite's transaction timeout bounds each attempt. The coroutine does not add a
+timeout around a running thread, because the thread could still commit after
+an external timeout. Lifecycle task cancellation stops waiting without starting
+failure or settings-retry cleanup writes. Startup recovery handles remaining
+interrupted attempts. A user's cancellation still wins inside the atomic retry
+transition; source removal follows the cancelled commit. Other SQLite errors
+are propagated.

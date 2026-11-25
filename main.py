@@ -2774,6 +2774,35 @@ async def _run_web_job(owner, job_id, attempt, generation=None):
         return
     await _execute_web_job(owner, job_id, attempt)
 
+async def _web_job_store_operation(operation, *args, **kwargs):
+    """Keep a lifecycle transition pending while SQLite's writer is occupied.
+
+    Each attempt finishes in its thread before the next begins. Do not use an
+    asyncio timeout around a write: it could commit after the caller retries.
+    Lifecycle task cancellation stops the wait; durable attempt guards make any
+    already-running transaction safe for startup recovery.
+    """
+    backoff = .05
+    waiting_logged = False
+    while True:
+        try:
+            return await asyncio.to_thread(operation, *args, **kwargs)
+        except sqlite3.OperationalError as error:
+            code = getattr(error, 'sqlite_errorcode', None)
+            busy = (code & 0xff) in (5, 6) if isinstance(code, int) else any(
+                str(error).lower().startswith(message) for message in
+                ('database is locked', 'database table is locked',
+                 'database schema is locked', 'database is busy'))
+            if not busy:
+                raise
+            if not waiting_logged:
+                logger.warning('Web job store operation %s waiting for SQLite writer',
+                               operation.__name__)
+                waiting_logged = True
+            await asyncio.sleep(backoff)
+            backoff = min(.5, backoff * 2)
+
+
 async def _execute_web_job(owner, job_id, attempt):
     store = _job_store()
     event_loop = asyncio.get_running_loop()
@@ -2781,7 +2810,7 @@ async def _execute_web_job(owner, job_id, attempt):
     unknown_completion = False
     interrupted = False
     try:
-        job = store.start(owner, job_id, attempt)
+        job = await _web_job_store_operation(store.start, owner, job_id, attempt)
         settings = job['diarization']
         progress = {'phase': 'queued', 'percent': None, 'processed_seconds': 0.0,
                     'total_seconds': None, 'segments': 0}
@@ -2810,7 +2839,7 @@ async def _execute_web_job(owner, job_id, attempt):
             store.append_progress(owner, job_id, attempt, segment=segment, progress=progress, reset=reset)
             event_loop.call_soon_threadsafe(_notify_job, job_id)
 
-        store.append_progress(owner, job_id, attempt, progress=progress)
+        await _web_job_store_operation(store.append_progress, owner, job_id, attempt, progress=progress)
         _notify_job(job_id)
         with (_job_spool().root / job_id).open('rb') as source:
             result = await _transcribe_impl(UploadFile(file=source, filename=settings['filename']),
@@ -2827,11 +2856,11 @@ async def _execute_web_job(owner, job_id, attempt):
             if payload.get('code') == 'worker_stopped':
                 failure = payload.get('worker_failure')
                 if isinstance(failure, dict) and failure.get('job_key') == [job_id, attempt]:
-                    retry = store.interrupt_for_retry(
+                    retry = await _web_job_store_operation(store.interrupt_for_retry,
                         owner, job_id, attempt, failure=failure,
                         max_failures=int(os.getenv('WHISPER_JOB_CRASH_LIMIT', '3')))
                 else:
-                    retry = store.interrupt_for_retry(owner, job_id, attempt)
+                    retry = await _web_job_store_operation(store.interrupt_for_retry,owner, job_id, attempt)
                 if retry['status'] == 'queued':
                     _defer_or_launch_web_job(owner, retry)
                 elif retry['status'] == 'cancelled':
@@ -2841,28 +2870,34 @@ async def _execute_web_job(owner, job_id, attempt):
         terminal_signal = True
         result = dict(result)
         result['transcript_id'] = job_id
-        store.complete(owner, job_id, attempt, result)
+        await _web_job_store_operation(store.complete, owner, job_id, attempt, result)
         _notify_job(job_id)
     except asyncio.CancelledError:
         interrupted = True
         raise
     except InvalidTransition:
         try:
-            job = store.get(owner, job_id)
+            job = await _web_job_store_operation(store.get, owner, job_id)
             if terminal_signal and job['attempt'] == attempt and job['status'] == 'cancel_requested':
-                store.finish_cancel(owner, job_id, attempt)
+                await _web_job_store_operation(store.finish_cancel, owner, job_id, attempt)
                 await asyncio.to_thread(_job_spool().remove, job_id)
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         except (InvalidTransition, JobNotFound):
             pass
     except Exception as error:
         logger.exception('Web job %s failed', job_id)
         try:
-            job = store.get(owner, job_id)
+            job = await _web_job_store_operation(store.get, owner, job_id)
             if job['status'] == 'cancel_requested' and terminal_signal:
-                store.finish_cancel(owner, job_id, attempt)
+                await _web_job_store_operation(store.finish_cancel, owner, job_id, attempt)
                 await asyncio.to_thread(_job_spool().remove, job_id)
             elif job['status'] != 'cancel_requested':
-                store.fail(owner, job_id, attempt, str(error)[:4000])
+                await _web_job_store_operation(store.fail, owner, job_id, attempt, str(error)[:4000])
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         except (InvalidTransition, JobNotFound):
             pass
     finally:
@@ -2872,7 +2907,7 @@ async def _execute_web_job(owner, job_id, attempt):
             flags.pop((job_id, attempt), None)
         if not unknown_completion and not interrupted and hasattr(store, 'retry_if_diarization_changed'):
             try:
-                retry = store.retry_if_diarization_changed(owner, job_id, attempt)
+                retry = await _web_job_store_operation(store.retry_if_diarization_changed, owner, job_id, attempt)
                 if retry:
                     _launch_job(owner, retry)
             except (InvalidTransition, JobNotFound):
