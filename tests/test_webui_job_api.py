@@ -903,8 +903,8 @@ async def test_supervisor_replaces_dead_worker_without_replaying_queue(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize('past_deadline', [False, True])
 async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, past_deadline):
-    # Focused integration: a read started before retirement holds a final reply;
-    # both normal and streaming responses must be delivered. Max 6s; no GPU.
+    # Replies within the drain window remain authoritative. Beyond the cutoff,
+    # pending requests fail deterministically and late responses are discarded.
     from runtime_support import RestartBudget
     monkeypatch.setattr(main.app.state, 'worker_ready', False, raising=False)
     monkeypatch.setattr(main.app.state, 'worker_restart_policy', RestartBudget(base_delay=0, max_delay=0), raising=False)
@@ -951,7 +951,7 @@ async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, p
     stream = asyncio.Queue()
     monkeypatch.setattr(main, 'pending_results', {'normal': future})
     monkeypatch.setattr(main, 'pending_streams', {'stream': stream})
-    listener = asyncio.create_task(main.response_listener(None, responses, retirement))
+    listener = asyncio.create_task(main.response_listener(None, responses, retirement, generation=0))
     monkeypatch.setattr(main.app.state, 'response_listener_task', listener, raising=False)
     supervisor = asyncio.create_task(main._worker_supervisor(Context()))
     try:
@@ -961,20 +961,23 @@ async def test_supervisor_drains_inflight_read_before_replacement(monkeypatch, p
         assert entered.is_set() and retirement.is_set()
         assert not listener.done() and not future.done()
         if past_deadline:
-            await asyncio.wait_for(supervisor, 4)
-            assert not main.app.state.worker_accepting and not future.done()
-        release.set()
-        assert (await asyncio.wait_for(future, 2))['text'] == 'late'
-        assert (await asyncio.wait_for(stream.get(), 2))['segment']['text'] == 'segment'
-        assert (await asyncio.wait_for(stream.get(), 2))['result']['text'] == 'complete'
-        assert await asyncio.wait_for(stream.get(), 2) is None
-        if not past_deadline:
-            for _ in range(200):
-                if main.app.state.worker_accepting: break
-                await asyncio.sleep(.01)
-            assert main.app.state.worker_accepting
+            with pytest.raises(main.WorkerStopped):
+                await asyncio.wait_for(future, 4)
+            assert 'error' in await asyncio.wait_for(stream.get(), 2)
+            assert await asyncio.wait_for(stream.get(), 2) is None
+            release.set()
+            await asyncio.sleep(.05)
+            assert stream.empty()
         else:
-            assert not main.app.state.worker_accepting
+            release.set()
+            assert (await asyncio.wait_for(future, 2))['text'] == 'late'
+            assert (await asyncio.wait_for(stream.get(), 2))['segment']['text'] == 'segment'
+            assert (await asyncio.wait_for(stream.get(), 2))['result']['text'] == 'complete'
+            assert await asyncio.wait_for(stream.get(), 2) is None
+        for _ in range(200):
+            if main.app.state.worker_accepting: break
+            await asyncio.sleep(.01)
+        assert main.app.state.worker_accepting
     finally:
         release.set()
         main.app.state.lifecycle_stop.set()

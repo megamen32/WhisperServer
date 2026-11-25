@@ -1576,6 +1576,13 @@ def model_worker(request_queue, response_queue, stop_event, usage_dict, cancel_f
                 entry.release()
 
 
+def _close_parent_response_writer(response_queue):
+    """Only the worker writes responses; do not keep its pipe alive in the parent."""
+    writer = getattr(response_queue, '_writer', None)
+    if writer is not None:
+        writer.close()
+
+
 async def response_listener(stop_event, response_queue, retire_event=None, *, generation=None):
     loop = asyncio.get_running_loop()
     inbox = asyncio.Queue(maxsize=1)
@@ -1595,6 +1602,8 @@ async def response_listener(stop_event, response_queue, retire_event=None, *, ge
                     if retire_event is not None and retire_event.is_set():
                         break
                     continue
+                if reader_stop.is_set():
+                    break
                 consumed.clear()
                 loop.call_soon_threadsafe(inbox.put_nowait, item)
                 while not consumed.wait(.2):
@@ -1602,6 +1611,10 @@ async def response_listener(stop_event, response_queue, retire_event=None, *, ge
                         return
                 if item is None or item.get('__shutdown__'):
                     break
+        except (EOFError, OSError, ValueError):
+            # A dead writer can end between the frame header and payload.
+            # Closing the parent's unused writer makes that finite.
+            logger.debug('Worker response channel closed')
         except Exception:
             logger.exception('Worker response reader failed')
         finally:
@@ -1621,6 +1634,8 @@ async def response_listener(stop_event, response_queue, retire_event=None, *, ge
                     break
                 if result is None or result.get("__shutdown__"):
                     break
+                if generation is not None and generation != getattr(app.state, 'worker_generation', None):
+                    continue
                 if result.get('__worker_ready__'):
                     lifecycle_stop = getattr(app.state, 'lifecycle_stop', None)
                     if ((generation is None or generation == getattr(app.state, 'worker_generation', None))
@@ -1751,11 +1766,11 @@ async def _worker_supervisor(ctx):
             continue
         app.state.worker_accepting = False
         app.state.worker_ready = False
-        app.state.worker_generation += 1
         app.state.worker_failure_reason = 'worker_exited'
         logger.error('Model worker exited; closing admission')
-        # Drain the retired channel before replacing it, so terminal replies
-        # already in flight remain authoritative.
+        # Drain complete terminal replies before the generation cutoff.
+        # No parent writer may keep a truncated child frame waiting forever.
+        _close_parent_response_writer(app.state.response_queue)
         await asyncio.sleep(1)
         if app.state.lifecycle_stop.is_set():
             return
@@ -1763,11 +1778,14 @@ async def _worker_supervisor(ctx):
         app.state.response_listener_retire.set()
         done, _ = await asyncio.wait({listener}, timeout=2)
         if not done:
-            app.state.worker_failure_reason = 'response_reader_stuck'
-            logger.error('Worker response reader did not retire; recovery halted')
-            return
+            logger.warning('Worker response drain timed out; retiring its listener')
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
         if app.state.lifecycle_stop.is_set():
             return
+        # Everything still pending now belongs to the retired channel. A late
+        # delivery cannot publish into the replacement generation.
+        app.state.worker_generation += 1
         for request_id, future in list(pending_results.items()):
             pending_results.pop(request_id, None)
             pending_progress.pop(request_id, None)
@@ -1803,6 +1821,7 @@ async def _worker_supervisor(ctx):
                                   app.state.stop_event, app.state.model_usage, app.state.job_cancel_flags))
         try:
             replacement.start()
+            _close_parent_response_writer(response_queue)
         except Exception:
             app.state.worker_failure_reason = 'worker_start_failed'
             logger.exception('Could not restart model worker')
@@ -1861,6 +1880,7 @@ async def startup_event():
         args=(request_queue, response_queue, stop_event, model_usage, job_cancel_flags),
     )
     process.start()
+    _close_parent_response_writer(response_queue)
     executor = ThreadPoolExecutor()
     app.state.stop_event = stop_event
     app.state.model_process = process
